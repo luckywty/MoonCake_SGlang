@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
+from minisgl.disagg.role import WorkerRole
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger
@@ -17,6 +19,16 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    pd_timeout: float = 120.0
+    pd_data_port: int | None = None
+    pd_advertise_host: str | None = None
+    pd_transfer_backend: str = "tcp"
+    pd_mooncake_host: str | None = None
+    pd_max_transfer_bytes: int = 1024**3
+    pd_max_registered_bytes: int | None = None
+    pd_max_pending_transfers: int = 32
+    pd_max_quarantine_seconds: float = 300.0
+    pd_mooncake_device: str = ""
 
     @property
     def share_tokenizer(self) -> bool:
@@ -66,6 +78,38 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     from minisgl.moe import SUPPORTED_MOE_BACKENDS
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
+
+    parser.add_argument(
+        "--worker-role",
+        choices=[role.value for role in WorkerRole],
+        default=WorkerRole.UNIFIED.value,
+        help="Worker role. Split roles expose the P/D control protocol on --host/--port.",
+    )
+    parser.add_argument("--pd-timeout", type=float, default=ServerArgs.pd_timeout)
+    parser.add_argument("--pd-data-port", type=int, default=None)
+    parser.add_argument("--pd-advertise-host", default=None)
+    parser.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
+    parser.add_argument("--pd-mooncake-host", default=None)
+    parser.add_argument(
+        "--pd-max-transfer-bytes", type=int, default=ServerArgs.pd_max_transfer_bytes
+    )
+    parser.add_argument(
+        "--pd-max-registered-bytes",
+        type=int,
+        default=None,
+        help="GPU transfer allocation budget per Mooncake worker; defaults to twice the payload limit.",
+    )
+    parser.add_argument(
+        "--pd-max-pending-transfers", type=int, default=ServerArgs.pd_max_pending_transfers
+    )
+    parser.add_argument(
+        "--pd-max-quarantine-seconds", type=float, default=ServerArgs.pd_max_quarantine_seconds
+    )
+    parser.add_argument(
+        "--pd-mooncake-device",
+        default=ServerArgs.pd_mooncake_device,
+        help="Comma-separated RDMA HCA names, such as mlx5_0; not a CUDA device ordinal.",
+    )
 
     parser.add_argument(
         "--model-path",
@@ -225,6 +269,61 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    if kwargs["worker_role"] == WorkerRole.UNIFIED.value and kwargs["pd_transfer_backend"] != "tcp":
+        parser.error("--pd-transfer-backend mooncake requires a split worker role")
+    if kwargs["worker_role"] != WorkerRole.UNIFIED.value:
+        if kwargs["tensor_parallel_size"] != 1 or kwargs["use_dummy_weight"]:
+            parser.error("Phase 2 split workers require TP=1 and real model weights")
+        if kwargs["shell_mode"] or run_shell:
+            parser.error("split workers do not support shell mode")
+        if (
+            not math.isfinite(kwargs["pd_timeout"])
+            or kwargs["pd_timeout"] <= 0
+            or not 0 < kwargs["server_port"] < 65535
+        ):
+            parser.error("invalid split worker timeout or port")
+        if kwargs["pd_max_transfer_bytes"] <= 0:
+            parser.error("--pd-max-transfer-bytes must be positive")
+        if (
+            kwargs["pd_max_registered_bytes"] is not None
+            and kwargs["pd_max_registered_bytes"] < kwargs["pd_max_transfer_bytes"]
+        ):
+            parser.error("--pd-max-registered-bytes must cover --pd-max-transfer-bytes")
+        if kwargs["pd_max_pending_transfers"] <= 0:
+            parser.error("--pd-max-pending-transfers must be positive")
+        if (
+            not math.isfinite(kwargs["pd_max_quarantine_seconds"])
+            or kwargs["pd_max_quarantine_seconds"] <= 0
+        ):
+            parser.error("--pd-max-quarantine-seconds must be finite and positive")
+        kwargs["pd_mooncake_device"] = kwargs["pd_mooncake_device"].strip()
+        if kwargs["pd_mooncake_device"] and any(
+            not name.strip() for name in kwargs["pd_mooncake_device"].split(",")
+        ):
+            parser.error("--pd-mooncake-device must contain nonempty RDMA HCA names")
+        kwargs["pd_mooncake_device"] = ",".join(
+            name.strip() for name in kwargs["pd_mooncake_device"].split(",")
+        )
+        if kwargs["pd_transfer_backend"] == "mooncake":
+            local_host = (
+                kwargs["pd_mooncake_host"] or kwargs["pd_advertise_host"] or kwargs["server_host"]
+            )
+            if not local_host.strip() or local_host in ("0.0.0.0", "::"):
+                parser.error("Mooncake requires --pd-mooncake-host for a wildcard bind")
+            if kwargs["pd_max_registered_bytes"] is None:
+                kwargs["pd_max_registered_bytes"] = 2 * kwargs["pd_max_transfer_bytes"]
+            kwargs["pd_transfer_reserve_bytes"] = kwargs["pd_max_registered_bytes"]
+        data_port = (
+            kwargs["server_port"] + 2 if kwargs["pd_data_port"] is None else kwargs["pd_data_port"]
+        )
+        if kwargs["worker_role"] == WorkerRole.DECODE.value:
+            if not 0 < data_port < 65536 or data_port in (
+                kwargs["server_port"],
+                kwargs["server_port"] + 1,
+            ):
+                parser.error("KV data port must differ from the worker and distributed ports")
+            if kwargs["server_host"] in ("0.0.0.0", "::") and not kwargs["pd_advertise_host"]:
+                parser.error("wildcard decode bind requires --pd-advertise-host")
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

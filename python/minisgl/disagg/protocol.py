@@ -66,6 +66,7 @@ def _v1(version: int) -> None:
 
 @dataclass(frozen=True)
 class KVLayout:
+    '''定义 KV Cache 的数据类型、张量维度、打包格式和 TP 信息'''
     """Per-rank packed payload: K/V, layer, logical token, local KV head, head dimension."""
 
     model_fingerprint: str
@@ -102,6 +103,11 @@ class KVLayout:
 
 @dataclass(frozen=True)
 class KVTransferMetadata:
+    '''某一次传输需要搬运哪些 KV Cache
+
+    KVLayout 描述一类 KV Cache 的格式。
+    KVTransferMetadata 描述某次具体传输涉及的 KV Cache。
+    '''
     """Source page IDs are in logical order. Only kv_tokens tokens are valid in the payload."""
 
     transfer_id: str
@@ -168,6 +174,10 @@ class KVTransferMetadata:
 
 @dataclass(frozen=True)
 class RequestHandoff:
+    '''Prefill 完成后，Decode 应该如何接续这个推理请求
+    
+    Decode 收到 KV Cache 后，如何知道自己应该继续执行哪个请求，以及接下来需要生成什么？
+    '''
     """After final prefill. P sampled token zero; the sole egress publishes it once."""
 
     uid: int
@@ -215,6 +225,10 @@ class RequestHandoff:
 
 @dataclass(frozen=True)
 class ReceiveTicket:
+    '''Decode 已经准备好的接收任务，供 Prefill 定位传输目标
+    
+    让Prefill 知道自己需要发送什么 KV Cache，但是应该发送到 Decode 的哪个接收任务
+    '''
     """Attempt-scoped receiver locator, interpreted only by the selected transfer backend."""
 
     transfer_id: str

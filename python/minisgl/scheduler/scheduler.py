@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import torch
 from minisgl.core import Batch, Req
+from minisgl.disagg.role import require_serving_role
 from minisgl.env import ENV
 from minisgl.message import (
     AbortBackendMsg,
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from minisgl.engine import BatchSamplingArgs, ForwardOutput
 
 
+
 logger = init_logger(__name__)
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
@@ -43,9 +45,9 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
-    def __init__(self, config: SchedulerConfig):
+    def __init__(self, config: SchedulerConfig, *, _split_worker: bool = False):
+        require_serving_role(config.worker_role, split_worker=_split_worker)
         from minisgl.engine import Engine
-
         self.engine = Engine(config)
 
         # use another stream to overlap metadata processing with computation
@@ -204,6 +206,10 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
+        return self._prepare_batch_metadata(batch)
+
+    def _prepare_batch_metadata(self, batch: Batch) -> ForwardInput:
+        """Prepare a padded batch whose KV pages have already been allocated."""
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)

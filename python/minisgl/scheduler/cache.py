@@ -48,9 +48,50 @@ class CacheManager:
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
+        # if needed_pages > 0:
+        #     allocated = self._page_to_token(self._allocate(needed_pages))
+        #     _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+        '''新写法保留 pages，捕获上述异常后归还到 free_slots，再继续抛出异常。'''
         if needed_pages > 0:
-            allocated = self._page_to_token(self._allocate(needed_pages))
-            _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+            pages = self._allocate(needed_pages)
+            try:
+                allocated = self._page_to_token(pages)
+                _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+            except Exception:
+                self.free_slots = torch.cat([self.free_slots, pages])
+                raise
+
+    def reserve_import(self, table_idx: int, num_tokens: int) -> torch.Tensor:
+        '''为 D 端导入 KV 准备存储位置,它先检查参数类型、token 数、表行范围、页表宽度和可用容量，然后按页分配'''
+        """Reserve private pages without registering uninitialized KV in the prefix cache."""
+        if type(num_tokens) is not int or type(table_idx) is not int:
+            raise ValueError("import token count and table row must be integers")
+        pages = div_ceil(num_tokens, self.page_size)
+        if num_tokens <= 0 or not 0 <= table_idx < self.page_table.shape[0] - 1:
+            raise ValueError("invalid import token count or request table row")
+        if pages * self.page_size > self.page_table.shape[1]:
+            raise ValueError("import exceeds page table capacity")
+        if pages * self.page_size > self.available_size:
+            raise RuntimeError("insufficient KV capacity for import")
+        allocated_pages = self._allocate(pages)
+        try:
+            allocated = self._page_to_token(allocated_pages)
+            self.page_table[table_idx, : len(allocated)] = allocated
+        except Exception:
+            self.free_slots = torch.cat([self.free_slots, allocated_pages])
+            raise
+        return allocated
+
+    def discard_private(self, req: Req, allocated_len: int) -> None:
+        '''用于释放请求私有 KV Cache 资源的函数'''
+        """Release a split request, including allocated KV that a failed forward never populated."""
+        end = div_ceil(allocated_len, self.page_size) * self.page_size
+        start = req.cache_handle.cached_len
+        if not 0 <= start <= end <= self.page_table.shape[1]:
+            raise ValueError("invalid private KV allocation boundary")
+        self.unlock(req.cache_handle)
+        self._free(self.page_table[req.table_idx, start:end])
+
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         # ==================================== valid cache region ====================================

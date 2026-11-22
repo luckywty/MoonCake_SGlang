@@ -29,6 +29,8 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    # GPU memory kept outside the KV pool for direct P/D transfer allocations.
+    pd_transfer_reserve_bytes: int = 0
 
     @cached_property
     def hf_config(self):

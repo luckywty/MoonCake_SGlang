@@ -21,6 +21,11 @@ _TERMINAL = {RequestPhase.FINISHED, RequestPhase.CANCELLED, RequestPhase.FAILED}
 
 
 class RequestLifecycle:
+    '''P/D 分离系统中的请求生命周期状态机
+    
+    记录一个推理请求当前执行到了哪个阶段，并限制请求只能按照合法的顺序进行状态转换。
+    它可以防止 Prefill 尚未完成就开始 KV 传输，或者 Decode 尚未确认收到 KV Cache 就开始执行推理。
+    '''
     """Owned by one scheduler event loop for one frontend request and transfer attempt."""
 
     def __init__(self, uid: int, transfer_id: str) -> None:

@@ -42,6 +42,13 @@ def launch_server(run_shell: bool = False) -> None:
     from .args import parse_args
 
     server_args, run_shell = parse_args(sys.argv[1:], run_shell)
+    from minisgl.disagg.role import WorkerRole
+
+    if server_args.worker_role is not WorkerRole.UNIFIED:
+        from minisgl.disagg.worker import launch_split_worker
+
+        launch_split_worker(server_args)
+        return
     logger = init_logger(__name__, "initializer")
 
     def start_subprocess() -> None:

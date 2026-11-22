@@ -39,6 +39,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+pd-mooncake = ["mooncake-transfer-engine==0.3.12.post1", "cuda-bindings>=12.9,<14"]
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
