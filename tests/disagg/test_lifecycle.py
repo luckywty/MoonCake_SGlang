@@ -13,6 +13,10 @@ def request():
 
 
 def reach(state, req, phase):
+    if phase is RequestPhase.PREFILLING_AND_TRANSFERRING:
+        state.begin_prefill()
+        state.begin_prefill_transfer()
+        return
     actions = (
         state.begin_prefill,
         lambda: state.complete_prefill(req),
@@ -72,7 +76,9 @@ class TestLifecycle(unittest.TestCase):
         self.assertIs(state.phase, RequestPhase.TRANSFERRING)
 
     def test_cancellation_and_failure_are_terminal(self):
-        phases = list(RequestPhase)[:6]
+        phases = [p for p in RequestPhase if p not in (
+            RequestPhase.FINISHED, RequestPhase.CANCELLED, RequestPhase.FAILED
+        )]
         for phase in phases:
             for stop, terminal in (
                 ("cancel", RequestPhase.CANCELLED),
@@ -93,6 +99,28 @@ class TestLifecycle(unittest.TestCase):
         for uid, transfer_id in ((True, str(uuid4())), (-1, str(uuid4())), (1, "attempt")):
             with self.subTest(uid=uid), self.assertRaises(ValueError):
                 RequestLifecycle(uid, transfer_id)
+
+    def test_layered_eos_waits_for_drain(self):
+        req = replace(request(), first_token_id=99)
+        state = RequestLifecycle(req.uid, req.kv.transfer_id)
+        state.begin_prefill()
+        state.begin_prefill_transfer()
+        state.complete_prefill(req)
+        self.assertIs(state.phase, RequestPhase.TRANSFERRING)
+        state.finish_without_decode()
+        self.assertIs(state.phase, RequestPhase.FINISHED)
+
+    def test_layered_continuation(self):
+        req = request()
+        state = RequestLifecycle(req.uid, req.kv.transfer_id)
+        reach(state, req, RequestPhase.PREFILLING_AND_TRANSFERRING)
+        with self.assertRaises(RuntimeError):
+            state.accept_receive(req.kv.transfer_id)
+        state.complete_prefill(req)
+        state.accept_receive(req.kv.transfer_id)
+        state.begin_decode()
+        state.finish_decode()
+        self.assertIs(state.phase, RequestPhase.FINISHED)
 
 
 if __name__ == "__main__":

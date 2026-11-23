@@ -3,15 +3,16 @@
 `--pd-transfer-backend mooncake` 使用每个 Worker 常驻的 `mooncake.engine.TransferEngine`，
 通过 GPUDirect RDMA 传输 CUDA Tensor。旧 helper 子进程入口已经退役。
 当前实现保留 TP=1、未量化 MHA KV、greedy、串行请求及 eager 执行。
+Mooncake 路径现已增加启动期预注册池、前置接收握手及按层组的计算/传输重叠，
+实现和验证边界见 [逐层传输说明](layered_transfer.md)。
 
 ## 数据路径
 
 ```text
 P GPU KV pool
-  -> GPU index_select 打包副本
-  -> P Worker 注册 GPU 地址
+  -> transfer_stream 上按层组 index_select 到预注册环形槽位
   -> Mooncake / GPUDirect RDMA
-  -> D Worker 独立 GPU 接收 Tensor
+  -> D Worker 预注册 GPU 接收池
   -> GPU index_copy_ 写入 D 自己分配的 KV slots
   -> Decode
 ```
@@ -47,6 +48,8 @@ Engine 先初始化 CUDA 和加载模型，后端随后绑定同一 GPU、创建
 | `--pd-max-registered-bytes` | 每个 Worker 活动及隔离 GPU 注册区的总预算，默认单次上限的两倍 |
 | `--pd-max-pending-transfers` | 活动及遗留注册区数量上限，默认 32 |
 | `--pd-max-quarantine-seconds` | 未确认资源的最长处置时间，默认 300 秒；不是释放内存的证明 |
+| `--pd-layers-per-chunk` | 每组传输的层数，默认 1，两端一致 |
+| `--pd-staging-slots` | P 侧启动注册的环形槽位数，默认 3，允许 2～4 |
 
 总传输预算会在 Engine 计算 KV 页数时预留；显式指定 `--num-pages` 也会检查预算。
 两台服务器分别加载相同模型权重，dtype、页大小和布局必须匹配。TE 自身的 RPC/RDMA
@@ -78,9 +81,10 @@ PYTHONPATH=python python -m minisgl.disagg.client \
 
 ## 同步、取消与回收
 
-1. P 打包完成后才释放原请求页；TE 使用的独立 GPU Tensor 由 runtime 保持强引用。
+1. P 的层就绪回调只记录 event 并入队；后台等待该 event 后打包，再等待打包完成才提交。
+   原请求页保留到后台结束；TE 使用的环形槽位由 runtime 保持强引用，原生排空后才复用。
 2. D 在可信传输完成确认后，执行设备所需的 GPUDirect 写入可见性处理，再进行 GPU 写回。
-3. D 等写回 CUDA 工作完成后释放接收 Tensor，随后开始 Decode。
+3. D 等写回 CUDA 工作完成后归还接收池租约，随后开始 Decode；池在 Worker 生命周期内保留注册。
 4. 业务取消会撤销交付，不能据此释放仍可能被原生操作访问的 GPU 地址。
 5. `COMPLETION_UNKNOWN` 的 ticket、Tensor 和注册继续保留。后台线程继续 `drain`，
    已完成的旧请求通过独立控制连接收尾，绝不再安装到取消后的请求。
@@ -95,7 +99,7 @@ PYTHONPATH=python python -m minisgl.disagg.client \
 
 ## 验证范围
 
-本轮按要求只修改实现和说明，不新增或执行测试，也不安装运行依赖。
-静态语法、接口和差异检查不能证明 GPUDirect 路径可用。后续仍需分别执行：
+原有整体交接阶段只有静态检查记录；逐层改造增加了受控 CPU 适配测试和可选择 Mooncake 的
+GPU 对照工具，详情见逐层说明。CPU 测试和静态检查不能证明 GPUDirect 路径可用。后续仍需执行：
 GPU 字节对照、实际 RDMA 路径检查、Unified/P/D token 对照、取消/晚到写入、
 显存上限，以及双服务器现场验收。

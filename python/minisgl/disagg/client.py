@@ -11,6 +11,7 @@ from threading import Event
 from uuid import uuid4
 
 from .control import Channel, StartRequest, endpoint_address
+from .layered_protocol import LayeredReceiveTicket
 from .lifecycle import RequestLifecycle
 from .protocol import RequestHandoff, _token
 
@@ -69,7 +70,24 @@ class PDClient:
                     raise InterruptedError("request cancelled")
                 p = connect(self.prefill)   #与prefillWorker建立连接
                 state.begin_prefill()       #向prefillWorker发送prefill请求，更新客户端维护的请求状态。
-                p.send({"op": "prefill", "request": request.to_object()})   #Prefill Worker 接收请求，执行对应的模型计算。
+                p.send({"op": "capabilities"})
+                capabilities = response(p, "capabilities")
+                layered = capabilities.get("layered_transfer")
+                if type(layered) is not bool:
+                    raise ValueError("invalid worker transfer capabilities")
+                start = {"op": "prefill", "request": request.to_object()}
+                if layered:
+                    # This is before P starts any prompt computation. D reserves
+                    # final KV pages and a slice of its startup-registered pool.
+                    d = connect(self.decode)
+                    d.send({"op": "reserve", "request": request.to_object()})
+                    wire_ticket = response(d, "ready")["ticket"]
+                    ticket = LayeredReceiveTicket.from_wire(json.dumps(wire_ticket).encode())
+                    if ticket.transfer_id != request.transfer_id or ticket.kv_tokens != len(prompt_ids):
+                        raise ValueError("early reservation belongs to another request")
+                    start["ticket"] = wire_ticket
+                    state.begin_prefill_transfer()
+                p.send(start)
                 envelope = response(p, "handoff")["handoff"]    #等待 Prefill Worker 返回 Handoff
                 handoff = RequestHandoff.from_wire(json.dumps(envelope).encode())
                 if (
@@ -85,17 +103,28 @@ class PDClient:
                 state.complete_prefill(handoff)
                 yield handoff.first_token_id
 
-                if not handoff.remaining_tokens:
+                if layered:
+                    status = "sent" if handoff.remaining_tokens else "retired"
+                    if response(p, status).get("transfer_id") != request.transfer_id:
+                        raise ValueError("incorrect layer send acknowledgment")
+                    if not handoff.remaining_tokens:
+                        d.send({"op": "release", "transfer_id": request.transfer_id})
+                        if response(d, "released").get("transfer_id") != request.transfer_id:
+                            raise ValueError("incorrect reservation release acknowledgment")
+                        state.finish_without_decode()
+                        return
+                    d.send({"op": "commit", "transfer_id": request.transfer_id, "handoff": envelope})
+                elif not handoff.remaining_tokens:
                     return
-                
-                d = connect(self.decode)
-                d.send({"op": "decode", "handoff": envelope})   #PDClient 向 D Worker 发送控制请求，要求它接续 P 已完成 Prefill 的这个请求。
-                ticket = response(d, "ready")["ticket"] #取得 D Worker 为本次传输生成的 Ticket
-                state.begin_transfer()
-                p.send({"op": "send", "ticket": ticket})    #PDClient 通知 P Worker，按照 D 提供的接收凭据，将 KV 数据直接发送给 D。
-                if response(p, "sent").get("transfer_id") != request.transfer_id:
-                    raise ValueError("incorrect send acknowledgment")
-                d.send({"op": "commit", "transfer_id": request.transfer_id})    #PDClient 向 D Worker 发送“提交本次 KV 交接”。
+                else:
+                    d = connect(self.decode)
+                    d.send({"op": "decode", "handoff": envelope})
+                    ticket = response(d, "ready")["ticket"]
+                    state.begin_transfer()
+                    p.send({"op": "send", "ticket": ticket})
+                    if response(p, "sent").get("transfer_id") != request.transfer_id:
+                        raise ValueError("incorrect send acknowledgment")
+                    d.send({"op": "commit", "transfer_id": request.transfer_id})
                 if response(d, "installed").get("transfer_id") != request.transfer_id:
                     raise ValueError("incorrect installation acknowledgment")
                 state.accept_receive(request.transfer_id)

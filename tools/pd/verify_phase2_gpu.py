@@ -162,6 +162,13 @@ def run(args):
                     "3",
                     "--cuda-graph-max-bs",
                     "0",
+                    "--pd-transfer-backend", args.transfer_backend,
+                    "--pd-layers-per-chunk", str(args.layers_per_chunk),
+                    "--pd-staging-slots", str(args.staging_slots),
+                    "--pd-mooncake-host", args.mooncake_host,
+                    "--pd-mooncake-device", args.mooncake_device,
+                    "--pd-max-transfer-bytes", str(args.max_transfer_bytes),
+                    "--pd-max-registered-bytes", str(2 * args.max_transfer_bytes),
                 ],
                 env={**env, "CUDA_VISIBLE_DEVICES": device},
                 stdout=log,
@@ -172,6 +179,12 @@ def run(args):
             wait_ready(process, output / f"{role}.log", args.startup_timeout)
         client = PDClient(*(f"127.0.0.1:{port}" for port in ports))
         results = []
+        def health(port):
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+                channel = Channel(sock, 10)
+                channel.send({"op": "health"})
+                return channel.receive()
+        startup_health = [health(port) for port in ports]
         for expected in json.loads(records_path.read_text()):
             actual = client.generate(
                 expected["prompt_ids"], expected["max_tokens"], ignore_eos=expected["ignore_eos"]
@@ -179,23 +192,29 @@ def run(args):
             results.append({**expected, "pd_token_ids": actual})
             if actual != expected["token_ids"]:
                 raise AssertionError(f"greedy token mismatch: {results[-1]}")
-        for port in ports:
-            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-                channel = Channel(sock, 10)
-                channel.send({"op": "health"})
-                state = channel.receive()
-                if (
-                    state.get("status") != "ready"
-                    or state["free_rows"] != 4
-                    or state["protected_tokens"] != 0
-                ):
-                    raise AssertionError(f"worker resource leak: {state}")
+        final_health = [health(port) for port in ports]
+        for initial, state in zip(startup_health, final_health):
+            if (state.get("status") != "ready" or state["free_rows"] != 4
+                    or state["protected_tokens"] != 0):
+                raise AssertionError(f"worker resource leak: {state}")
+            if args.transfer_backend == "mooncake":
+                before = initial["transfer"]["mooncake"]
+                after = state["transfer"]["mooncake"]
+                if (after["registered_bytes"] != before["registered_bytes"]
+                        or after["registered_buffers"] != before["registered_buffers"]
+                        or after["pending_operations"] or after["quarantined_buffers"]
+                        or after["layered"]["receive_reserved"]):
+                    raise AssertionError(f"layer transfer resource leak: {state}")
         report = {
             "result": "PASS",
             "page_size": args.page_size,
             "cache_type": args.cache_type,
             "prefill_device": args.prefill_device,
             "decode_device": args.decode_device,
+            "transfer_backend": args.transfer_backend,
+            "layers_per_chunk": args.layers_per_chunk,
+            "startup_health": startup_health,
+            "final_health": final_health,
             "cases": results,
         }
         (output / "gpu_results.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -223,6 +242,12 @@ def main():
     parser.add_argument("--cache-type", choices=("radix", "naive"), default="radix")
     parser.add_argument("--output-dir", type=Path, default=Path("results/phase2"))
     parser.add_argument("--startup-timeout", type=float, default=300)
+    parser.add_argument("--transfer-backend", choices=("tcp", "mooncake"), default="tcp")
+    parser.add_argument("--layers-per-chunk", type=int, default=1)
+    parser.add_argument("--staging-slots", type=int, choices=(2, 3, 4), default=3)
+    parser.add_argument("--mooncake-host", default="127.0.0.1")
+    parser.add_argument("--mooncake-device", default="")
+    parser.add_argument("--max-transfer-bytes", type=int, default=64 * 1024**2)
     parser.add_argument("--baseline-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.baseline_output:

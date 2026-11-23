@@ -37,6 +37,8 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        # Installed only for the final prompt chunk by the split P scheduler.
+        self.layer_ready = None
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]
@@ -56,6 +58,50 @@ class MHAKVCache(BaseKVCachePool):
             k=k,
             v=v,
         )
+        if self.layer_ready is not None:
+            self.layer_ready(layer_id)
+
+    @torch.inference_mode()
+    def export_layers_into(
+        self, destination: torch.Tensor, slots: torch.Tensor, start: int, end: int,
+        *, num_pool_pages: int,
+    ) -> None:
+        """Gather into a preallocated layer-major staging slot, without a KV temporary.
+
+        Called on the transfer stream, after it waits for the producer event.
+        Index validation can synchronize metadata here; it never runs in the
+        model's layer-ready callback or copies the KV payload to the CPU.
+        """
+        if not 0 <= start < end <= self.num_layers:
+            raise ValueError("invalid layer range")
+        indices = self._transfer_indices(slots, num_pool_pages)
+        heads, dim = self._storage_shape[1:]
+        shape = (end - start, 2, len(slots), heads, dim)
+        nbytes = (end - start) * 2 * len(slots) * heads * dim * self.dtype.itemsize
+        if (destination.device != self.device or destination.dtype != torch.uint8
+                or destination.ndim != 1 or not destination.is_contiguous()
+                or destination.numel() != nbytes):
+            raise ValueError("incorrect layer staging region")
+        typed = destination.view(self.dtype).view(shape)
+        for i, layer in enumerate(range(start, end)):
+            source = self._kv_buffer[:, layer].flatten(1, 2)
+            torch.index_select(source, 1, indices, out=typed[i])
+
+    @torch.inference_mode()
+    def import_layered_tensor(
+        self, packed: torch.Tensor, slots: torch.Tensor, *, num_pool_pages: int
+    ) -> None:
+        """Install a completed [layer, K/V, token, head, dim] receive region."""
+        indices = self._transfer_indices(slots, num_pool_pages)
+        heads, dim = self._storage_shape[1:]
+        shape = (self.num_layers, 2, len(slots), heads, dim)
+        expected = 2 * self.num_layers * len(slots) * heads * dim * self.dtype.itemsize
+        if (packed.device != self.device or packed.dtype != torch.uint8
+                or packed.ndim != 1 or not packed.is_contiguous() or packed.numel() != expected):
+            raise ValueError("incorrect layered receive region")
+        typed = packed.view(self.dtype).view(shape)
+        for layer in range(self.num_layers):
+            self._kv_buffer[:, layer].flatten(1, 2).index_copy_(1, indices, typed[layer])
 
     def _transfer_indices(self, slots: torch.Tensor, num_pool_pages: int) -> torch.Tensor:
         ''' 验证传入的 KV Cache Slot 索引是否合法，避免访问非法显存位置、重复 Slot 或不支持的数据格式。

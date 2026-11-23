@@ -23,6 +23,7 @@ from minisgl.scheduler.utils import PendingReq
 
 from .backend import create_transfer_backend
 from .control import CancelledError, Channel, StartRequest
+from .layered_protocol import LayeredReceiveTicket
 from .lifecycle import RequestLifecycle
 from .protocol import KVLayout, KVTransferMetadata, ReceiveTicket, RequestHandoff
 from .role import WorkerRole
@@ -152,7 +153,7 @@ class PDWorkerScheduler(Scheduler):
 
     @torch.inference_mode()
     def prefill(
-        self, request: StartRequest, channel: Channel, *, backend=None
+        self, request: StartRequest, channel: Channel, *, backend=None, layered=None
     ) -> tuple[RequestHandoff, bytes | torch.Tensor]:
         self._validate_request(request.prompt_ids, request.max_tokens)
         params = SamplingParams(max_tokens=request.max_tokens, ignore_eos=request.ignore_eos)
@@ -171,7 +172,19 @@ class PDWorkerScheduler(Scheduler):
                     self._owned_req = req = batch.reqs[0]
                     self._allocated_len = max(self._allocated_len, req.cache_handle.cached_len)
                     prepared = self._prepare_owned_batch(batch)
-                    output = self._forward(prepared)
+                    pool = self.engine.kv_cache
+                    if layered is not None and not isinstance(req, ChunkedReq):
+                        # Earlier prompt chunks and borrowed prefix KV already
+                        # exist. In the final chunk each layer becomes complete
+                        # for the full prompt, so send it exactly once.
+                        layered.set_slots(
+                            self.engine.page_table[req.table_idx, :req.device_len].to(torch.int64)
+                        )
+                        pool.layer_ready = layered.layer_ready
+                    try:
+                        output = self._forward(prepared)
+                    finally:
+                        pool.layer_ready = None
                     self.decode_manager.remove_req(req)
                     output.copy_done_event.synchronize()
                     if isinstance(req, ChunkedReq):
@@ -194,7 +207,7 @@ class PDWorkerScheduler(Scheduler):
                         meta,
                     )
                     payload = b""
-                    if handoff.remaining_tokens:
+                    if handoff.remaining_tokens and layered is None:
                         if getattr(backend, "gpu_payload", getattr(self, "_gpu_transfer", False)):
                             if backend is None or not getattr(backend, "gpu_payload", False):
                                 raise ValueError("GPU prefill requires the Mooncake GPU backend")
@@ -212,8 +225,122 @@ class PDWorkerScheduler(Scheduler):
                 # _release synchronizes the engine stream. The independent GPU
                 # transfer tensor is fully populated before the source pages are
                 # cached/freed; its lifetime subsequently belongs to the backend.
-                self._release(cache=success)
+                # Layer jobs may still gather from the source pool. Their owner
+                # drains/cancels them before releasing the request's pages.
+                if layered is None:
+                    self._release(cache=success)
                 self.prefill_manager.pending_list.clear()
+
+    def reserve_layered_request(self, request: StartRequest):
+        """Reserve D's private KV pages before P has produced its first token."""
+        self._validate_request(request.prompt_ids, request.max_tokens)
+        p = self.layout.page_size
+        needed = ((len(request.prompt_ids) + request.max_tokens + p - 1) // p) * p
+        if not self.table_manager.available_size or needed > self.cache_manager.available_size:
+            raise RuntimeError("insufficient decode capacity")
+        table_idx = self.table_manager.allocate()
+        slots = None
+        try:
+            slots = self.cache_manager.reserve_import(table_idx, len(request.prompt_ids))
+            handle = self.cache_manager.prefix_cache.match_prefix(
+                torch.empty(0, dtype=torch.int32)
+            ).cuda_handle
+            self.cache_manager.lock(handle)
+            self._owned_req = Req(
+                input_ids=torch.tensor((*request.prompt_ids, 0), dtype=torch.int32),
+                table_idx=table_idx, cached_len=len(request.prompt_ids),
+                output_len=request.max_tokens - 1, uid=request.uid,
+                sampling_params=SamplingParams(
+                    max_tokens=request.max_tokens, ignore_eos=request.ignore_eos
+                ), cache_handle=handle,
+            )
+            self._allocated_len = len(request.prompt_ids)
+            return slots[:len(request.prompt_ids)]
+        except Exception:
+            if slots is not None:
+                self.cache_manager._free(slots)
+            self.table_manager.free(table_idx)
+            raise
+
+    @torch.inference_mode()
+    def decode_layered(self, request, channel, backend):
+        ticket = None
+        success = False
+        with self.execution():
+            try:
+                slots = self.reserve_layered_request(request)
+                ticket = backend.reserve_layers(request, self.eos_token_id)
+                channel.send({"status": "ready", "ticket": json.loads(ticket.to_wire())})
+                message = channel.receive()
+                if message == {"op": "release", "transfer_id": request.transfer_id}:
+                    backend.release_layers(ticket)
+                    ticket = None
+                    channel.send({"status": "released", "transfer_id": request.transfer_id})
+                    return
+                if set(message) != {"op", "transfer_id", "handoff"} or (
+                    message["op"] != "commit" or message["transfer_id"] != request.transfer_id
+                ):
+                    raise ValueError("invalid layered commit")
+                handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
+                if (handoff.uid != request.uid or handoff.prompt_ids != request.prompt_ids
+                        or handoff.max_tokens != request.max_tokens
+                        or handoff.ignore_eos != request.ignore_eos
+                        or handoff.kv.transfer_id != request.transfer_id
+                        or handoff.kv.layout != self.layout or handoff.eos_token_id != self.eos_token_id
+                        or not handoff.remaining_tokens or handoff.first_token_id >= self.vocab_size):
+                    raise ValueError("layered handoff does not match its reservation")
+                staging = backend.finish_layers(ticket)
+                self.engine.kv_cache.import_layered_tensor(
+                    staging, slots, num_pool_pages=self.engine.num_pages
+                )
+                req = self._owned_req
+                req.input_ids[-1] = handoff.first_token_id
+                self.token_pool[req.table_idx, :req.device_len] = req.input_ids.to(self.device)
+                self.synchronize()
+                # Pool reuse is legal only after the scatter consumer finished.
+                staging = None
+                backend.release_layers(ticket, consumer_complete=True)
+                ticket = None
+                self.decode_manager.filter_reqs([req])
+                channel.send({"status": "installed", "transfer_id": request.transfer_id})
+                self._decode_tokens(handoff, channel)
+                success = True
+            finally:
+                if ticket is not None:
+                    # An import may raise after enqueueing some CUDA copies.
+                    # Prove that those readers stopped before returning the pool.
+                    try:
+                        self.synchronize()
+                    except BaseException as exc:
+                        backend.release_layers(ticket)
+                        backend.runtime.retire("CUDA layer installation completion is unknown")
+                        raise TransferBackendUnavailable(
+                            "CUDA layer installation did not synchronize"
+                        ) from exc
+                try:
+                    if ticket is not None:
+                        backend.release_layers(ticket, consumer_complete=True)
+                finally:
+                    self._release(cache=success)
+
+    def _decode_tokens(self, handoff, channel):
+        req = self._owned_req
+        for index in range(1, handoff.max_tokens):
+            channel.check_connected()
+            batch = self.decode_manager.schedule_next_batch()
+            output = self._forward(self._prepare_owned_batch(batch))
+            output.copy_done_event.synchronize()
+            req.append_host(output.next_tokens_cpu[:1])
+            token = int(output.next_tokens_cpu[0])
+            finished = not req.can_decode or (
+                not handoff.ignore_eos and token == handoff.eos_token_id
+            )
+            channel.send({
+                "status": "token", "transfer_id": handoff.kv.transfer_id,
+                "index": index, "token_id": token, "finished": finished,
+            })
+            if finished:
+                return
 
     def _reserve_decode(self, handoff: RequestHandoff) -> torch.Tensor:
         if handoff.kv.layout != self.layout or handoff.eos_token_id != self.eos_token_id:
@@ -352,6 +479,34 @@ class PDWorkerScheduler(Scheduler):
         }
 
 
+def _serve_layered_prefill(scheduler, request, ticket, channel, backend):
+    scheduler._validate_request(request.prompt_ids, request.max_tokens)
+    if ticket.eos_token_id != scheduler.eos_token_id:
+        raise ValueError("incompatible EOS configuration")
+    job = backend.begin_layer_send(
+        ticket, request, scheduler.engine.kv_cache, channel.check_connected
+    )
+    prefill_ok = False
+    try:
+        handoff, _ = scheduler.prefill(request, channel, backend=backend, layered=job)
+        prefill_ok = True
+        # Return token zero before waiting for the sender's tail convergence.
+        channel.send({"status": "handoff", "handoff": json.loads(handoff.to_wire())})
+        job.finish(cancel=not handoff.remaining_tokens)
+        channel.send({
+            "status": "sent" if handoff.remaining_tokens else "retired",
+            "transfer_id": request.transfer_id,
+        })
+    finally:
+        try:
+            if not job.done.is_set():
+                job.finish(cancel=True)
+        finally:
+            if not job.done.is_set() or not job.safe_sources:
+                raise TransferBackendUnavailable("layer packing may still access the request's KV pages")
+            scheduler._release(cache=prefill_ok)
+
+
 def serve_worker(
     scheduler, listener: socket.socket, backend, timeout: float, stop: Event | None = None
 ):
@@ -369,6 +524,12 @@ def serve_worker(
             channel = Channel(sock, timeout)
             try:
                 message = channel.receive()
+                if message == {"op": "capabilities"}:
+                    channel.send({
+                        "status": "capabilities",
+                        "layered_transfer": bool(getattr(backend, "layered_transfer", False)),
+                    })
+                    message = channel.receive()
                 if message == {"op": "health"}:
                     native_health = getattr(backend, "health", lambda: {})()
                     status = native_health.get("status", "ready")
@@ -385,10 +546,33 @@ def serve_worker(
                 if check_available is not None:
                     check_available()
                 if (
+                    scheduler.role is WorkerRole.DECODE
+                    and getattr(backend, "layered_transfer", False)
+                    and set(message) == {"op", "request"} and message["op"] == "reserve"
+                ):
+                    request = StartRequest.from_object(message["request"])
+                    if request.transfer_id in recent:
+                        raise ValueError("duplicate transfer attempt")
+                    recent.append(request.transfer_id)
+                    scheduler.decode_layered(request, channel, backend)
+                elif (
+                    scheduler.role is WorkerRole.PREFILL
+                    and getattr(backend, "layered_transfer", False)
+                    and set(message) == {"op", "request", "ticket"} and message["op"] == "prefill"
+                ):
+                    request = StartRequest.from_object(message["request"])
+                    if request.transfer_id in recent:
+                        raise ValueError("duplicate transfer attempt")
+                    recent.append(request.transfer_id)
+                    ticket = LayeredReceiveTicket.from_wire(json.dumps(message["ticket"]).encode())
+                    _serve_layered_prefill(scheduler, request, ticket, channel, backend)
+                elif (
                     scheduler.role is WorkerRole.PREFILL
                     and set(message) == {"op", "request"}
                     and message["op"] == "prefill"
                 ):
+                    if getattr(backend, "layered_transfer", False):
+                        raise ValueError("Mooncake prefill requires an early layer receive ticket")
                     request = StartRequest.from_object(message["request"])
                     transfer_id = request.transfer_id
                     if transfer_id in recent:
@@ -419,6 +603,8 @@ def serve_worker(
                     and set(message) == {"op", "handoff"}
                     and message["op"] == "decode"
                 ):
+                    if getattr(backend, "layered_transfer", False):
+                        raise ValueError("Mooncake decode requires an early layer reservation")
                     handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
                     transfer_id = handoff.kv.transfer_id
                     if transfer_id in recent:
@@ -467,6 +653,9 @@ def launch_split_worker(args) -> None:
                     # Engine must initialize CUDA first: Engine.__init__ rejects
                     # an already initialized torch.cuda context.
                     bind_device(scheduler.device)
+                configure_pipeline = getattr(backend, "configure_pipeline", None)
+                if configure_pipeline is not None:
+                    configure_pipeline(scheduler)
                 try:
                     print(
                         json.dumps(
@@ -483,6 +672,9 @@ def launch_split_worker(args) -> None:
                                 "transfer": getattr(backend, "health", lambda: {})(),
                                 "cuda_graph": False,
                                 "overlap": False,
+                                "kv_transfer_overlap": bool(
+                                    getattr(backend, "layered_transfer", False)
+                                ),
                             }
                         ),
                         flush=True,

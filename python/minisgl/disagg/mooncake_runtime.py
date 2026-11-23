@@ -23,7 +23,6 @@ from .control import endpoint_address, endpoint_name
 from .cuda_transfer import CudaTransfer
 from .transfer import TransferBackendUnavailable, TransferError
 
-
 # Unknown tickets must not lose their last reference: their native destructor
 # waits for physical completion with the GIL held. The launcher handles a failed
 # close with a nonzero process exit while this registry retains all allocations.
@@ -347,14 +346,36 @@ class MooncakeRuntime:
                     operation.ticket = None  # terminal native operation only
                 buffer.tensor = None
 
-    def submit_write(self, buffer: RegisteredBuffer, remote: dict) -> TransferOperation:
+    def recycle_operation(self, operation: TransferOperation) -> None:
+        """Retire a drained operation while retaining its startup registration."""
+        with operation.lock, self._lock:
+            self._owned_locked(operation.buffer)
+            if (operation.status not in ("completed", "failed_drained")
+                    or operation.ticket is None or not operation.ticket.drained
+                    or not operation.buffer.safe_to_release):
+                raise TransferError("cannot reuse a staging slot before native drain")
+            if self._operations.get(operation.buffer.key) is not operation:
+                raise TransferError("stale staging operation")
+            self._operations.pop(operation.buffer.key)
+            operation.ticket = None
+
+    def retire(self, reason: str) -> None:
+        with self._lock:
+            self._retire_reason = str(reason)
+
+    def submit_write(
+        self, buffer: RegisteredBuffer, remote: dict, *, nbytes: int | None = None
+    ) -> TransferOperation:
         self.check_available()
         if not isinstance(remote, dict) or set(remote) != {"session", "address", "nbytes"}:
             raise TransferError("incorrect Mooncake GPU target descriptor")
         endpoint_address(remote["session"])
         if type(remote["address"]) is not int or remote["address"] <= 0:
             raise TransferError("incorrect remote GPU address")
-        if type(remote["nbytes"]) is not int or remote["nbytes"] != buffer.nbytes:
+        nbytes = buffer.nbytes if nbytes is None else nbytes
+        if type(nbytes) is not int or not 0 < nbytes <= buffer.nbytes:
+            raise TransferError("write exceeds its registered staging slot")
+        if type(remote["nbytes"]) is not int or remote["nbytes"] != nbytes:
             raise TransferError("remote GPU capacity does not match the payload")
         with self._lock:
             self._owned_locked(buffer)
@@ -368,9 +389,9 @@ class MooncakeRuntime:
             with self.cuda.activate():
                 operation.ticket = self.engine.submit_scatter_write(
                     remote["session"],
-                    [buffer.address], [buffer.nbytes],
+                    [buffer.address], [nbytes],
                     [remote["address"]], [remote["nbytes"]],
-                    [[0]], [[0]], [[buffer.nbytes]],
+                    [[0]], [[0]], [[nbytes]],
                 )
             if operation.ticket is None or not callable(getattr(operation.ticket, "drain", None)):
                 raise TransferError("Mooncake did not return a drainable native operation")

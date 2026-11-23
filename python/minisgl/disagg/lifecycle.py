@@ -8,6 +8,7 @@ from .protocol import RequestHandoff, check_transfer_id
 class RequestPhase(str, Enum):
     QUEUED = "queued"
     PREFILLING = "prefilling"
+    PREFILLING_AND_TRANSFERRING = "prefilling_and_transferring"
     AWAITING_TRANSFER = "awaiting_transfer"
     TRANSFERRING = "transferring"
     DECODE_READY = "decode_ready"
@@ -22,9 +23,9 @@ _TERMINAL = {RequestPhase.FINISHED, RequestPhase.CANCELLED, RequestPhase.FAILED}
 
 class RequestLifecycle:
     '''P/D 分离系统中的请求生命周期状态机
-    
+
     记录一个推理请求当前执行到了哪个阶段，并限制请求只能按照合法的顺序进行状态转换。
-    它可以防止 Prefill 尚未完成就开始 KV 传输，或者 Decode 尚未确认收到 KV Cache 就开始执行推理。
+    整体交接与逐层重叠使用不同状态；Decode 必须在接收确认之后才能执行。
     '''
     """Owned by one scheduler event loop for one frontend request and transfer attempt."""
 
@@ -51,8 +52,19 @@ class RequestLifecycle:
     def complete_prefill(self, handoff: RequestHandoff) -> None:
         if self.uid != handoff.uid or self.transfer_id != handoff.kv.transfer_id:
             raise ValueError("handoff belongs to another request or attempt")
-        new = RequestPhase.AWAITING_TRANSFER if handoff.remaining_tokens else RequestPhase.FINISHED
-        self._step(RequestPhase.PREFILLING, new)
+        if self.phase is RequestPhase.PREFILLING_AND_TRANSFERRING:
+            # Even EOS must await the cancellation/drain receipt before resources
+            # can be retired. There may already be native writes in flight.
+            self._step(self.phase, RequestPhase.TRANSFERRING)
+        else:
+            new = RequestPhase.AWAITING_TRANSFER if handoff.remaining_tokens else RequestPhase.FINISHED
+            self._step(RequestPhase.PREFILLING, new)
+
+    def begin_prefill_transfer(self) -> None:
+        self._step(RequestPhase.PREFILLING, RequestPhase.PREFILLING_AND_TRANSFERRING)
+
+    def finish_without_decode(self) -> None:
+        self._step(RequestPhase.TRANSFERRING, RequestPhase.FINISHED)
 
     def begin_transfer(self) -> None:
         self._step(RequestPhase.AWAITING_TRANSFER, RequestPhase.TRANSFERRING)

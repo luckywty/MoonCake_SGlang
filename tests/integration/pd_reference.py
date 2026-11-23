@@ -57,6 +57,8 @@ class TinyEngine:
             values = self.kv_cache.v_cache(layer).view(-1, 8)
             keys[batch.out_loc.to(torch.long)] = k
             values[batch.out_loc.to(torch.long)] = v
+            if self.kv_cache.layer_ready is not None:
+                self.kv_cache.layer_ready(layer)
             results = []
             for i, position in enumerate(batch.positions.tolist()):
                 slots = self.page_table[row, : position + 1].to(torch.long)

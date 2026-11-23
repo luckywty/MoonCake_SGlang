@@ -29,6 +29,8 @@ class ServerArgs(SchedulerConfig):
     pd_max_pending_transfers: int = 32
     pd_max_quarantine_seconds: float = 300.0
     pd_mooncake_device: str = ""
+    pd_layers_per_chunk: int = 1
+    pd_staging_slots: int = 3
 
     @property
     def share_tokenizer(self) -> bool:
@@ -90,6 +92,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument("--pd-advertise-host", default=None)
     parser.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
     parser.add_argument("--pd-mooncake-host", default=None)
+    parser.add_argument("--pd-layers-per-chunk", type=int, default=ServerArgs.pd_layers_per_chunk)
+    parser.add_argument("--pd-staging-slots", type=int, default=ServerArgs.pd_staging_slots)
     parser.add_argument(
         "--pd-max-transfer-bytes", type=int, default=ServerArgs.pd_max_transfer_bytes
     )
@@ -291,6 +295,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             parser.error("--pd-max-registered-bytes must cover --pd-max-transfer-bytes")
         if kwargs["pd_max_pending_transfers"] <= 0:
             parser.error("--pd-max-pending-transfers must be positive")
+        if kwargs["pd_layers_per_chunk"] <= 0:
+            parser.error("--pd-layers-per-chunk must be positive")
+        if not 2 <= kwargs["pd_staging_slots"] <= 4:
+            parser.error("--pd-staging-slots must be between 2 and 4")
         if (
             not math.isfinite(kwargs["pd_max_quarantine_seconds"])
             or kwargs["pd_max_quarantine_seconds"] <= 0
