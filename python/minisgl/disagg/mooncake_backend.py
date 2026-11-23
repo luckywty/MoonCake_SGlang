@@ -71,6 +71,7 @@ class MooncakeTransferBackend:
         max_pending_transfers: int = 32,
         max_quarantine_seconds: float = 300.0,
         device_name: str = "",
+        rpc_port: int | None = None,
         _engine_module: str = "mooncake.engine",
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
@@ -115,6 +116,7 @@ class MooncakeTransferBackend:
             max_quarantine_seconds=max_quarantine_seconds,
             device_name=device_name,
             engine_module=_engine_module,
+            rpc_port=rpc_port,
         )
         self.endpoint = "rdma-sender"
         if bind is not None:
@@ -167,11 +169,16 @@ class MooncakeTransferBackend:
             status = "unavailable"
         elif status not in ("ready", "degraded"):
             status = "unavailable"
-        return {"status": status, "mooncake": {
-            **native, "control_endpoint": self.endpoint,
-            "receive_records": count, "control_connections": connections,
-            "control_error": error,
-        }}
+        return {
+            "status": status,
+            "mooncake": {
+                **native,
+                "control_endpoint": self.endpoint,
+                "receive_records": count,
+                "control_connections": connections,
+                "control_error": error,
+            },
+        }
 
     def _record_fatal(self, error: BaseException) -> None:
         with self._lock:
@@ -221,7 +228,8 @@ class MooncakeTransferBackend:
     @staticmethod
     def _validate_tensor(tensor: torch.Tensor, nbytes: int) -> None:
         if (
-            not isinstance(tensor, torch.Tensor) or tensor.device.type != "cuda"
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device.type != "cuda"
             or not tensor.is_contiguous()
             or tensor.numel() * tensor.element_size() != nbytes
         ):
@@ -265,8 +273,11 @@ class MooncakeTransferBackend:
 
     def _identity(self, entry: _Receive) -> tuple:
         return (
-            entry.target.transfer_id, entry.target.locator,
-            self.runtime.info["session"], entry.target.nbytes, entry.sender_session,
+            entry.target.transfer_id,
+            entry.target.locator,
+            self.runtime.info["session"],
+            entry.target.nbytes,
+            entry.sender_session,
         )
 
     def _forget(self, entry: _Receive, result: str) -> None:
@@ -276,7 +287,10 @@ class MooncakeTransferBackend:
             if self._attempts.get(entry.target.transfer_id) == entry.target.locator:
                 self._attempts.pop(entry.target.transfer_id)
             if entry.sender_session is not None:
-                self._tombstones[self._identity(entry)] = (entry.terminal or "not_submitted", result)
+                self._tombstones[self._identity(entry)] = (
+                    entry.terminal or "not_submitted",
+                    result,
+                )
                 while len(self._tombstones) > 1024:
                     self._tombstones.popitem(last=False)
 
@@ -299,26 +313,35 @@ class MooncakeTransferBackend:
         try:
             with self._connection(target.endpoint) as sock:
                 channel = Channel(sock, self.timeout, self._stop)
-                channel.send({
-                    "op": "prepare", "backend": _TRANSPORT,
-                    "metadata": json.loads(meta.to_wire()),
-                    "ticket": json.loads(target.to_wire()),
-                    "source_session": self.runtime.info["session"],
-                })
+                channel.send(
+                    {
+                        "op": "prepare",
+                        "backend": _TRANSPORT,
+                        "metadata": json.loads(meta.to_wire()),
+                        "ticket": json.loads(target.to_wire()),
+                        "source_session": self.runtime.info["session"],
+                    }
+                )
                 ready = channel.receive()
                 if set(ready) != {"status", "backend", "target"} or (
                     ready["status"] != "ready" or ready["backend"] != _TRANSPORT
                 ):
                     raise TransferError(str(ready.get("error", "incompatible transfer backend")))
                 candidate = ready["target"]
-                if not isinstance(candidate, dict) or set(candidate) != {"session", "address", "nbytes"}:
+                if not isinstance(candidate, dict) or set(candidate) != {
+                    "session",
+                    "address",
+                    "nbytes",
+                }:
                     raise TransferError("incorrect Mooncake remote descriptor")
                 if not isinstance(candidate["session"], str):
                     raise TransferError("incorrect Mooncake remote session")
                 endpoint_address(candidate["session"])
                 if (
-                    type(candidate["address"]) is not int or candidate["address"] <= 0
-                    or type(candidate["nbytes"]) is not int or candidate["nbytes"] != meta.nbytes
+                    type(candidate["address"]) is not int
+                    or candidate["address"] <= 0
+                    or type(candidate["nbytes"]) is not int
+                    or candidate["nbytes"] != meta.nbytes
                 ):
                     raise TransferError("incorrect Mooncake remote allocation")
                 remote = candidate
@@ -354,7 +377,9 @@ class MooncakeTransferBackend:
                 self._schedule_finalize(target, remote, terminal)
             elif remote is not None and not submitted:
                 self._schedule_finalize(target, remote, "not_submitted")
-            if isinstance(exc, (CancelledError, TransferBackendUnavailable, KeyboardInterrupt, SystemExit)):
+            if isinstance(
+                exc, (CancelledError, TransferBackendUnavailable, KeyboardInterrupt, SystemExit)
+            ):
                 raise
             raise TransferError(f"Mooncake GPU transfer failed: {exc}") from exc
         finally:
@@ -383,11 +408,14 @@ class MooncakeTransferBackend:
         self, target: ReceiveTicket, remote: dict, status: str, operation: str
     ) -> dict:
         return {
-            "op": operation, "backend": _TRANSPORT,
-            "transfer_id": target.transfer_id, "locator": target.locator,
+            "op": operation,
+            "backend": _TRANSPORT,
+            "transfer_id": target.transfer_id,
+            "locator": target.locator,
             "receiver_session": remote["session"],
             "source_session": self.runtime.info["session"],
-            "nbytes": target.nbytes, "native_status": status,
+            "nbytes": target.nbytes,
+            "native_status": status,
         }
 
     @staticmethod
@@ -395,7 +423,8 @@ class MooncakeTransferBackend:
         if (
             set(reply) != {"status", "transfer_id", "locator"}
             or reply["status"] not in ("complete", "retired", "quarantined")
-            or reply["transfer_id"] != target.transfer_id or reply["locator"] != target.locator
+            or reply["transfer_id"] != target.transfer_id
+            or reply["locator"] != target.locator
         ):
             raise TransferError(str(reply.get("error", "incorrect Mooncake completion receipt")))
         return reply["status"]
@@ -526,7 +555,8 @@ class MooncakeTransferBackend:
                 entry.exposed = True
                 remote = {
                     "session": self.runtime.info["session"],
-                    "address": entry.buffer.address, "nbytes": entry.buffer.nbytes,
+                    "address": entry.buffer.address,
+                    "nbytes": entry.buffer.nbytes,
                 }
                 channel.send({"status": "ready", "backend": _TRANSPORT, "target": remote})
             terminal = channel.receive()
@@ -548,21 +578,32 @@ class MooncakeTransferBackend:
 
     def _settle_receive(self, message: dict) -> dict:
         if set(message) != {
-            "op", "backend", "transfer_id", "locator", "receiver_session",
-            "source_session", "nbytes", "native_status",
+            "op",
+            "backend",
+            "transfer_id",
+            "locator",
+            "receiver_session",
+            "source_session",
+            "nbytes",
+            "native_status",
         } or (
-            message["op"] not in ("terminal", "finalize") or message["backend"] != _TRANSPORT
+            message["op"] not in ("terminal", "finalize")
+            or message["backend"] != _TRANSPORT
             or not isinstance(message["native_status"], str)
             or message["native_status"] not in _TERMINAL_STATES
             or type(message["nbytes"]) is not int
-            or any(not isinstance(message[key], str) for key in (
-                "transfer_id", "locator", "receiver_session", "source_session"
-            ))
+            or any(
+                not isinstance(message[key], str)
+                for key in ("transfer_id", "locator", "receiver_session", "source_session")
+            )
         ):
             raise TransferError("incorrect native completion message")
         identity = (
-            message["transfer_id"], message["locator"], message["receiver_session"],
-            message["nbytes"], message["source_session"],
+            message["transfer_id"],
+            message["locator"],
+            message["receiver_session"],
+            message["nbytes"],
+            message["source_session"],
         )
         with self._lock:
             entry = self._receives.get(message["locator"])
@@ -609,7 +650,9 @@ class MooncakeTransferBackend:
                     result = "quarantined"
                 entry.done.set()
         return {
-            "status": result, "transfer_id": message["transfer_id"], "locator": message["locator"]
+            "status": result,
+            "transfer_id": message["transfer_id"],
+            "locator": message["locator"],
         }
 
     def close(self) -> None:

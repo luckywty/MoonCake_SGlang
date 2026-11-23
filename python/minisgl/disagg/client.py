@@ -28,11 +28,17 @@ class RemoteCapacityError(RemoteWorkerError, AdmissionError):
     pass
 
 
+class RemoteUnavailableError(RemoteWorkerError):
+    pass
+
+
 def response(channel: Channel, status: str) -> dict:
     message = channel.receive()
     if message.get("status") == "error":
         if message.get("code") == "busy":
             raise RemoteCapacityError(str(message.get("error", "worker capacity is busy")))
+        if message.get("code") == "unavailable":
+            raise RemoteUnavailableError(str(message.get("error", "worker is retired")))
         raise RemoteWorkerError(str(message.get("error", "remote worker failed")))
     if message.get("status") != status:
         raise ValueError(f"expected worker response {status}")
@@ -59,12 +65,15 @@ class PDClient:
         self.timeout = timeout
         self.admission = AdmissionBudget(max_inflight_requests, max_inflight_tokens)
 
-    def stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None):
+    def stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None):
         # Validate before acquiring a shared budget. Each admitted stream owns
         # its own sockets; only accounting updates hold the condition lock.
-        StartRequest(str(uuid4()), 0, tuple(prompt_ids), max_tokens, ignore_eos)
+        request_id = str(uuid4()) if request_id is None else request_id
+        StartRequest(request_id, 0, tuple(prompt_ids), max_tokens, ignore_eos)
         with self.admission.reserve(len(prompt_ids) + max_tokens, self.timeout, cancel):
-            yield from self._stream(prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel)
+            yield from self._stream(
+                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id
+            )
 
     def _stream(
         self,
@@ -73,9 +82,12 @@ class PDClient:
         *,
         ignore_eos: bool = False,
         cancel: Event | None = None,
+        request_id=None,
     ):
         # 构造一个请求
-        request = StartRequest(str(uuid4()), 0, tuple(prompt_ids), max_tokens, ignore_eos)
+        request = StartRequest(
+            request_id or str(uuid4()), 0, tuple(prompt_ids), max_tokens, ignore_eos
+        )
         state = RequestLifecycle(
             request.uid, request.transfer_id
         )  # 它用于跟踪请求经过的执行阶段，它记录和检查请求的阶段变化
@@ -197,24 +209,59 @@ class PDClient:
                         pass
 
     # 这个 generate() 是 stream() 的非流式封装：把逐个产生的 token 编号收集成列表，等生成结束后一次性返回。
-    def generate(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None) -> list[int]:
-        return list(self.stream(prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel))
+    def generate(
+        self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None
+    ) -> list[int]:
+        return list(
+            self.stream(
+                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id
+            )
+        )
 
 
 def main() -> None:
+    from .cluster_config import add_routing_args, remote_addresses
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prefill", required=True)
-    parser.add_argument("--decode", required=True)
+    parser.add_argument("--prefill")
+    parser.add_argument("--decode")
+    add_routing_args(parser)
     parser.add_argument("--input-ids", required=True, help="JSON array of input token IDs")
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
-    client = PDClient(args.prefill, args.decode, timeout=args.timeout)
-    tokens = client.generate(
-        json.loads(args.input_ids), args.max_tokens, ignore_eos=args.ignore_eos
-    )
-    print(json.dumps({"token_ids": tokens, "completion_tokens": len(tokens)}))
+    try:
+        prefill, decode = remote_addresses(args)
+        if prefill:
+            if args.prefill or args.decode:
+                raise ValueError("use either single endpoints or address lists")
+            from .routed_client import RoutedPDClient
+
+            client = RoutedPDClient(
+                prefill,
+                decode,
+                timeout=args.timeout,
+                routing_seed=args.routing_seed,
+                health_interval=args.health_interval,
+                health_timeout=args.health_timeout,
+                ready_timeout=args.worker_ready_timeout,
+                max_quarantined_bytes=args.max_quarantined_bytes,
+            )
+        elif args.prefill and args.decode:
+            client = PDClient(args.prefill, args.decode, timeout=args.timeout)
+        else:
+            raise ValueError("both P and D endpoints or address lists are required")
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        tokens = client.generate(
+            json.loads(args.input_ids), args.max_tokens, ignore_eos=args.ignore_eos
+        )
+        print(json.dumps({"token_ids": tokens, "completion_tokens": len(tokens)}))
+    finally:
+        if hasattr(client, "close"):
+            client.close()
 
 
 if __name__ == "__main__":

@@ -37,8 +37,9 @@ GPU 循环每轮推进命令、传输完成与安装状态，然后组成下一�
    主循环用 `event.query()` 检查完成，归还该接收切片，发送 `installed` 并加入 DecodeManager。
    每次 `_forward()` 为当前 batch 的每个请求各生成一个 token；新安装请求动态加入，结束请求单独移出。
 
-`PDClient` 仍固定一组 P/D 端点。多个客户端可向同一个 P 提供不同 D 的票据；本次没有增加自动
-发现、选路或负载均衡。`n=1` 指每个 HTTP 请求返回一个候选，与服务并发及 GPU batch 大小无关。
+原有 `PDClient` 保留单组端点，新增 `RoutedPDClient` 支持健康地址池随机选路、长连接和 reserve 重选。
+不同客户端或路由请求可向同一个 P 提供不同 D 的票据，详见 [多 Worker 说明](multi_worker.md)。
+`n=1` 指每个 HTTP 请求返回一个候选，与服务并发及 GPU batch 大小无关。
 
 ## 准入与容量参数
 

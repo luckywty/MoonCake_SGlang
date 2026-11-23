@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from contextlib import suppress
+import logging
+from contextlib import asynccontextmanager, suppress
 from threading import Event, Lock
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from minisgl.tokenizer.detokenize import DetokenizeManager
 
 from .admission import AdmissionError
 from .client import PDClient, RemoteWorkerError
+from .cluster_config import add_routing_args, remote_addresses
 
 """提供 HTTP 接口，处理分词、文本输出和流式响应
 接收用户的 HTTP 请求、Tokenization、调用 P/D 推理客户端，
@@ -25,7 +27,17 @@ from .client import PDClient, RemoteWorkerError
 
 
 def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            if hasattr(client, "start"):
+                await asyncio.to_thread(client.start)
+            yield
+        finally:
+            if hasattr(client, "close"):
+                await asyncio.to_thread(client.close)
+
+    app = FastAPI(lifespan=lifespan)
 
     def finish_reason(tokens, req):
         stopped_by_eos = tokens and not req.ignore_eos and tokens[-1] == tokenizer.eos_token_id
@@ -61,11 +73,18 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
         else:
             raise HTTPException(400, "messages or prompt is required")
         cancel = Event()
-        request_id = "chatcmpl-" + str(uuid4())
+        routing_request_id = str(uuid4())
+        request_id = "chatcmpl-" + routing_request_id
 
         async def chunks():
             watcher = asyncio.create_task(disconnect(request, cancel))
-            iterator = client.stream(ids, req.max_tokens, ignore_eos=req.ignore_eos, cancel=cancel)
+            iterator = client.stream(
+                ids,
+                req.max_tokens,
+                ignore_eos=req.ignore_eos,
+                cancel=cancel,
+                request_id=routing_request_id,
+            )
             tokens = []
             detokenizer = DetokenizeManager(tokenizer)
             iterator_lock = Lock()
@@ -138,7 +157,12 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
         watcher = asyncio.create_task(disconnect(request, cancel))
         try:
             tokens = await asyncio.to_thread(
-                client.generate, ids, req.max_tokens, ignore_eos=req.ignore_eos, cancel=cancel
+                client.generate,
+                ids,
+                req.max_tokens,
+                ignore_eos=req.ignore_eos,
+                cancel=cancel,
+                request_id=routing_request_id,
             )
             detokenizer = DetokenizeManager(tokenizer)
             content = "".join(
@@ -187,8 +211,9 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prefill", required=True)
-    parser.add_argument("--decode", required=True)
+    parser.add_argument("--prefill")
+    parser.add_argument("--decode")
+    add_routing_args(parser)
     parser.add_argument("--model", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1940)
@@ -196,17 +221,36 @@ def main() -> None:
     parser.add_argument("--max-inflight-requests", type=int, default=128)
     parser.add_argument("--max-inflight-tokens", type=int, default=1048576)
     args = parser.parse_args()
+    try:
+        if args.prefill or args.decode:
+            if not (args.prefill and args.decode) or args.prefill_addrs or args.decode_addrs:
+                raise ValueError("use either --prefill/--decode or both address lists")
+            args.prefill_addrs, args.decode_addrs = [args.prefill], [args.decode]
+        prefill, decode = remote_addresses(args)
+        if not prefill:
+            raise ValueError("prefill and decode addresses are required")
+        from .routed_client import RoutedPDClient
+
+        client = RoutedPDClient(
+            prefill,
+            decode,
+            timeout=args.timeout,
+            routing_seed=args.routing_seed,
+            max_inflight_requests=args.max_inflight_requests,
+            max_inflight_tokens=args.max_inflight_tokens,
+            health_interval=args.health_interval,
+            health_timeout=args.health_timeout,
+            ready_timeout=args.worker_ready_timeout,
+            max_quarantined_bytes=args.max_quarantined_bytes,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    logging.basicConfig(level=logging.INFO)
     import uvicorn
     from minisgl.utils import load_tokenizer
 
     app = create_app(
-        PDClient(
-            args.prefill,
-            args.decode,
-            timeout=args.timeout,
-            max_inflight_requests=args.max_inflight_requests,
-            max_inflight_tokens=args.max_inflight_tokens,
-        ),
+        client,
         load_tokenizer(args.model),
         args.model,
     )

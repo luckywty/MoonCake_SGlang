@@ -35,6 +35,8 @@ class ServerArgs(SchedulerConfig):
     pd_max_queued_tokens: int | None = None
     pd_batch_wait_ms: float = 2.0
     pd_output_queue_size: int = 128
+    worker_id: str = ""
+    pd_mooncake_port: int | None = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -96,6 +98,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument("--pd-advertise-host", default=None)
     parser.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
     parser.add_argument("--pd-mooncake-host", default=None)
+    parser.add_argument("--worker-id", default="")
+    parser.add_argument("--pd-mooncake-port", type=int, default=None)
     parser.add_argument("--pd-layers-per-chunk", type=int, default=ServerArgs.pd_layers_per_chunk)
     parser.add_argument("--pd-staging-slots", type=int, default=ServerArgs.pd_staging_slots)
     parser.add_argument(
@@ -286,6 +290,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     if kwargs["worker_role"] == WorkerRole.UNIFIED.value and kwargs["pd_transfer_backend"] != "tcp":
         parser.error("--pd-transfer-backend mooncake requires a split worker role")
     if kwargs["worker_role"] != WorkerRole.UNIFIED.value:
+        te_port = kwargs["pd_mooncake_port"]
+        if te_port is not None and (
+            not 0 < te_port < 65536 or kwargs["pd_transfer_backend"] != "mooncake"
+        ):
+            parser.error("--pd-mooncake-port requires Mooncake and a valid TCP port")
+        if te_port is not None:
+            from minisgl.disagg.cluster_config import validate_mooncake_port
+
+            try:
+                validate_mooncake_port(te_port)
+            except ValueError as exc:
+                parser.error(str(exc))
         if kwargs["tensor_parallel_size"] != 1 or kwargs["use_dummy_weight"]:
             parser.error("Phase 2 split workers require TP=1 and real model weights")
         if kwargs["shell_mode"] or run_shell:
@@ -348,6 +364,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
                 parser.error("KV data port must differ from the worker and distributed ports")
             if kwargs["server_host"] in ("0.0.0.0", "::") and not kwargs["pd_advertise_host"]:
                 parser.error("wildcard decode bind requires --pd-advertise-host")
+        if te_port is not None and te_port in (
+            kwargs["server_port"],
+            kwargs["server_port"] + 1,
+            data_port,
+        ):
+            parser.error("TE port must differ from control, distributed and backend data ports")
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

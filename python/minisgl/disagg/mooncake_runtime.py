@@ -19,6 +19,7 @@ from typing import Callable
 
 import torch
 
+from .cluster_config import validate_mooncake_port
 from .control import endpoint_address, endpoint_name
 from .cuda_transfer import CudaTransfer
 from .transfer import TransferBackendUnavailable, TransferError
@@ -67,6 +68,7 @@ class MooncakeRuntime:
         max_quarantine_seconds: float = 300.0,
         device_name: str = "",
         engine_module: str = "mooncake.engine",
+        rpc_port: int | None = None,
     ):
         if (
             not isinstance(local_host, str)
@@ -76,6 +78,9 @@ class MooncakeRuntime:
             raise ValueError("Mooncake requires a reachable local host, not a wildcard")
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Mooncake timeout must be finite and positive")
+        if rpc_port is not None:
+            validate_mooncake_port(rpc_port)
+        self.rpc_port = rpc_port
         if type(max_transfer_bytes) is not int or max_transfer_bytes <= 0:
             raise ValueError("max_transfer_bytes must be positive")
         if max_registered_bytes is None:
@@ -166,6 +171,10 @@ class MooncakeRuntime:
             if device.type != "cuda" or device.index is None:
                 raise TransferBackendUnavailable("GPU Mooncake needs a CUDA Worker")
             devices = self._configure_rdma(self.device_name)
+            if self.rpc_port is not None:
+                # Classic P2PHANDSHAKE chooses within this range, including
+                # when initialize(local_host:port) would ignore a requested port.
+                os.environ["MC_MIN_RPC_PORT"] = os.environ["MC_MAX_RPC_PORT"] = str(self.rpc_port)
             cuda = CudaTransfer(device)
             try:
                 module = importlib.import_module(self.engine_module)
@@ -208,6 +217,8 @@ class MooncakeRuntime:
                     port = self.engine.get_rpc_port()
                     if type(port) is not int or not 0 < port < 65536:
                         raise TransferError("Mooncake returned an invalid RPC port")
+                    if self.rpc_port is not None and port != self.rpc_port:
+                        raise TransferError("Mooncake ignored its configured RPC port range")
                     self.session = endpoint_name(self.local_host, port)
                 except Exception as exc:
                     self._retire_reason = f"Mooncake initialization failed: {exc}"

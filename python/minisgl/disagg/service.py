@@ -34,6 +34,7 @@ from .transfer import TransferBackendUnavailable, TransferCapacityError
 @dataclass(eq=False)
 class Session:
     output_limit: int = 128
+    request_id: str | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
 
@@ -126,6 +127,26 @@ class WorkerService:
             **self.stats,
         }
 
+    def capabilities(self):
+        return {
+            "status": "capabilities",
+            "layered_transfer": self.layered,
+            "concurrent_requests": True,
+            "multiplex_version": 1,
+        }
+
+    def health(self):
+        native = getattr(self.backend, "health", lambda: {})()
+        return {
+            **self.snapshot,
+            "status": native.get("status", "ready"),
+            "worker_id": getattr(self.s, "worker_id", ""),
+            "transfer_backend": getattr(self.backend, "name", "tcp"),
+            "layered_transfer": self.layered,
+            "multiplex_version": 1,
+            "transfer": native,
+        }
+
     def _aligned(self, n):
         p = self.s.layout.page_size
         return (n + p - 1) // p * p
@@ -180,12 +201,7 @@ class WorkerService:
             if set(message) != allowed:
                 raise ValueError("prefill requires the worker's transfer protocol")
             request = StartRequest.from_object(message["request"])
-        elif (
-            op == "reserve"
-            and not self.is_prefill
-            and self.layered
-            and set(message) == {"op", "request"}
-        ):
+        elif op == "reserve" and not self.is_prefill and set(message) == {"op", "request"}:
             request = StartRequest.from_object(message["request"])
         elif (
             op == "decode"
@@ -205,6 +221,8 @@ class WorkerService:
         else:
             raise ValueError("operation does not match worker role")
         self.s._validate_request(request.prompt_ids, request.max_tokens)
+        if session.request_id is not None and session.request_id != request.transfer_id:
+            raise ValueError("request_id does not match transfer_id")
         if request.transfer_id in self.recent:
             raise ValueError("duplicate transfer attempt")
         if (
@@ -246,10 +264,14 @@ class WorkerService:
             if self.layered:
                 ctx.ticket = self.backend.reserve_layers(request, self.s.eos_token_id)
             else:
-                ctx.handoff = handoff
                 # Host payloads are admission-bounded too, independently of KV pages.
-                self._check_host_budget(handoff.kv.nbytes)
-                ctx.staging = bytearray(handoff.kv.nbytes)
+                size = len(request.prompt_ids) * self.s.layout.bytes_per_token
+                self._check_host_budget(size)
+                ctx.staging = bytearray(size)
+                if op == "reserve":
+                    session.emit({"status": "reserved", "transfer_id": request.transfer_id})
+                    return
+                ctx.handoff = handoff
                 ctx.ticket = self.backend.prepare_receive(handoff.kv, self.s.layout, ctx.staging)
             session.emit({"status": "ready", "ticket": json.loads(ctx.ticket.to_wire())})
 
@@ -284,6 +306,17 @@ class WorkerService:
                 return
             return self._start(session, message)
         op = message.get("op")
+        if op == "prepare" and not self.layered and ctx.phase == "reserved" and ctx.handoff is None:
+            if (
+                set(message) != {"op", "transfer_id", "handoff"}
+                or message["transfer_id"] != ctx.request.transfer_id
+            ):
+                raise ValueError("invalid reserved payload preparation")
+            ctx.handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
+            self._validate_handoff(ctx.request, ctx.handoff)
+            ctx.ticket = self.backend.prepare_receive(ctx.handoff.kv, self.s.layout, ctx.staging)
+            session.emit({"status": "ready", "ticket": json.loads(ctx.ticket.to_wire())})
+            return
         if op in ("cancel", "release") and message == {
             "op": op,
             "transfer_id": ctx.request.transfer_id,
@@ -299,6 +332,8 @@ class WorkerService:
             if self.layered:
                 ctx.handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
                 self._validate_handoff(ctx.request, ctx.handoff)
+            elif ctx.handoff is None or ctx.ticket is None:
+                raise ValueError("payload must be prepared before commit")
             ctx.phase = "committed"
             return
         if (
@@ -674,25 +709,16 @@ class WorkerService:
             try:
                 with sock:
                     message = channel.receive()
+                    if message.get("op") == "multiplex":
+                        from .mux_server import serve_multiplex
+
+                        serve_multiplex(self, sock, channel, message, stopping)
+                        return
                     if message == {"op": "capabilities"}:
-                        channel.send(
-                            {
-                                "status": "capabilities",
-                                "layered_transfer": self.layered,
-                                "concurrent_requests": True,
-                            }
-                        )
+                        channel.send(self.capabilities())
                         message = channel.receive()
                     if message == {"op": "health"}:
-                        native = getattr(self.backend, "health", lambda: {})()
-                        channel.send(
-                            {
-                                **self.snapshot,
-                                "status": native.get("status", "ready"),
-                                "transfer_backend": getattr(self.backend, "name", "tcp"),
-                                "transfer": native,
-                            }
-                        )
+                        channel.send(self.health())
                         return
                     self.submit(session, message)
                     while not stopping.is_set():

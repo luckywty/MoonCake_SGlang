@@ -38,6 +38,15 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
 
 def launch_server(run_shell: bool = False) -> None:
+    from minisgl.disagg.launcher import is_cluster_command
+
+    if is_cluster_command(sys.argv[1:]):
+        if run_shell:
+            raise ValueError("multi-Worker clusters do not support shell mode")
+        from minisgl.disagg.launcher import main
+
+        main(sys.argv[1:])
+        return
     from .api_server import run_api_server
     from .args import parse_args
 

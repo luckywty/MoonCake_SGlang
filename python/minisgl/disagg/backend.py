@@ -29,6 +29,7 @@ def create_transfer_backend(args):
             max_pending_transfers=getattr(args, "pd_max_pending_transfers", 32),
             max_quarantine_seconds=getattr(args, "pd_max_quarantine_seconds", 300.0),
             device_name=getattr(args, "pd_mooncake_device", ""),
+            rpc_port=getattr(args, "pd_mooncake_port", None),
             layers_per_chunk=getattr(args, "pd_layers_per_chunk", 1),
             staging_slots=getattr(args, "pd_staging_slots", 3),
             **kwargs,

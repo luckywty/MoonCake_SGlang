@@ -91,6 +91,7 @@ class PDWorkerScheduler(Scheduler):
             self.shutdown()
             raise ValueError("Phase 2 requires the MHAKVCache transfer layout")
         self.role = config.worker_role
+        self.worker_id = getattr(config, "worker_id", "")
         pool = self.engine.kv_cache
         self.layout = KVLayout(
             fingerprint,
@@ -570,6 +571,7 @@ def launch_split_worker(args) -> None:
                                 "data_endpoint": backend.endpoint,
                                 "transfer_backend": getattr(backend, "name", "tcp"),
                                 "worker_pid": os.getpid(),
+                                "worker_id": getattr(args, "worker_id", ""),
                                 "kv_memory": (
                                     "cuda" if getattr(backend, "gpu_payload", False) else "host"
                                 ),
