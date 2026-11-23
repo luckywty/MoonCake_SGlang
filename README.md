@@ -2,11 +2,11 @@
 
 基于 [Mini-SGLang](https://github.com/sgl-project/mini-sglang) 的大模型推理项目，
 保留 Unified 推理引擎，扩展 **Prefill/Decode（P/D）分离**，并接入 Mooncake Transfer Engine。
-当前重点是 GPU KV Cache 的交接、逐层传输与后续 Prefill 计算重叠，以及资源生命周期管理。
+当前重点是多请求组批推理、逐层 KV 传输与后续 Prefill 计算重叠，以及独立取消和资源回收。
 Python 包名和命令入口仍为 `minisgl`。
 
-> **当前状态（2026-11-23，代码基线 `b106db5`）**：独立 P/D Worker、TCP 参考传输和 Mooncake
-> 逐层异步传输机制已实现，有历史 CPU/TCP 记录及受控 CPU 测试。真实 GPU/RDMA 正确性、
+> **当前版本（2026-11-23）**：独立 P/D Worker、并发控制面、Prefill/Decode
+> 组批和 Mooncake 逐层异步传输已实现，有历史 CPU/TCP 记录及受控 CPU 测试。真实 GPU/RDMA 正确性、
 > 双服务器运行、实际重叠比例与性能收益尚未验收。下文部署命令是配置模板。
 
 ## 功能与边界
@@ -15,14 +15,15 @@ Python 包名和命令入口仍为 `minisgl`。
 |---|---|
 | Unified 推理 | 保留上游连续组批、Radix 前缀缓存、Chunked Prefill、CUDA Graph、调度重叠和 TP。 |
 | 独立 P/D Worker | P 处理 prompt 并生成首 token；D 导入 prompt KV 后生成后续 token。 |
+| 多请求推理 | 异步控制连接、Prefill batch、安装完成后动态加入 Continuous Batching Decode；按请求取消和回收。 |
 | TCP 参考传输 | 完整 Prefill 后交接 CPU 字节，具有长度、SHA-256、票据与完成确认检查。 |
 | Mooncake GPU 传输 | Worker 内持有 TE，启动期预注册显存池，按层组异步打包、发送，不经 CPU KV 暂存或 helper。 |
 | HTTP 网关 | 独立进程分词，提供 `/v1/chat/completions` 非流式/SSE、`/v1/models` 和断连取消。 |
 | 资源管理 | D 私有 KV 页、异常回滚、槽位排空后复用、GPU reader 保护、完成未知隔离及 Worker 退役。 |
 
 当前 split 模式限制为 **TP=1、greedy、真实 safetensors 权重、未量化 MHA KV、eager 执行**。
-每个 Worker 一次服务一个请求，关闭 CUDA Graph 和原有 CPU/GPU 调度重叠。
-Mooncake 的逐层计算/通信重叠是独立机制；尚未实现多请求组批、多 P/D 发现或负载均衡。
+每个 Worker 支持多个请求，由单个 GPU 调度主循环组 batch；关闭 CUDA Graph 和原有 CPU/GPU 调度重叠。
+Mooncake 的逐层计算/通信重叠是独立机制；尚未实现多 P/D 自动发现或负载均衡。
 
 模型源码包含 Llama、Qwen2、Qwen3、Qwen3MoE 和 Mistral；这些模型尚未全部通过新的
 P/D/RDMA 验收。上游性能结果也不代表本项目逐层传输版本的性能。
@@ -63,8 +64,28 @@ P GPU KV 池 → transfer_stream gather → 预注册环形槽位
    后台等待该 event，打包到空闲槽位，等待打包完成后提交异步 RDMA Write。
 4. 一个槽位的原生操作进入终态、且 `ticket.drained` 为真后，才允许复用。
    槽位满时由后台线程等待，逐层计算回调不等待传输。
-5. P 先返回首 token，再收敛剩余传输。D 校验完整成功证明、处理 GPU 可见性，
-   收到 `commit` 后安装 KV；安装同步完成才归还接收租约并开始 Decode。
+5. P 分别返回 batch 内各请求的首 token，按请求收敛传输、返回 `sent`。
+   D 收到 `commit` 后在独立 stream 安装 KV；主循环通过 `event.query()` 确认完成，
+   归还该接收切片，并将请求加入活跃 Decode batch。
+
+D 的连续接收池支持多个互不重叠的租约；P 的 `BatchTransferPlan` 绑定批内各请求的 slots 和目标票据。
+同目标复用控制连接，不同目标独立提交；一个请求取消或首 token 为 EOS 不会取消同批其他请求。
+并发、页预算与启动参数详见[多请求调度说明](docs/pd/batching.md)。
+
+### 多请求组批与退出
+
+Worker 控制线程持续接收请求；GPU 主循环通过 `PrefillManager` 和 `DecodeManager` 组批执行前向。
+批次成员在每轮前向完成后调整，实际 batch 大小取决于到达时间、token 预算、请求表行及 KV 页容量。
+
+- **P 完成 Prefill**：返回首 token，退出后续 Prefill 调度。后台 gather 不再读取源 KV 后，
+  归还 P 的请求表行和私有 KV 占用；Staging 槽位仍须等 RDMA 排空，客户端请求继续在 D 生成。
+- **D 完成安装**：以 `event.query()` 确认后归还接收切片，动态加入活跃 Decode batch。
+- **D 结束生成**：遇到 EOS（未忽略 EOS）、达到预算或取消后，单独移出并回收资源。
+  其余请求继续，已经就绪且容量允许的新请求可加入后续 batch。
+
+例如 Decode batch 为 `[A, B, C]`，B 结束且 D 已安装就绪时，后续 batch 可以是 `[A, C, D]`。
+回收表示容量可复用；显存池常驻，Radix 前缀缓存可能保留可驱逐 KV，显存占用不必立即下降。
+`n=1` 指一个 HTTP 请求生成一个候选，不限制多请求并发或 GPU batch 大小。
 
 当前使用 Chunked Prefill 时，**在最后一个 token chunk 中逐层发送完整 prompt KV**，
 其中包含较早 chunk 和命中前缀的 KV；尚未实现每个 token chunk 的增量发送。
@@ -139,7 +160,8 @@ Unified 是默认角色，可省略 `--worker-role unified`；多 GPU 使用 `--
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python python -m minisgl \
   --model /models/Qwen3-0.6B --worker-role prefill \
   --host 127.0.0.1 --port 1919 --dtype bfloat16 \
-  --attention-backend fi --page-size 1 --pd-transfer-backend tcp
+  --attention-backend fi --page-size 1 --pd-transfer-backend tcp \
+  --max-running-requests 32 --max-prefill-length 8192
 ```
 
 ```bash
@@ -147,7 +169,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python python -m minisgl \
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=python python -m minisgl \
   --model /models/Qwen3-0.6B --worker-role decode \
   --host 127.0.0.1 --port 1929 --pd-data-port 1931 --dtype bfloat16 \
-  --attention-backend fi --page-size 1 --pd-transfer-backend tcp
+  --attention-backend fi --page-size 1 --pd-transfer-backend tcp \
+  --max-running-requests 32
 ```
 
 Worker 就绪后运行 Token ID 客户端：
@@ -207,7 +230,8 @@ P/D Worker 控制端口不提供 HTTP。网关独立加载 tokenizer，不创建
 ```bash
 PYTHONPATH=python python -m minisgl.disagg.gateway \
   --prefill 10.0.0.11:1919 --decode 10.0.0.12:1929 \
-  --model /models/Qwen3-0.6B --host 0.0.0.0 --port 1940
+  --model /models/Qwen3-0.6B --host 0.0.0.0 --port 1940 \
+  --max-inflight-requests 32 --max-inflight-tokens 65536
 ```
 
 同机 TCP 配置将 P/D 地址改为 `127.0.0.1:1919` 和 `127.0.0.1:1929`。
@@ -228,6 +252,8 @@ curl http://127.0.0.1:1940/v1/chat/completions \
 | 参数 | 默认值 / 含义 |
 |---|---|
 | `--worker-role` | 默认 `unified`；split 选择 `prefill` 或 `decode`。 |
+| `--max-running-requests` | 默认 256；Worker 的请求表行容量，实际并发还受页、准入和传输预算限制。 |
+| `--max-prefill-length` | 默认 8192；每个 Prefill batch 的 token 预算，可分块处理长 prompt。 |
 | `--pd-transfer-backend` | 默认 `tcp`；`mooncake` 启用逐层 GPU 路径。 |
 | `--pd-layers-per-chunk` | 默认 1；每组传几层，尾组可不足，P/D 保持一致。 |
 | `--pd-staging-slots` | 默认 3；P 环形槽位数量，范围 2～4。 |
@@ -238,16 +264,25 @@ curl http://127.0.0.1:1940/v1/chat/completions \
 | `--pd-timeout` | 默认 120 秒；超时不能证明原生 DMA 已停止。 |
 | `--pd-max-transfer-bytes` | 默认 1 GiB；限制完整 prompt KV 大小，并用于计算启动池容量。 |
 | `--pd-max-registered-bytes` | 默认单次上限的两倍；每个 Worker 的注册显存预算。 |
-| `--pd-max-pending-transfers` | 默认 32；限制注册区数量，不代表模型请求并发数。 |
+| `--pd-max-pending-transfers` | 默认 32；限制注册数及 Mooncake 在途请求、接收租约和目标连接数。 |
+| `--pd-max-queued-requests` | 默认 128；尚未回收的已准入请求上限。 |
+| `--pd-max-queued-tokens` | 默认 KV token 容量的 4 倍；准入请求的 prompt+max_tokens 预算。 |
+| `--pd-batch-wait-ms` | 默认 2；新 Prefill 请求的组批等待窗口。 |
+| `--pd-output-queue-size` | 默认 128；每个连接的输出队列容量。 |
 | `--pd-max-quarantine-seconds` | 默认 300 秒；隔离超龄需要处置或退役，不会自动释放未知地址。 |
 
 Engine 先为总注册预算预留显存，再确定 KV 页数；显式 `--num-pages` 同样检查预算。
 大层组配合多个槽位可能需要减少槽位或提高预算；模型、最终 KV 池、传输池及算子工作区
-仍需一起评估。D 的连续接收池当前只有一个活动租约。容量公式见[逐层传输说明](docs/pd/layered_transfer.md)。
+仍需一起评估。D 池按请求切片复用，切片总量受注册预算限制。容量公式见[多请求调度说明](docs/pd/batching.md)。
+
+Worker 使用 `--max-running-requests` 控制活跃行数，`--max-prefill-length` 控制每个 Prefill batch 的 token 预算。
+网关可设置 `--max-inflight-requests 32 --max-inflight-tokens 65536`；Worker 还会检查实际 KV 页和未来输出预算。
+非流式 HTTP 的容量拒绝返回 429；`n=1` 限制单请求候选数量，不限制并发请求数或 GPU batch 大小。
 
 就绪日志中的 `overlap=false` 表示原有调度重叠关闭；`kv_transfer_overlap=true` 表示启用逐层传输。
 健康信息位于 `transfer.mooncake`，可观察 `registered_bytes`、`registered_buffers`、
-`pending_operations`、`quarantined_buffers`、`oldest_quarantine_seconds` 和 `layered.receive_reserved`。
+`pending_operations`、`quarantined_buffers`、`oldest_quarantine_seconds`、`layered.receive_leases` 和 `layered.receive_available_bytes`。
+调度快照还有 `active_requests`、`max_prefill_batch`、`max_decode_batch`，健康检查不再等待整个请求结束。
 注册池会一直驻留，空闲时应与启动基线一致，而非要求注册字节归零。
 
 Worker 健康检查使用自定义 `Channel` 消息 `{"op":"health"}`，不能直接 `curl` 控制端口。
@@ -288,6 +323,8 @@ FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
 | `test_pd_pipeline.py` | 两进程 CPU attention 模型经实际 TCP 续算并对照 token。 |
 | `test_pd_failures.py`、`test_pd_gateway.py` | 失败清理、HTTP/SSE、结束原因与断连；网关主要使用桩客户端。 |
 | `test_pd_layered.py` | 受控 DMA/event 下的实际发送队列/runtime、背压、槽位与租约、终态、取消和新握手续算。 |
+| `test_pd_batching.py` | 多请求实际组批、参考输出一致、不同 D 独立完成、分块/EOS 取消、页预算与安装 event。 |
+| `test_pd_control_loop.py` | 内存通道驱动完整并发 Worker 服务和 PDClient；4 请求并发及关闭单个 generator。 |
 | `test_pd_layered_cuda.py` | 真实 CUDA 分组打包/安装检查，不包含原生 RDMA。 |
 | `test_pd_gpu.py` | 显式 opt-in 的真实 GPU 模型对照，默认 TCP，可选择 Mooncake。 |
 
@@ -295,10 +332,11 @@ FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
 不下载 Hugging Face 权重。逐层所有权测试使用内存控制通道，端到端用例另使用真实 socket；
 CUDA event 和原生 DMA 的 CPU 适配器不能证明真实 GPU/RDMA 并发。
 
-2026-11-23 的最终沙箱内子集记录为 **98 passed、10 skipped、5 deselected、113 subtests passed**。
-10 项 GPU 用例因环境跳过，5 项新增 socket 用例未执行，完整网络回归也未完成最终快照复核。
-更早 CPU/TCP 阶段有 **105 passed、1 skipped、101 subtests passed** 的历史记录；
-这些数字均不构成真实 GPU/RDMA 验收。详细证据与时间见交接文档。
+本轮无 socket 回归为 **131 passed、10 skipped、5 deselected、113 subtests passed**。
+测试使用确定性 CPU attention 验证多请求组批、独立参考 token 对照，以及内存通道中的完整并发 Worker/PDClient 控制循环。
+10 项 GPU 用例跳过，5 项逐层 socket 用例排除；独立 TCP 与 HTTP 回归未纳入此子集。
+真实 socket 受沙箱限制，沙箱外执行申请未获批准；尚未执行真实 GPU/RDMA 验收。
+复现命令见[多请求调度说明](docs/pd/batching.md)，交接要点见[项目交接文档](交接文档/项目交接文档.md)。
 
 ### GPU 模型对照
 
@@ -337,7 +375,11 @@ python/minisgl/
 ├── disagg/
 │   ├── protocol.py     # 整体交接数据契约
 │   ├── layered_protocol.py   # 前置接收票据与层组布局
-│   ├── worker.py       # P/D 计算、预留、安装与清理
+│   ├── worker.py       # P/D 调度器适配与入口
+│   ├── service.py      # 并发控制面、GPU 组批循环、异步安装与独立回收
+│   ├── layered_sender.py     # BatchTransferPlan、公平发送、目标连接复用
+│   ├── allocator.py    # 多租约接收池空闲区间管理
+│   ├── admission.py    # 客户端并发请求/token 预算
 │   ├── client.py       # 控制协调与 Token ID 流
 │   ├── gateway.py      # HTTP、分词、SSE
 │   ├── tcp_backend.py  # CPU 字节参考传输
@@ -354,6 +396,7 @@ docs/pd/                # P/D 专项设计和阶段记录
 ```
 
 - [逐层 KV 传输](docs/pd/layered_transfer.md)：缓冲池、层组流水线、所有权、取消与验收入口。
+- [多请求调度](docs/pd/batching.md)：异步控制面、批量传输、动态 Decode、显存与准入参数。
 - [Mooncake GPU 直传](docs/pd/mooncake_direct.md)：TE、CUDA/RDMA 条件、部署与资源边界。
 - [项目交接文档](交接文档/项目交接文档.md)：按交接快照记录架构、提交历史、测试和待办。
 - [Phase 2 报告](docs/pd/phase2.md) / [移植说明](docs/pd/phase2_porting.md)：TCP/CPU 参考阶段历史。
@@ -362,11 +405,11 @@ docs/pd/                # P/D 专项设计和阶段记录
 ## 性能与后续工作
 
 上游性能脚本保留在 [benchmark/offline/](benchmark/offline/) 和 [benchmark/online/](benchmark/online/)。
-运行前需调整其固定模型、端口、输入输出长度与负载，不能直接作为当前串行 greedy P/D 的性能结论。
+运行前需调整其固定模型、端口、输入输出长度、采样与并发负载，不能直接作为当前 P/D 的性能结论。
 
 下一步优先完成原生扩展、GPU 字节、双机 token、取消/晚到写入及长期资源回收验收；
 再建立 TTFT、TPOT、吞吐与显存基线，测量 `layers_per_chunk=1/2/4` 和槽位数的影响，
-随后扩展多请求调度与多 P/D 管理。目前没有可发布的本地 GPU/RDMA 性能达标结果。
+随后完善多请求调度的硬件验收和多 P/D 管理。目前没有可发布的本地 GPU/RDMA 性能达标结果。
 
 ## 上游与许可证
 

@@ -24,6 +24,9 @@ class FakeStream:
     def wait_event(self, event):
         assert event.recorded
 
+    def wait_stream(self, stream):
+        pass
+
 
 class FakeEvent:
     def __init__(self):
@@ -35,6 +38,9 @@ class FakeEvent:
     def synchronize(self):
         assert self.recorded
         assert threading.current_thread().name == "pd-layer-sender"
+
+    def query(self):
+        return self.recorded
 
 
 class FakeCuda:
@@ -59,12 +65,13 @@ class FakeTicket:
         self.snapshot = source[:length].clone()
         self.drained = False
         self._status = "unknown"
+        self.gate = engine.gate
 
     def drain(self, timeout_ms):
         assert threading.current_thread().name == "pd-layer-sender" or self.engine.cleaning
         if self.drained:
             return self._status
-        if self.engine.gate is not None and not self.engine.gate.is_set():
+        if self.gate is not None and not self.gate.is_set():
             return "unknown"
         # A ring overwrite while DMA owns this slot is observable even though
         # the fake's final copy itself executes synchronously on the CPU.
@@ -88,6 +95,7 @@ class FakeEngine:
         self.register_calls = 0
         self.unregister_calls = 0
         self.cleaning = False
+        self.destination_gates = {}
 
     def register_memory(self, address, length, device, remote):
         assert address not in self.registrations
@@ -120,6 +128,7 @@ class FakeEngine:
         assert length <= capacities[0] and length <= remote_capacities[0]
         assert source_offsets == target_offsets == [[0]]
         ticket = FakeTicket(self, source, target, length)
+        ticket.gate = self.destination_gates.get(session, self.gate)
         self.submissions.append(ticket)
         return ticket
 
@@ -144,8 +153,8 @@ class CpuLayeredBackend(LayeredMooncakeBackend):
         self.runtime.session = f"127.0.0.1:{FakeEngine.next_port}"
         original = self.runtime.register_tensor
 
-        def register(tensor, key):
-            buffer = original(tensor, key)
+        def register(tensor, key, *, pool=False):
+            buffer = original(tensor, key, pool=pool)
             FakeEngine.registrations[buffer.address] = tensor
             return buffer
 
@@ -158,10 +167,16 @@ class CpuLayeredBackend(LayeredMooncakeBackend):
         self.fake_engine.cleaning = True
         if self.fake_engine.gate is not None:
             self.fake_engine.gate.set()
-        for operation in list(self.runtime._operations.values()):
-            self.runtime.poll(operation, timeout_ms=0)
+        for gate in self.fake_engine.destination_gates.values():
+            gate.set()
+        with torch.inference_mode():
+            for operation in list(self.runtime._operations.values()):
+                self.runtime.poll(operation, timeout_ms=0)
         for buffer in list(self.runtime._buffers.values()):
             self.runtime.mark_safe(buffer)
+        for lease in self._leases.values():
+            lease.safe = True
+            lease.consuming = False
         self.close()
 
 

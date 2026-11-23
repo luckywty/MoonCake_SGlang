@@ -18,7 +18,9 @@ from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import Scheduler, SchedulerConfig
 from minisgl.server.args import parse_args
 
-'''用于验证：新增的 P/D 角色和交接协议，是否正确接入 mini-SGLang 原有的配置、Scheduler、命令行和请求对象。'''
+"""用于验证：新增的 P/D 角色和交接协议，是否正确接入 mini-SGLang 原有的配置、Scheduler、命令行和请求对象。"""
+
+
 def config(**kwargs):
     return SchedulerConfig("local-model", DistributedInfo(0, 1), torch.bfloat16, **kwargs)
 
@@ -101,6 +103,11 @@ def test_split_cli_dispatches_to_real_worker_entrypoint(role):
         ["--pd-layers-per-chunk", "0"],
         ["--pd-staging-slots", "1"],
         ["--pd-staging-slots", "5"],
+        ["--pd-max-queued-requests", "0"],
+        ["--pd-max-queued-tokens", "0"],
+        ["--pd-output-queue-size", "0"],
+        ["--pd-batch-wait-ms", "nan"],
+        ["--pd-batch-wait-ms", "-1"],
         ["--pd-data-port", "1919"],
         ["--pd-data-port", "1920"],
         ["--pd-data-port", "0"],

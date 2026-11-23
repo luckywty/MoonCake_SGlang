@@ -12,227 +12,45 @@ import queue
 import socket
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from uuid import uuid4
 
 import torch
 
+from .allocator import ReceiveAllocator
 from .control import CancelledError, Channel, StartRequest
 from .layered_protocol import LayeredReceiveTicket
+from .layered_sender import ControlSession, LayeredSend, sender_loop
 from .mooncake_backend import MooncakeTransferBackend
 from .role import WorkerRole
-from .transfer import TransferBackendUnavailable, TransferError
+from .transfer import TransferBackendUnavailable, TransferCapacityError, TransferError
 
 _TRANSPORT = "mooncake-layered-gpu-v2"
-_END = object()
 
 
 @dataclass
 class _Lease:
     request: StartRequest
     ticket: LayeredReceiveTicket
+    offset: int = 0
+    safe: bool = True
     source: str | None = None
     exposed: bool = False
     cancelled: bool = False
     owner_released: bool = False
     delivered: bool = False
     consuming: bool = False
+    finalizing: bool = False
+    quarantine_since: float | None = None
     terminal: dict | None = None
     done: threading.Event = field(default_factory=threading.Event)
-
-
-class LayeredSend:
-    def __init__(self, backend, ticket, pool, cancel_check):
-        self.backend, self.ticket, self.pool = backend, ticket, pool
-        self.cancel_check = cancel_check
-        self.tasks = queue.Queue()
-        self.opened = threading.Event()
-        self.done = threading.Event()
-        self.cancelled = threading.Event()
-        self.error = None
-        self.safe_sources = True
-        self._sealed = False
-        self._last_layer = -1
-        self._slots = None
-
-    def set_slots(self, slots):
-        # The snapshot is created before forward on the compute stream. Every
-        # layer event below also orders its production against the transfer stream.
-        self._slots = slots
-
-    def layer_ready(self, layer: int) -> None:
-        """Model callback: record an event and enqueue; never wait or pack here."""
-        if self.error is not None:
-            raise self.error
-        if layer != self._last_layer + 1:
-            raise TransferError("layer-ready notifications are not in model order")
-        self._last_layer = layer
-        if self.cancelled.is_set():
-            return
-        if (layer + 1) % self.ticket.layers_per_chunk and layer + 1 != self.ticket.layout.layers:
-            return
-        if self._slots is None:
-            raise TransferError("layer transfer is missing its source slots")
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(self.backend.runtime.device))
-        self.tasks.put_nowait((layer // self.ticket.layers_per_chunk, self._slots, event))
-
-    def seal(self, *, cancel: bool = False) -> None:
-        if cancel:
-            self.cancelled.set()
-        if not self._sealed:
-            self._sealed = True
-            self.tasks.put_nowait(_END)
-
-    def finish(self, *, cancel: bool = False) -> None:
-        self.seal(cancel=cancel)
-        # Native drain and GPU packing fences remain on the sender thread.
-        if not self.done.wait(3 * self.backend.timeout + 1):
-            self.backend.runtime.retire("layer sender did not stop; its GPU pools must be retained")
-            raise TransferBackendUnavailable("layer sender did not stop")
-        if self.error is not None:
-            raise self.error
-
-    def _check_cancel(self):
-        if self.cancel_check is not None and not self.cancelled.is_set():
-            try:
-                self.cancel_check()
-            except (OSError, RuntimeError, ValueError) as exc:
-                self.error = exc
-                self.cancelled.set()
-
-    def run(self):
-        pending = deque()
-        free = deque(self.backend._send_buffers)
-        submitted, completed = set(), set()
-        uncertain = False
-        terminal_result = None
-
-        def poll_one():
-            nonlocal uncertain
-            buffer, operation, group, deadline = pending[0]
-            try:
-                status = self.backend.runtime.poll(operation, timeout_ms=0)
-            except (RuntimeError, ValueError):
-                status = "unknown"
-            if status == "unknown":
-                if time.monotonic() >= deadline:
-                    self.backend.runtime.quarantine(buffer, "layer write completion is unknown")
-                    uncertain = True
-                    pending.popleft()
-                    self.error = TransferError("layer write did not drain before its deadline")
-                    self.cancelled.set()
-                    return True
-                return False
-            # This checks ticket.drained again before dropping the operation.
-            self.backend.runtime.recycle_operation(operation)
-            pending.popleft()
-            free.append(buffer)
-            if status == "completed":
-                completed.add(group)
-            else:
-                uncertain = True  # FAILED_DRAINED cannot authorize a D-side reuse.
-                self.error = TransferError("layer write failed after local drain")
-                self.cancelled.set()
-            return True
-
-        try:
-            with self.backend._connection(self.ticket.endpoint) as sock:
-                channel = Channel(sock, self.backend.timeout)
-                channel.send(
-                    {
-                        "op": "layer_open",
-                        "backend": _TRANSPORT,
-                        "ticket": json.loads(self.ticket.to_wire()),
-                        "source": self.backend.runtime.session,
-                    }
-                )
-                if channel.receive() != {"status": "ready", "locator": self.ticket.locator}:
-                    raise TransferError("layer receive reservation was revoked or rejected")
-                self.opened.set()
-                expected = 0
-                while True:
-                    self._check_cancel()
-                    try:
-                        task = self.tasks.get(timeout=0.02)
-                    except queue.Empty:
-                        continue
-                    if task is _END:
-                        break
-                    if self.cancelled.is_set():
-                        continue
-                    group, slots, event = task
-                    if group != expected:
-                        raise TransferError("missing or repeated layer group")
-                    expected += 1
-                    while not free and not self.cancelled.is_set():
-                        self._check_cancel()
-                        if not poll_one():
-                            time.sleep(0.002)  # Release the GIL; never Python busy-poll.
-                    if self.cancelled.is_set():
-                        continue
-                    buffer = free.popleft()
-                    self.safe_sources = False
-                    nbytes = self.backend._pack(self, task, buffer)
-                    self.safe_sources = True
-                    self._check_cancel()
-                    if self.cancelled.is_set():
-                        free.append(buffer)
-                        continue
-                    start, _ = self.ticket.groups[group]
-                    remote = {
-                        "session": self.ticket.session,
-                        "address": self.ticket.address + self.ticket.layer_offsets[start],
-                        "nbytes": nbytes,
-                    }
-                    # A partially failed native submission can still access the slot.
-                    try:
-                        operation = self.backend.runtime.submit_write(buffer, remote, nbytes=nbytes)
-                    except BaseException:
-                        uncertain = True
-                        raise
-                    submitted.add(group)
-                    pending.append(
-                        (buffer, operation, group, time.monotonic() + self.backend.timeout)
-                    )
-                if not self.cancelled.is_set() and expected != len(self.ticket.groups):
-                    raise TransferError("prefill did not produce every layer group")
-                while pending:
-                    self._check_cancel()
-                    if not poll_one():
-                        time.sleep(0.002)
-                result = (
-                    "quarantined"
-                    if uncertain
-                    else ("cancelled" if self.cancelled.is_set() else "complete")
-                )
-                terminal_result = result
-                self.backend._send_terminal(self.ticket, submitted, completed, result, channel)
-        except BaseException as exc:
-            self.error = exc
-            self.cancelled.set()
-            while pending:
-                if not poll_one():
-                    time.sleep(0.002)
-            # Re-send the exact certificate after a lost receipt. Changing a
-            # previously recorded success into cancellation breaks idempotency.
-            result = terminal_result or ("quarantined" if uncertain else "cancelled")
-            # An independent connection is needed when the original control
-            # channel failed. If both receipts are lost, D keeps its reservation.
-            try:
-                self.backend._send_terminal(self.ticket, submitted, completed, result)
-            except (OSError, RuntimeError, ValueError):
-                pass
-        finally:
-            if uncertain or not self.safe_sources:
-                self.backend.runtime.retire("layer transfer could not prove safe completion")
-            self.opened.set()
-            self.done.set()
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class LayeredMooncakeBackend(MooncakeTransferBackend):
-    """One fixed receive region or a fixed sender ring per serial split Worker."""
+    """Multi-lease receive pool and a fair sender sharing startup registrations."""
 
     layered_transfer = True
 
@@ -245,11 +63,14 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         self._layout = None
         self._send_buffers = []
         self._receive_buffer = None
-        self._lease = None
+        self._leases = {}
+        self._lease_attempts = {}
         self._layer_tombstones = OrderedDict()
         self._jobs = queue.Queue()
+        self._batch_tasks = queue.Queue()
+        self._send_jobs = {}
+        self._control_sessions = {}
         self._sender_thread = None
-        self._job = None
         self._pipeline_closed = False
         super().__init__(*args, **kwargs)
 
@@ -283,9 +104,15 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
             )
             self._sender_thread.start()
         else:
+            # Memory was excluded from Engine's KV capacity at startup. Keep
+            # each request bounded by max_transfer_bytes, but share a larger MR.
+            table = getattr(scheduler.engine, "page_table", None)
+            rows = table.shape[0] - 1 if table is not None else 1
+            capacity = min(self.runtime.max_registered_bytes, rows * (self._pool_bytes + 255))
             self._receive_buffer = self.runtime.allocate_buffer(
-                self._pool_bytes, "layer-receive-pool"
+                capacity, "layer-receive-pool", pool=True
             )
+            self._allocator = ReceiveAllocator(capacity)
 
     def check_capacity(self, nbytes):
         # Reservations are slices of startup registrations, not new allocations.
@@ -297,25 +124,34 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         nbytes = len(request.prompt_ids) * self._layout.bytes_per_token
         self.check_capacity(nbytes)
         with self._lock:
-            if self._lease is not None:
-                raise TransferError("the receive pool is busy or quarantined")
+            if request.transfer_id in self._lease_attempts:
+                raise TransferError("receive attempt is already reserved")
+            if len(self._leases) >= self.runtime.max_pending_transfers:
+                raise TransferCapacityError("receive lease budget is busy")
+            locator = str(uuid4())
+            offset = self._allocator.allocate(locator, nbytes)
             layer_bytes = nbytes // self._layout.layers
-            ticket = LayeredReceiveTicket(
-                request.transfer_id,
-                self.endpoint,
-                str(uuid4()),
-                self.runtime.session,
-                self._receive_buffer.address,
-                self._layout,
-                len(request.prompt_ids),
-                self.layers_per_chunk,
-                tuple(i * layer_bytes for i in range(self._layout.layers)),
-                eos_token_id,
-            )
-            self._lease = _Lease(request, ticket)
+            try:
+                ticket = LayeredReceiveTicket(
+                    request.transfer_id,
+                    self.endpoint,
+                    locator,
+                    self.runtime.session,
+                    self._receive_buffer.address + offset,
+                    self._layout,
+                    len(request.prompt_ids),
+                    self.layers_per_chunk,
+                    tuple(i * layer_bytes for i in range(self._layout.layers)),
+                    eos_token_id,
+                )
+            except Exception:
+                self._allocator.release(locator)
+                raise
+            self._leases[locator] = _Lease(request, ticket, offset=offset)
+            self._lease_attempts[request.transfer_id] = locator
             return ticket
 
-    def begin_layer_send(self, ticket, request, pool, cancel_check):
+    def begin_layer_send(self, ticket, request, pool, cancel_check=None, *, wait=True):
         self.check_capacity(ticket.nbytes)
         if (
             ticket.layout != self._layout
@@ -325,23 +161,51 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         ):
             raise TransferError("incompatible early receive ticket")
         with self._lock:
-            if self._job is not None and not self._job.done.is_set():
-                raise TransferError("the layer sender is busy")
-            job = self._job = LayeredSend(self, ticket, pool, cancel_check)
+            if ticket.transfer_id in self._send_jobs:
+                raise TransferError("duplicate layer send attempt")
+            if len(self._send_jobs) >= self.runtime.max_pending_transfers:
+                raise TransferCapacityError("sender request budget is busy")
+            job = LayeredSend(self, ticket, pool, cancel_check)
+            self._send_jobs[ticket.transfer_id] = job
             self._jobs.put_nowait(job)
-        if not job.opened.wait(self.timeout + 1):
-            job.seal(cancel=True)
-            raise TransferError("layer sender did not open its receive reservation")
-        if job.error is not None:
-            raise job.error
+        if wait:
+            if not job.opened.wait(self.timeout + 1):
+                job.seal(cancel=True)
+                raise TransferError("layer sender did not open its receive reservation")
+            if job.error is not None:
+                job.seal(cancel=True)
+                raise job.error
         return job
 
+    def _session(self, endpoint):
+        with self._lock:
+            if endpoint not in self._control_sessions:
+                if len(self._control_sessions) >= self.runtime.max_pending_transfers:
+                    active = {job.ticket.endpoint for job in self._send_jobs.values()}
+                    idle = next((key for key in self._control_sessions if key not in active), None)
+                    if idle is None:
+                        raise TransferCapacityError("destination connection budget is busy")
+                    self._control_sessions.pop(idle).close()
+                self._control_sessions[endpoint] = ControlSession(self, endpoint)
+            return self._control_sessions[endpoint]
+
+    def _channel(self, sock):
+        return Channel(sock, self.timeout)
+
     def _sender_loop(self):
-        while True:
-            job = self._jobs.get()
-            if job is _END:
-                return
-            job.run()
+        try:
+            # Inference mode is thread-local. Startup pools may themselves be
+            # inference tensors, so the packing writer needs it on this thread.
+            with torch.inference_mode():
+                sender_loop(self)
+        except BaseException as exc:
+            self.runtime.retire(f"layer sender failed; retain its buffers: {exc}")
+            self._record_fatal(exc)
+
+    @property
+    def _lease(self):
+        # Compatibility for ownership diagnostics written for a single lease.
+        return next(iter(self._leases.values()), None)
 
     def _pack(self, job, task, buffer):
         group, slots, ready = task
@@ -397,27 +261,24 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                 exchange(Channel(sock, self.timeout))
 
     def _receive(self, sock: socket.socket) -> None:
-        channel = Channel(sock, self.timeout)
+        channel = Channel(sock, self.timeout, self._stop)
         try:
-            message = channel.receive()
-            if message.get("backend") != _TRANSPORT:
-                raise TransferError("incompatible layered transfer backend")
-            if message.get("op") == "layer_terminal":
-                channel.send(self._settle_layers(message))
-                return
-            self.check_available()
-            if (
-                set(message) != {"op", "backend", "ticket", "source"}
-                or message["op"] != "layer_open"
-            ):
-                raise TransferError("incorrect layer transfer open")
-            ticket = LayeredReceiveTicket.from_wire(json.dumps(message["ticket"]).encode())
-            channel.send(self.open_layers(ticket, message["source"]))
-            terminal = channel.receive()
-            channel.send(self._settle_layers(terminal))
+            while not self._stop.is_set():
+                message = channel.receive()
+                if message.get("backend") != _TRANSPORT:
+                    raise TransferError("incompatible layered transfer backend")
+                if message.get("op") == "layer_terminal":
+                    channel.send(self._settle_layers(message))
+                    continue
+                self.check_available()
+                if (
+                    set(message) != {"op", "backend", "ticket", "source"}
+                    or message["op"] != "layer_open"
+                ):
+                    raise TransferError("incorrect layer transfer open")
+                ticket = LayeredReceiveTicket.from_wire(json.dumps(message["ticket"]).encode())
+                channel.send(self.open_layers(ticket, message["source"]))
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
-            # The reservation owner handles revocation. A disconnected sender
-            # never constitutes evidence that an exposed pool is safe to reuse.
             try:
                 channel.send({"status": "error", "error": str(exc)})
             except (OSError, ValueError):
@@ -429,21 +290,49 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         endpoint_address(source)
         with self._lock:
             entry = self._get_lease(ticket)
-            if entry.cancelled or entry.exposed:
+            if (
+                entry.cancelled
+                or entry.finalizing
+                or entry.terminal is not None
+                or (entry.exposed and entry.source != source)
+            ):
                 raise TransferError("layer reservation was revoked or already opened")
             entry.source = source
             # Mark unsafe before granting permission. A partial ready reply
             # must never let cancellation reuse an address that P may write.
             self.runtime.expose(self._receive_buffer)
             entry.exposed = True
+            entry.safe = False
             return {"status": "ready", "locator": ticket.locator}
 
     def _get_lease(self, ticket):
-        if self._lease is None or self._lease.ticket != ticket:
+        entry = self._leases.get(ticket.locator)
+        if entry is None or entry.ticket != ticket:
             raise TransferError("unknown or stale layer reservation")
-        return self._lease
+        return entry
+
+    def _refresh_pool_safety(self):
+        entries = list(self._leases.values())
+        quarantines = [
+            e.quarantine_since for e in entries if e.quarantine_since is not None and not e.safe
+        ]
+        self.runtime.update_pool_safety(
+            self._receive_buffer,
+            safe=all(e.safe and not e.consuming for e in entries),
+            quarantine_since=min(quarantines, default=None),
+        )
 
     def _settle_layers(self, message):
+        if not isinstance(message, dict) or not isinstance(message.get("locator"), str):
+            raise TransferError("incorrect layer completion message")
+        with self._lock:
+            entry = self._leases.get(message["locator"])
+        # Serialize duplicate receipts for this lease while letting other leases
+        # reserve/release during the potentially slow CUDA visibility fence.
+        with entry.lock if entry is not None else nullcontext():
+            return self._settle_serial(message)
+
+    def _settle_serial(self, message):
         if (
             not isinstance(message, dict)
             or set(message)
@@ -468,7 +357,7 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                 if old[0] != message:
                     raise TransferError("layer completion changed after retirement")
                 return dict(old[1])
-            entry = self._lease
+            entry = self._leases.get(message["locator"])
             if (
                 entry is None
                 or not entry.exposed
@@ -499,17 +388,20 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                 or (result != "quarantined" and completed != submitted)
             ):
                 raise TransferError("layer completion does not prove quiescence")
+            visible = entry.terminal is None and result == "complete" and not entry.cancelled
+            entry.finalizing = True
+        if visible:
+            self.runtime.make_visible(self._receive_buffer)
+        with self._lock:
             if entry.terminal is None:
                 if result == "quarantined":
-                    self.runtime.quarantine(
-                        self._receive_buffer, "peer could not prove every layer write"
-                    )
+                    entry.quarantine_since = time.monotonic()
                     entry.cancelled = True
                 else:
                     if result == "complete" and not entry.cancelled:
-                        self.runtime.make_visible(self._receive_buffer)
                         entry.delivered = True
-                    self.runtime.mark_safe(self._receive_buffer)
+                    entry.safe = True
+                    entry.quarantine_since = None
                     entry.cancelled |= result == "cancelled"
                 entry.terminal = dict(message)
                 entry.done.set()
@@ -519,23 +411,26 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                 else ("retired" if entry.cancelled else "complete"),
                 "locator": entry.ticket.locator,
             }
-            if entry.owner_released and self._receive_buffer.safe_to_release:
+            if entry.owner_released and entry.safe and not entry.consuming:
                 self._forget_lease(entry, reply)
+            self._refresh_pool_safety()
             return reply
 
-    def finish_layers(self, ticket):
+    def finish_layers(self, ticket, *, wait=True):
         with self._lock:
             entry = self._get_lease(ticket)
-        if not entry.done.wait(self.timeout):
+        if not wait and not entry.done.is_set():
+            return None
+        if wait and not entry.done.wait(self.timeout):
             raise TransferError("layer receive completion timed out")
         with self._lock:
-            if entry.cancelled or not entry.delivered or not self._receive_buffer.safe_to_release:
+            if entry.cancelled or not entry.delivered or not entry.safe or entry.consuming:
                 raise TransferError("layer receive is cancelled or incomplete")
             # Native writes are drained, but CUDA scatter is a separate owner.
             # Keep the pool unavailable until that consumer's fence is proved.
             self.runtime.expose(self._receive_buffer)
             entry.consuming = True
-            return self._receive_buffer.tensor[: ticket.nbytes]
+            return self._receive_buffer.tensor[entry.offset : entry.offset + ticket.nbytes]
 
     def release_layers(self, ticket, *, consumer_complete=False):
         with self._lock:
@@ -543,46 +438,57 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
             entry.cancelled = True
             entry.owner_released = True
             if entry.consuming and consumer_complete:
-                self.runtime.mark_safe(self._receive_buffer)
                 entry.consuming = False
-            if self._receive_buffer.safe_to_release:
+            if entry.safe and not entry.consuming:
                 self._forget_lease(entry, {"status": "retired", "locator": ticket.locator})
-            else:
-                self.runtime.quarantine(
-                    self._receive_buffer, "revoked layer reservation awaits sender drain"
-                )
+            elif not entry.safe and entry.quarantine_since is None:
+                entry.quarantine_since = time.monotonic()
+            self._refresh_pool_safety()
 
     def _forget_lease(self, entry, reply):
         if entry.terminal is not None:
             self._layer_tombstones[entry.ticket.locator] = (entry.terminal, dict(reply))
             while len(self._layer_tombstones) > 1024:
                 self._layer_tombstones.popitem(last=False)
-        self._lease = None
+        self._leases.pop(entry.ticket.locator)
+        self._lease_attempts.pop(entry.request.transfer_id)
+        self._allocator.release(entry.ticket.locator)
 
     def health(self):
         result = super().health()
-        result["mooncake"]["layered"] = {
-            "layers_per_chunk": self.layers_per_chunk,
-            "staging_slots": self.staging_slots,
-            "pool_bytes": getattr(self, "_pool_bytes", 0),
-            "receive_reserved": self._lease is not None,
-        }
+        with self._lock:
+            result["mooncake"]["layered"] = {
+                "layers_per_chunk": self.layers_per_chunk,
+                "staging_slots": self.staging_slots,
+                "pool_bytes": getattr(self, "_pool_bytes", 0),
+                "receive_reserved": bool(self._leases),
+                "receive_leases": len(self._leases),
+                "receive_pool_bytes": self._receive_buffer.nbytes if self._receive_buffer else 0,
+                "receive_available_bytes": self._allocator.available if self._receive_buffer else 0,
+                "quarantined_lease_bytes": sum(
+                    e.ticket.nbytes
+                    for e in self._leases.values()
+                    if e.quarantine_since is not None and not e.safe
+                ),
+                "send_requests": len(self._send_jobs),
+            }
         return result
 
     def close(self):
         if not self._pipeline_closed:
-            job = self._job
-            if job is not None and not job.done.is_set():
+            for job in list(self._send_jobs.values()):
                 job.seal(cancel=True)
             if self._sender_thread is not None:
-                self._jobs.put_nowait(_END)
+                self._jobs.put_nowait(None)
                 self._sender_thread.join(timeout=3 * self.timeout + 1)
                 if self._sender_thread.is_alive():
                     self.runtime.retire("layer sender remains active during shutdown")
                     raise TransferBackendUnavailable("layer sender did not shut down")
             with self._lock:
-                if self._lease is not None:
-                    self.release_layers(self._lease.ticket)
+                for entry in list(self._leases.values()):
+                    self.release_layers(entry.ticket)
+            for session in self._control_sessions.values():
+                session.close()
             for buffer in self._send_buffers + (
                 [self._receive_buffer] if self._receive_buffer else []
             ):

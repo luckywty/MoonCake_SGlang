@@ -27,12 +27,12 @@ from minisgl.scheduler.table import TableManager
 
 
 class TinyEngine:
-    def __init__(self, page_size, delay=0.0):
+    def __init__(self, page_size, delay=0.0, max_running_req=2):
         self.device = torch.device("cpu")
         self.dtype = torch.float32
         self.num_pages = 32
         self.max_seq_len = 64
-        self.page_table = torch.zeros((3, 64), dtype=torch.int32)
+        self.page_table = torch.zeros((max_running_req + 1, 64), dtype=torch.int32)
         self.kv_cache = MHAKVCache(1, 2, 8, 33, page_size, self.dtype, self.device)
         self.kv_cache._kv_buffer.zero_()
         self.graph_runner = SimpleNamespace(
@@ -50,7 +50,11 @@ class TinyEngine:
         if self.delay:
             time.sleep(self.delay)
         x = self.embedding[batch.input_ids.to(torch.long)]
-        row = batch.reqs[0].table_idx
+        rows = [req.table_idx for req in batch.reqs for _ in range(req.extend_len)]
+        ends, offset = [], 0
+        for req in batch.reqs:
+            offset += req.extend_len
+            ends.append(offset - 1)
         for layer in range(2):
             q, k, v = (x @ self.weights[layer, i] for i in range(3))
             keys = self.kv_cache.k_cache(layer).view(-1, 8)
@@ -61,11 +65,11 @@ class TinyEngine:
                 self.kv_cache.layer_ready(layer)
             results = []
             for i, position in enumerate(batch.positions.tolist()):
-                slots = self.page_table[row, : position + 1].to(torch.long)
+                slots = self.page_table[rows[i], : position + 1].to(torch.long)
                 scores = (keys[slots] @ q[i]) / (8**0.5)
                 results.append(torch.softmax(scores, dim=0) @ values[slots])
             x = torch.tanh(x + torch.stack(results) @ self.weights[layer, 3])
-        token = torch.argmax(x[-1] @ self.head).reshape(1).to(torch.int32)
+        token = torch.argmax(x[ends] @ self.head, dim=-1).to(torch.int32)
         for req in batch.reqs:
             req.complete_one()
         return SimpleNamespace(
@@ -75,18 +79,18 @@ class TinyEngine:
         )
 
 
-def cpu_scheduler(role, page_size=4, delay=0.0):
+def cpu_scheduler(role, page_size=4, delay=0.0, max_running_req=2, prefill_budget=3):
     tp_info._TP_INFO = tp_info.DistributedInfo(0, 1)
     core._GLOBAL_CTX = core.Context(page_size)
     scheduler = PDWorkerScheduler.__new__(PDWorkerScheduler)
-    scheduler.engine = TinyEngine(page_size, delay)
+    scheduler.engine = TinyEngine(page_size, delay, max_running_req)
     scheduler.device = torch.device("cpu")
     scheduler.role = WorkerRole(role)
     scheduler.layout = KVLayout("a" * 64, "float32", 2, 1, 8, page_size)
     scheduler.vocab_size = 32
     scheduler.eos_token_id = 31
     scheduler.engine_stream_ctx = nullcontext()
-    scheduler.table_manager = TableManager(2, scheduler.engine.page_table)
+    scheduler.table_manager = TableManager(max_running_req, scheduler.engine.page_table)
     scheduler.cache_manager = CacheManager(32, page_size, scheduler.engine.page_table, "naive")
     if scheduler.role is WorkerRole.DECODE:
         scheduler.cache_manager.free_slots = scheduler.cache_manager.free_slots.flip(0)
@@ -95,7 +99,7 @@ def cpu_scheduler(role, page_size=4, delay=0.0):
         scheduler.cache_manager, scheduler.table_manager, scheduler.decode_manager
     )
     scheduler.token_pool = scheduler.table_manager.token_pool
-    scheduler.prefill_budget = 3
+    scheduler.prefill_budget = prefill_budget
     scheduler._owned_req = None
     scheduler._allocated_len = 0
     return scheduler
@@ -157,3 +161,18 @@ def health(endpoint):
         channel = Channel(sock, 3)
         channel.send({"op": "health"})
         return channel.receive()
+
+
+def idle_health(endpoint, timeout=3):
+    """Cancellation and control output are asynchronous; wait for actual reclamation."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = health(endpoint)
+        if (
+            state["free_pages"] == 32
+            and state["free_rows"] == 2
+            and not state.get("active_requests", 0)
+        ):
+            return state
+        time.sleep(0.01)
+    raise AssertionError(f"worker resources did not return to baseline: {state}")

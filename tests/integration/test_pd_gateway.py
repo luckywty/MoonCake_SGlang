@@ -104,6 +104,22 @@ def test_first_token_eos_uses_stop_finish_reason():
         assert result.json()["choices"][0]["message"]["content"] == ""
 
 
+def test_gateway_reports_worker_admission_failure_as_429():
+    from minisgl.disagg.client import RemoteCapacityError
+
+    class BusyClient(Client):
+        def generate(self, *args, **kwargs):
+            raise RemoteCapacityError("decode page budget is busy")
+
+    with TestClient(create_app(BusyClient(), Tokenizer(), "tiny-model")) as http:
+        result = http.post(
+            "/v1/chat/completions",
+            json={"model": "tiny-model", "temperature": 0, "prompt": "hello"},
+        )
+        assert result.status_code == 429
+        assert "page budget" in result.text
+
+
 import asyncio
 import json
 from threading import Event

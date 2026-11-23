@@ -1,4 +1,4 @@
-"""Serial P/D workers with TCP host payloads or direct Mooncake GPU payloads."""
+"""P/D scheduler adapters and the concurrent Worker service entrypoint."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import os
 import socket
 import sys
-from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -23,9 +22,8 @@ from minisgl.scheduler.utils import PendingReq
 
 from .backend import create_transfer_backend
 from .control import CancelledError, Channel, StartRequest
-from .layered_protocol import LayeredReceiveTicket
 from .lifecycle import RequestLifecycle
-from .protocol import KVLayout, KVTransferMetadata, ReceiveTicket, RequestHandoff
+from .protocol import KVLayout, KVTransferMetadata, RequestHandoff
 from .role import WorkerRole
 from .transfer import TransferBackendUnavailable
 
@@ -105,6 +103,12 @@ class PDWorkerScheduler(Scheduler):
         self.vocab_size = config.model_config.vocab_size
         self._owned_req = None
         self._allocated_len = 0
+        self.pd_service_config = {
+            "max_queued_requests": getattr(config, "pd_max_queued_requests", 128),
+            "max_queued_tokens": getattr(config, "pd_max_queued_tokens", None),
+            "batch_wait_ms": getattr(config, "pd_batch_wait_ms", 2.0),
+            "output_queue_size": getattr(config, "pd_output_queue_size", 128),
+        }
 
     @contextmanager
     def execution(self):
@@ -178,7 +182,7 @@ class PDWorkerScheduler(Scheduler):
                         # exist. In the final chunk each layer becomes complete
                         # for the full prompt, so send it exactly once.
                         layered.set_slots(
-                            self.engine.page_table[req.table_idx, :req.device_len].to(torch.int64)
+                            self.engine.page_table[req.table_idx, : req.device_len].to(torch.int64)
                         )
                         pool.layer_ready = layered.layer_ready
                     try:
@@ -248,14 +252,17 @@ class PDWorkerScheduler(Scheduler):
             self.cache_manager.lock(handle)
             self._owned_req = Req(
                 input_ids=torch.tensor((*request.prompt_ids, 0), dtype=torch.int32),
-                table_idx=table_idx, cached_len=len(request.prompt_ids),
-                output_len=request.max_tokens - 1, uid=request.uid,
+                table_idx=table_idx,
+                cached_len=len(request.prompt_ids),
+                output_len=request.max_tokens - 1,
+                uid=request.uid,
                 sampling_params=SamplingParams(
                     max_tokens=request.max_tokens, ignore_eos=request.ignore_eos
-                ), cache_handle=handle,
+                ),
+                cache_handle=handle,
             )
             self._allocated_len = len(request.prompt_ids)
-            return slots[:len(request.prompt_ids)]
+            return slots[: len(request.prompt_ids)]
         except Exception:
             if slots is not None:
                 self.cache_manager._free(slots)
@@ -282,12 +289,17 @@ class PDWorkerScheduler(Scheduler):
                 ):
                     raise ValueError("invalid layered commit")
                 handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
-                if (handoff.uid != request.uid or handoff.prompt_ids != request.prompt_ids
-                        or handoff.max_tokens != request.max_tokens
-                        or handoff.ignore_eos != request.ignore_eos
-                        or handoff.kv.transfer_id != request.transfer_id
-                        or handoff.kv.layout != self.layout or handoff.eos_token_id != self.eos_token_id
-                        or not handoff.remaining_tokens or handoff.first_token_id >= self.vocab_size):
+                if (
+                    handoff.uid != request.uid
+                    or handoff.prompt_ids != request.prompt_ids
+                    or handoff.max_tokens != request.max_tokens
+                    or handoff.ignore_eos != request.ignore_eos
+                    or handoff.kv.transfer_id != request.transfer_id
+                    or handoff.kv.layout != self.layout
+                    or handoff.eos_token_id != self.eos_token_id
+                    or not handoff.remaining_tokens
+                    or handoff.first_token_id >= self.vocab_size
+                ):
                     raise ValueError("layered handoff does not match its reservation")
                 staging = backend.finish_layers(ticket)
                 self.engine.kv_cache.import_layered_tensor(
@@ -295,7 +307,7 @@ class PDWorkerScheduler(Scheduler):
                 )
                 req = self._owned_req
                 req.input_ids[-1] = handoff.first_token_id
-                self.token_pool[req.table_idx, :req.device_len] = req.input_ids.to(self.device)
+                self.token_pool[req.table_idx, : req.device_len] = req.input_ids.to(self.device)
                 self.synchronize()
                 # Pool reuse is legal only after the scatter consumer finished.
                 staging = None
@@ -335,10 +347,15 @@ class PDWorkerScheduler(Scheduler):
             finished = not req.can_decode or (
                 not handoff.ignore_eos and token == handoff.eos_token_id
             )
-            channel.send({
-                "status": "token", "transfer_id": handoff.kv.transfer_id,
-                "index": index, "token_id": token, "finished": finished,
-            })
+            channel.send(
+                {
+                    "status": "token",
+                    "transfer_id": handoff.kv.transfer_id,
+                    "index": index,
+                    "token_id": token,
+                    "finished": finished,
+                }
+            )
             if finished:
                 return
 
@@ -493,143 +510,30 @@ def _serve_layered_prefill(scheduler, request, ticket, channel, backend):
         # Return token zero before waiting for the sender's tail convergence.
         channel.send({"status": "handoff", "handoff": json.loads(handoff.to_wire())})
         job.finish(cancel=not handoff.remaining_tokens)
-        channel.send({
-            "status": "sent" if handoff.remaining_tokens else "retired",
-            "transfer_id": request.transfer_id,
-        })
+        channel.send(
+            {
+                "status": "sent" if handoff.remaining_tokens else "retired",
+                "transfer_id": request.transfer_id,
+            }
+        )
     finally:
         try:
             if not job.done.is_set():
                 job.finish(cancel=True)
         finally:
             if not job.done.is_set() or not job.safe_sources:
-                raise TransferBackendUnavailable("layer packing may still access the request's KV pages")
+                raise TransferBackendUnavailable(
+                    "layer packing may still access the request's KV pages"
+                )
             scheduler._release(cache=prefill_ok)
 
 
 def serve_worker(
     scheduler, listener: socket.socket, backend, timeout: float, stop: Event | None = None
 ):
-    listener.settimeout(0.2)
-    recent = deque(maxlen=1024)
-    while stop is None or not stop.is_set():
-        try:
-            sock, _ = listener.accept()
-        except socket.timeout:
-            check_available = getattr(backend, "check_available", None)
-            if check_available is not None:
-                check_available()
-            continue
-        with sock:
-            channel = Channel(sock, timeout)
-            try:
-                message = channel.receive()
-                if message == {"op": "capabilities"}:
-                    channel.send({
-                        "status": "capabilities",
-                        "layered_transfer": bool(getattr(backend, "layered_transfer", False)),
-                    })
-                    message = channel.receive()
-                if message == {"op": "health"}:
-                    native_health = getattr(backend, "health", lambda: {})()
-                    status = native_health.get("status", "ready")
-                    channel.send(
-                        {
-                            **scheduler.health(),
-                            "status": status,
-                            "transfer_backend": getattr(backend, "name", "tcp"),
-                            "transfer": native_health,
-                        }
-                    )
-                    continue
-                check_available = getattr(backend, "check_available", None)
-                if check_available is not None:
-                    check_available()
-                if (
-                    scheduler.role is WorkerRole.DECODE
-                    and getattr(backend, "layered_transfer", False)
-                    and set(message) == {"op", "request"} and message["op"] == "reserve"
-                ):
-                    request = StartRequest.from_object(message["request"])
-                    if request.transfer_id in recent:
-                        raise ValueError("duplicate transfer attempt")
-                    recent.append(request.transfer_id)
-                    scheduler.decode_layered(request, channel, backend)
-                elif (
-                    scheduler.role is WorkerRole.PREFILL
-                    and getattr(backend, "layered_transfer", False)
-                    and set(message) == {"op", "request", "ticket"} and message["op"] == "prefill"
-                ):
-                    request = StartRequest.from_object(message["request"])
-                    if request.transfer_id in recent:
-                        raise ValueError("duplicate transfer attempt")
-                    recent.append(request.transfer_id)
-                    ticket = LayeredReceiveTicket.from_wire(json.dumps(message["ticket"]).encode())
-                    _serve_layered_prefill(scheduler, request, ticket, channel, backend)
-                elif (
-                    scheduler.role is WorkerRole.PREFILL
-                    and set(message) == {"op", "request"}
-                    and message["op"] == "prefill"
-                ):
-                    if getattr(backend, "layered_transfer", False):
-                        raise ValueError("Mooncake prefill requires an early layer receive ticket")
-                    request = StartRequest.from_object(message["request"])
-                    transfer_id = request.transfer_id
-                    if transfer_id in recent:
-                        raise ValueError("duplicate transfer attempt")
-                    recent.append(transfer_id)
-                    if getattr(backend, "gpu_payload", False):
-                        handoff, payload = scheduler.prefill(request, channel, backend=backend)
-                    else:
-                        handoff, payload = scheduler.prefill(request, channel)
-                    channel.send({"status": "handoff", "handoff": json.loads(handoff.to_wire())})
-                    if handoff.remaining_tokens:
-                        target = channel.receive()
-                        if set(target) != {"op", "ticket"} or target["op"] != "send":
-                            raise ValueError("expected a receive ticket")
-                        ticket = ReceiveTicket.from_wire(json.dumps(target["ticket"]).encode())
+    from .service import WorkerService
 
-                        # payload is bytes for TCP and an independent CUDA Tensor
-                        # for Mooncake; ticket identifies D's receive allocation.
-                        # `ticket` 包含 D 端的接收地址与接收凭据。
-                        #使用普通 TCP 时，KV 直接通过两个 Worker 之间的 TCP socket 传输，
-                        # P Worker ───── TCP：KV 字节 ─────→ D Worker
-                        backend.send(
-                            handoff.kv, payload, ticket, cancel_check=channel.check_connected
-                        )
-                        channel.send({"status": "sent", "transfer_id": transfer_id})
-                elif (
-                    scheduler.role is WorkerRole.DECODE
-                    and set(message) == {"op", "handoff"}
-                    and message["op"] == "decode"
-                ):
-                    if getattr(backend, "layered_transfer", False):
-                        raise ValueError("Mooncake decode requires an early layer reservation")
-                    handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
-                    transfer_id = handoff.kv.transfer_id
-                    if transfer_id in recent:
-                        raise ValueError("duplicate transfer attempt")
-                    recent.append(transfer_id)
-                    scheduler.decode(handoff, channel, backend)
-                else:
-                    raise ValueError("operation does not match worker role")
-            except TransferBackendUnavailable as exc:
-                try:
-                    channel.send({"status": "error", "error": str(exc)})
-                except OSError:
-                    pass
-                raise
-            except (OSError, RuntimeError, ValueError) as exc:
-                try:
-                    channel.send({"status": "error", "error": str(exc)})
-                except OSError:
-                    pass
-                if scheduler._owned_req is not None:
-                    raise RuntimeError(
-                        "split worker could not release its request resources"
-                    ) from exc
-            finally:
-                payload = None
+    WorkerService(scheduler, backend, timeout).run(listener, stop)
 
 
 def _exit_unavailable_worker(exc: BaseException) -> NoReturn:

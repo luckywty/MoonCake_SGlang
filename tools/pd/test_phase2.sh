@@ -14,4 +14,5 @@ test_python="${FLUXINFER_TEST_PYTHON:-python3}"
     tests/integration/test_pd_failures.py \
     tests/integration/test_pd_gateway.py tests/integration/test_pd_gpu.py \
     tests/integration/test_pd_layered.py tests/integration/test_pd_layered_cuda.py \
+    tests/integration/test_pd_batching.py tests/integration/test_pd_control_loop.py \
     tests/core/test_cache_allocate.py tests/misc/test_serialize.py

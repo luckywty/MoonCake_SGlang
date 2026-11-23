@@ -31,6 +31,10 @@ class ServerArgs(SchedulerConfig):
     pd_mooncake_device: str = ""
     pd_layers_per_chunk: int = 1
     pd_staging_slots: int = 3
+    pd_max_queued_requests: int = 128
+    pd_max_queued_tokens: int | None = None
+    pd_batch_wait_ms: float = 2.0
+    pd_output_queue_size: int = 128
 
     @property
     def share_tokenizer(self) -> bool:
@@ -94,6 +98,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument("--pd-mooncake-host", default=None)
     parser.add_argument("--pd-layers-per-chunk", type=int, default=ServerArgs.pd_layers_per_chunk)
     parser.add_argument("--pd-staging-slots", type=int, default=ServerArgs.pd_staging_slots)
+    parser.add_argument(
+        "--pd-max-queued-requests", type=int, default=ServerArgs.pd_max_queued_requests
+    )
+    parser.add_argument("--pd-max-queued-tokens", type=int, default=None)
+    parser.add_argument("--pd-batch-wait-ms", type=float, default=ServerArgs.pd_batch_wait_ms)
+    parser.add_argument("--pd-output-queue-size", type=int, default=ServerArgs.pd_output_queue_size)
     parser.add_argument(
         "--pd-max-transfer-bytes", type=int, default=ServerArgs.pd_max_transfer_bytes
     )
@@ -299,6 +309,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             parser.error("--pd-layers-per-chunk must be positive")
         if not 2 <= kwargs["pd_staging_slots"] <= 4:
             parser.error("--pd-staging-slots must be between 2 and 4")
+        if kwargs["pd_max_queued_requests"] < 1 or kwargs["pd_output_queue_size"] < 1:
+            parser.error("P/D request and output queue limits must be positive")
+        if kwargs["pd_max_queued_tokens"] is not None and kwargs["pd_max_queued_tokens"] < 1:
+            parser.error("--pd-max-queued-tokens must be positive")
+        if not math.isfinite(kwargs["pd_batch_wait_ms"]) or kwargs["pd_batch_wait_ms"] < 0:
+            parser.error("--pd-batch-wait-ms must be finite and nonnegative")
         if (
             not math.isfinite(kwargs["pd_max_quarantine_seconds"])
             or kwargs["pd_max_quarantine_seconds"] <= 0

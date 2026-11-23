@@ -144,8 +144,10 @@ def test_cancel_keeps_exposed_receive_and_slots_until_drain():
         job.seal(cancel=True)
         assert not job.done.wait(0.03)
         assert d._lease is not None and not d._receive_buffer.safe_to_release
-        with pytest.raises(TransferError, match="busy"):
-            d.reserve_layers(StartRequest(str(uuid4()), 0, (1,), 2, True), 31)
+        other = d.reserve_layers(StartRequest(str(uuid4()), 0, (1,), 2, True), 31)
+        assert other.address >= target.address + target.nbytes
+        d.release_layers(other)
+        assert target.locator in d._leases
         gate.set()
         job.finish(cancel=True)
         assert d._lease is None and d._receive_buffer.safe_to_release
@@ -197,8 +199,7 @@ def test_lost_receipt_replays_identical_terminal_proof():
         job, _, _, target = start_job(p, d, layout)
         for layer in range(layout.layers):
             job.layer_ready(layer)
-        with pytest.raises(ConnectionError, match="lost terminal receipt"):
-            job.finish()
+        job.finish()  # A lost receipt is replayed on a reconnected control channel.
         assert lost.is_set()
         assert d._lease.terminal["result"] == "complete"
         assert d._receive_buffer.safe_to_release
@@ -370,7 +371,12 @@ def test_early_handshake_real_scheduler_continuation_and_eos(group):
             )
         eos_prompt = next([token] for token in range(32) if reference_tokens([token], 1) == [31])
         assert client.generate(eos_prompt, 5) == [31]
-        wait_for(lambda: all(s._owned_req is None for s in schedulers))
+        wait_for(
+            lambda: all(
+                s.table_manager.available_size == 2 and len(s.cache_manager.free_slots) == 32
+                for s in schedulers
+            )
+        )
         assert all(s.table_manager.available_size == 2 for s in schedulers)
         assert all(len(s.cache_manager.free_slots) == 32 for s in schedulers)
         assert backends[0].fake_engine.register_calls == 2
@@ -383,7 +389,7 @@ def test_client_disconnect_after_first_token_reclaims_layer_reservation():
         iterator = client.stream([1, 2, 3, 4, 5], 10, ignore_eos=True)
         next(iterator)
         iterator.close()
-        wait_for(lambda: all(s._owned_req is None for s in schedulers))
+        wait_for(lambda: all(s.table_manager.available_size == 2 for s in schedulers))
         wait_for(lambda: backends[1]._lease is None)
         assert client.generate([1, 2], 3, ignore_eos=True) == reference_tokens([1, 2], 3)
 
@@ -395,7 +401,9 @@ def test_reservation_disconnect_before_prefill_reclaims_private_pages():
             channel = Channel(sock, 2)
             channel.send({"op": "reserve", "request": request.to_object()})
             assert channel.receive()["status"] == "ready"
-        wait_for(lambda: schedulers[1]._owned_req is None)
+        wait_for(
+            lambda: schedulers[1].table_manager.available_size == 2 and backends[1]._lease is None
+        )
         assert backends[1]._lease is None
         assert schedulers[1].table_manager.available_size == 2
         assert len(schedulers[1].cache_manager.free_slots) == 32

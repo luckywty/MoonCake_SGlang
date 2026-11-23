@@ -57,13 +57,22 @@ class TransferOperation:
 
 class MooncakeRuntime:
     def __init__(
-        self, local_host: str, *, timeout: float = 30.0,
-        max_transfer_bytes: int = 1024**3, max_registered_bytes: int | None = None,
-        max_pending_transfers: int = 32, max_quarantine_seconds: float = 300.0,
-        device_name: str = "", engine_module: str = "mooncake.engine",
+        self,
+        local_host: str,
+        *,
+        timeout: float = 30.0,
+        max_transfer_bytes: int = 1024**3,
+        max_registered_bytes: int | None = None,
+        max_pending_transfers: int = 32,
+        max_quarantine_seconds: float = 300.0,
+        device_name: str = "",
+        engine_module: str = "mooncake.engine",
     ):
-        if (not isinstance(local_host, str) or not local_host.strip()
-                or local_host.strip() in ("0.0.0.0", "::")):
+        if (
+            not isinstance(local_host, str)
+            or not local_host.strip()
+            or local_host.strip() in ("0.0.0.0", "::")
+        ):
             raise ValueError("Mooncake requires a reachable local host, not a wildcard")
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Mooncake timeout must be finite and positive")
@@ -110,14 +119,23 @@ class MooncakeRuntime:
 
     def _check_pid(self) -> None:
         if os.getpid() != self.owner_pid:
-            raise TransferBackendUnavailable("Mooncake runtimes cannot be shared across forked Workers")
+            raise TransferBackendUnavailable(
+                "Mooncake runtimes cannot be shared across forked Workers"
+            )
 
     @staticmethod
     def _configure_rdma(device_name: str) -> list[str]:
         incompatible = (
-            "MC_FORCE_TCP", "MC_USE_TENT", "MC_USE_TEV1", "MC_FORCE_SHM",
-            "MC_FORCE_MNNVL", "MC_INTRANODE_NVLINK", "MC_FORCE_MUSA",
-            "MC_ENABLE_HYLINK", "MC_USE_RDMA_TWOSIDED", "USE_BAREX",
+            "MC_FORCE_TCP",
+            "MC_USE_TENT",
+            "MC_USE_TEV1",
+            "MC_FORCE_SHM",
+            "MC_FORCE_MNNVL",
+            "MC_INTRANODE_NVLINK",
+            "MC_FORCE_MUSA",
+            "MC_ENABLE_HYLINK",
+            "MC_USE_RDMA_TWOSIDED",
+            "USE_BAREX",
         )
         present = [name for name in incompatible if name in os.environ]
         if present:
@@ -156,23 +174,37 @@ class MooncakeRuntime:
             if getattr(module, "SUPPORT_CUDA", False) is not True:
                 raise TransferBackendUnavailable("the Mooncake extension lacks CUDA support")
             engine_type = getattr(module, "TransferEngine", None)
-            methods = ("initialize", "get_rpc_port", "register_memory", "unregister_memory", "submit_scatter_write")
-            if engine_type is None or any(not callable(getattr(engine_type, name, None)) for name in methods):
+            methods = (
+                "initialize",
+                "get_rpc_port",
+                "register_memory",
+                "unregister_memory",
+                "submit_scatter_write",
+            )
+            if engine_type is None or any(
+                not callable(getattr(engine_type, name, None)) for name in methods
+            ):
                 raise TransferBackendUnavailable("Mooncake lacks the required GPU scatter API")
             states = getattr(module, "ScatterTransferCompletionStatus", None)
-            if states is None or any(not hasattr(states, name) for name in (
-                "COMPLETED", "FAILED_DRAINED", "COMPLETION_UNKNOWN"
-            )):
-                raise TransferBackendUnavailable("Mooncake lacks explicit scatter completion states")
+            if states is None or any(
+                not hasattr(states, name)
+                for name in ("COMPLETED", "FAILED_DRAINED", "COMPLETION_UNKNOWN")
+            ):
+                raise TransferBackendUnavailable(
+                    "Mooncake lacks explicit scatter completion states"
+                )
             self.module, self.cuda, self.device = module, cuda, device
             with cuda.activate():
                 self.engine = engine_type()
                 with _LIVE_RUNTIMES_LOCK:
                     _LIVE_RUNTIMES[id(self)] = self
                 try:
-                    self._native_ok("initialize", self.engine.initialize(
-                        self.local_host, "P2PHANDSHAKE", "rdma", self.device_name
-                    ))
+                    self._native_ok(
+                        "initialize",
+                        self.engine.initialize(
+                            self.local_host, "P2PHANDSHAKE", "rdma", self.device_name
+                        ),
+                    )
                     port = self.engine.get_rpc_port()
                     if type(port) is not int or not 0 < port < 65536:
                         raise TransferError("Mooncake returned an invalid RPC port")
@@ -185,25 +217,37 @@ class MooncakeRuntime:
             except importlib.metadata.PackageNotFoundError:
                 version = "source-build"
             self._info = {
-                "owner_pid": self.owner_pid, "session": self.session,
-                "transport": "rdma", "memory": "cuda", "helpers": False,
+                "owner_pid": self.owner_pid,
+                "session": self.session,
+                "transport": "rdma",
+                "memory": "cuda",
+                "helpers": False,
                 "engine_file": str(getattr(module, "__file__", "unknown")),
-                "package_version": version, "hca_devices": devices, "cuda": cuda.info,
+                "package_version": version,
+                "hca_devices": devices,
+                "cuda": cuda.info,
             }
-            self._reaper = threading.Thread(target=self._reap_loop, name="pd-mooncake-reaper", daemon=True)
+            self._reaper = threading.Thread(
+                target=self._reap_loop, name="pd-mooncake-reaper", daemon=True
+            )
             self._reaper.start()
 
     @property
     def info(self) -> dict:
         with self._lock:
-            return {**self._info, "owner_pid": self.owner_pid,
-                    "initialized": self.session is not None and not self._closed}
+            return {
+                **self._info,
+                "owner_pid": self.owner_pid,
+                "initialized": self.session is not None and not self._closed,
+            }
 
     def _age_check_locked(self) -> None:
         now = time.monotonic()
-        if any(buffer.quarantine_since is not None
-               and now - buffer.quarantine_since >= self.max_quarantine_seconds
-               for buffer in self._buffers.values()):
+        if any(
+            buffer.quarantine_since is not None
+            and now - buffer.quarantine_since >= self.max_quarantine_seconds
+            for buffer in self._buffers.values()
+        ):
             self._retire_reason = "an unresolved GPU registration exceeded its quarantine deadline"
 
     def check_available(self) -> None:
@@ -215,15 +259,20 @@ class MooncakeRuntime:
             if self._closing or self._closed or self.session is None:
                 raise TransferBackendUnavailable("the GPU Mooncake runtime is not ready")
 
-    def check_capacity(self, nbytes: int) -> None:
+    def check_capacity(self, nbytes: int, *, pool: bool = False) -> None:
         self.check_available()
-        if type(nbytes) is not int or not 0 < nbytes <= self.max_transfer_bytes:
+        limit = self.max_registered_bytes if pool else self.max_transfer_bytes
+        if type(nbytes) is not int or not 0 < nbytes <= limit:
             raise TransferError("KV payload exceeds the configured GPU transfer limit")
         with self._lock:
-            if (self._registered_bytes + nbytes > self.max_registered_bytes
-                    or len(self._buffers) >= self.max_pending_transfers):
+            if (
+                self._registered_bytes + nbytes > self.max_registered_bytes
+                or len(self._buffers) >= self.max_pending_transfers
+            ):
                 if any(buffer.quarantine_since is not None for buffer in self._buffers.values()):
-                    self._retire_reason = "unresolved GPU registrations exhausted the transfer budget"
+                    self._retire_reason = (
+                        "unresolved GPU registrations exhausted the transfer budget"
+                    )
                     raise TransferBackendUnavailable(self._retire_reason)
                 raise TransferError("the registered GPU transfer budget is busy")
 
@@ -231,23 +280,29 @@ class MooncakeRuntime:
         if self._buffers.get(buffer.key) is not buffer:
             raise TransferError("unknown or released GPU registration")
 
-    def register_tensor(self, tensor: torch.Tensor, key: str) -> RegisteredBuffer:
+    def register_tensor(self, tensor: torch.Tensor, key: str, *, pool=False) -> RegisteredBuffer:
         if not isinstance(tensor, torch.Tensor) or tensor.device != self.device:
             raise TransferError("KV payload must be a tensor on the Worker's CUDA device")
         if not isinstance(key, str) or not key:
             raise TransferError("GPU registrations need an attempt-scoped key")
         if not tensor.is_contiguous() or tensor.dtype not in (
-            torch.uint8, torch.float16, torch.bfloat16, torch.float32
+            torch.uint8,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
         ):
             raise TransferError("GPU KV registration requires contiguous, unquantized storage")
         nbytes = tensor.numel() * tensor.element_size()
         address = tensor.data_ptr()
         with self._lock:
-            self.check_capacity(nbytes)
+            # A startup pool can hold several individually bounded transfers.
+            self.check_capacity(nbytes, pool=pool)
             if key in self._buffers:
                 raise TransferError("GPU registration key is already in use")
-            if any(address < entry.address + entry.nbytes and entry.address < address + nbytes
-                   for entry in self._buffers.values()):
+            if any(
+                address < entry.address + entry.nbytes and entry.address < address + nbytes
+                for entry in self._buffers.values()
+            ):
                 raise TransferError("GPU allocation overlaps an existing registration")
             # Registration itself is native work. close() must retain this
             # Tensor even before register_memory() has returned.
@@ -273,9 +328,12 @@ class MooncakeRuntime:
             buffer.registered = True
             try:
                 with self.cuda.activate():
-                    self._native_ok("register_memory", self.engine.register_memory(
-                        address, nbytes, f"cuda:{self.device.index}", True
-                    ))
+                    self._native_ok(
+                        "register_memory",
+                        self.engine.register_memory(
+                            address, nbytes, f"cuda:{self.device.index}", True
+                        ),
+                    )
             except Exception as exc:
                 self.quarantine(buffer, f"memory registration failed: {exc}")
                 raise TransferError(f"GPU memory registration failed: {exc}") from exc
@@ -283,12 +341,12 @@ class MooncakeRuntime:
                 buffer.safe_to_release = True
         return buffer
 
-    def allocate_buffer(self, nbytes: int, key: str) -> RegisteredBuffer:
-        self.check_capacity(nbytes)
+    def allocate_buffer(self, nbytes: int, key: str, *, pool=False) -> RegisteredBuffer:
+        self.check_capacity(nbytes, pool=pool)
         assert self.cuda is not None
         with self.cuda.activate():
             tensor = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        return self.register_tensor(tensor, key)
+        return self.register_tensor(tensor, key, pool=pool)
 
     def expose(self, buffer: RegisteredBuffer) -> None:
         with self._lock:
@@ -302,6 +360,16 @@ class MooncakeRuntime:
             buffer.safe_to_release = True
             buffer.quarantine_since = None
             buffer.last_error = None
+
+    def update_pool_safety(self, buffer, *, safe: bool, quarantine_since):
+        """Atomically aggregate slice ownership without clearing another lease's quarantine."""
+        with self._lock:
+            self._owned_locked(buffer)
+            buffer.safe_to_release = safe
+            buffer.quarantine_since = quarantine_since
+            buffer.last_error = (
+                "receive slice awaits native completion" if quarantine_since is not None else None
+            )
 
     def quarantine(self, buffer: RegisteredBuffer, reason: str) -> None:
         with self._lock:
@@ -333,7 +401,9 @@ class MooncakeRuntime:
             try:
                 if buffer.registered:
                     with self.cuda.activate():
-                        self._native_ok("unregister_memory", self.engine.unregister_memory(buffer.address))
+                        self._native_ok(
+                            "unregister_memory", self.engine.unregister_memory(buffer.address)
+                        )
             except Exception as exc:
                 self.quarantine(buffer, f"memory unregistration failed: {exc}")
                 raise TransferError(f"GPU memory unregistration failed: {exc}") from exc
@@ -350,9 +420,12 @@ class MooncakeRuntime:
         """Retire a drained operation while retaining its startup registration."""
         with operation.lock, self._lock:
             self._owned_locked(operation.buffer)
-            if (operation.status not in ("completed", "failed_drained")
-                    or operation.ticket is None or not operation.ticket.drained
-                    or not operation.buffer.safe_to_release):
+            if (
+                operation.status not in ("completed", "failed_drained")
+                or operation.ticket is None
+                or not operation.ticket.drained
+                or not operation.buffer.safe_to_release
+            ):
                 raise TransferError("cannot reuse a staging slot before native drain")
             if self._operations.get(operation.buffer.key) is not operation:
                 raise TransferError("stale staging operation")
@@ -389,9 +462,13 @@ class MooncakeRuntime:
             with self.cuda.activate():
                 operation.ticket = self.engine.submit_scatter_write(
                     remote["session"],
-                    [buffer.address], [nbytes],
-                    [remote["address"]], [remote["nbytes"]],
-                    [[0]], [[0]], [[nbytes]],
+                    [buffer.address],
+                    [nbytes],
+                    [remote["address"]],
+                    [remote["nbytes"]],
+                    [[0]],
+                    [[0]],
+                    [[nbytes]],
                 )
             if operation.ticket is None or not callable(getattr(operation.ticket, "drain", None)):
                 raise TransferError("Mooncake did not return a drainable native operation")
@@ -476,16 +553,22 @@ class MooncakeRuntime:
     def health(self) -> dict:
         with self._lock:
             self._age_check_locked()
-            quarantined = [entry for entry in self._buffers.values() if entry.quarantine_since is not None]
-            oldest = max((time.monotonic() - entry.quarantine_since for entry in quarantined), default=0.0)
+            quarantined = [
+                entry for entry in self._buffers.values() if entry.quarantine_since is not None
+            ]
+            oldest = max(
+                (time.monotonic() - entry.quarantine_since for entry in quarantined), default=0.0
+            )
             return {
-                "state": "unavailable" if self._retire_reason or self._closing else (
-                    "degraded" if quarantined else ("ready" if self.session else "unbound")
-                ),
+                "state": "unavailable"
+                if self._retire_reason or self._closing
+                else ("degraded" if quarantined else ("ready" if self.session else "unbound")),
                 "reason": self._retire_reason,
                 "registered_bytes": self._registered_bytes,
                 "registered_buffers": len(self._buffers),
-                "pending_operations": sum(entry.status == "unknown" for entry in self._operations.values()),
+                "pending_operations": sum(
+                    entry.status == "unknown" for entry in self._operations.values()
+                ),
                 "quarantined_bytes": sum(entry.nbytes for entry in quarantined),
                 "quarantined_buffers": len(quarantined),
                 "oldest_quarantine_seconds": oldest,
@@ -503,7 +586,9 @@ class MooncakeRuntime:
         deadline = time.monotonic() + self.timeout
         while True:
             with self._lock:
-                operations = [entry for entry in self._operations.values() if entry.status == "unknown"]
+                operations = [
+                    entry for entry in self._operations.values() if entry.status == "unknown"
+                ]
             if not operations or time.monotonic() >= deadline:
                 break
             for operation in operations:
@@ -527,7 +612,9 @@ class MooncakeRuntime:
                     pass
         with self._lock:
             if self._buffers or (self._reaper is not None and self._reaper.is_alive()):
-                self._retire_reason = "Mooncake close could not drain every GPU registration; the Worker must exit"
+                self._retire_reason = (
+                    "Mooncake close could not drain every GPU registration; the Worker must exit"
+                )
                 raise TransferBackendUnavailable(self._retire_reason)
             self.engine = None
             self.module = None

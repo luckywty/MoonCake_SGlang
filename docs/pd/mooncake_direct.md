@@ -2,9 +2,9 @@
 
 `--pd-transfer-backend mooncake` 使用每个 Worker 常驻的 `mooncake.engine.TransferEngine`，
 通过 GPUDirect RDMA 传输 CUDA Tensor。旧 helper 子进程入口已经退役。
-当前实现保留 TP=1、未量化 MHA KV、greedy、串行请求及 eager 执行。
+当前实现保留 TP=1、未量化 MHA KV、greedy 及 eager 执行，支持多请求组批。
 Mooncake 路径现已增加启动期预注册池、前置接收握手及按层组的计算/传输重叠，
-实现和验证边界见 [逐层传输说明](layered_transfer.md)。
+实现和验证边界见 [逐层传输说明](layered_transfer.md) 和 [多请求调度说明](batching.md)。
 
 ## 数据路径
 
@@ -82,7 +82,7 @@ PYTHONPATH=python python -m minisgl.disagg.client \
 ## 同步、取消与回收
 
 1. P 的层就绪回调只记录 event 并入队；后台等待该 event 后打包，再等待打包完成才提交。
-   原请求页保留到后台结束；TE 使用的环形槽位由 runtime 保持强引用，原生排空后才复用。
+   原请求页保留到该请求的后台 gather 结束；TE 使用的环形槽位由 runtime 保持强引用，原生排空后才复用。
 2. D 在可信传输完成确认后，执行设备所需的 GPUDirect 写入可见性处理，再进行 GPU 写回。
 3. D 等写回 CUDA 工作完成后归还接收池租约，随后开始 Decode；池在 Worker 生命周期内保留注册。
 4. 业务取消会撤销交付，不能据此释放仍可能被原生操作访问的 GPU 地址。

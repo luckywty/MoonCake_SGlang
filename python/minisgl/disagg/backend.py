@@ -6,7 +6,7 @@ from .role import WorkerRole
 from .tcp_backend import TcpTransferBackend
 
 
-#根据启动参数 args.pd_transfer_backend，
+# 根据启动参数 args.pd_transfer_backend，
 # 决定 P Worker 和 D Worker 使用 TCP 还是 Mooncake Transfer Engine 进行 KV Cache 传输。
 def create_transfer_backend(args):
     name = args.pd_transfer_backend
@@ -17,7 +17,7 @@ def create_transfer_backend(args):
     )
     kwargs = {"advertise_host": args.pd_advertise_host, "timeout": args.pd_timeout}
     if name == "tcp":
-        return TcpTransferBackend(bind, **kwargs)
+        return TcpTransferBackend(bind, max_transfer_bytes=args.pd_max_transfer_bytes, **kwargs)
     if name == "mooncake":
         from .layered_mooncake import LayeredMooncakeBackend
 

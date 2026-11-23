@@ -16,11 +16,14 @@ from minisgl.message import DetokenizeMsg
 from minisgl.server.api_server import OpenAICompletionRequest
 from minisgl.tokenizer.detokenize import DetokenizeManager
 
+from .admission import AdmissionError
 from .client import PDClient, RemoteWorkerError
 
-'''提供 HTTP 接口，处理分词、文本输出和流式响应
+"""提供 HTTP 接口，处理分词、文本输出和流式响应
 接收用户的 HTTP 请求、Tokenization、调用 P/D 推理客户端，
-以及将生成的 Token 转换成 OpenAI API 风格的响应。'''
+以及将生成的 Token 转换成 OpenAI API 风格的响应。"""
+
+
 def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
     app = FastAPI()
 
@@ -85,34 +88,42 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
                         not req.ignore_eos and token == tokenizer.eos_token_id
                     )
                     delta = detokenizer.detokenize([DetokenizeMsg(0, token, finished)])[0]
-                    yield "data: " + json.dumps(
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [
+                                    {"index": 0, "delta": {"content": delta}, "finish_reason": None}
+                                ],
+                            }
+                        )
+                        + "\n\n"
+                    )
+                yield (
+                    "data: "
+                    + json.dumps(
                         {
                             "id": request_id,
                             "object": "chat.completion.chunk",
                             "model": model,
                             "choices": [
-                                {"index": 0, "delta": {"content": delta}, "finish_reason": None}
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": finish_reason(tokens, req),
+                                }
                             ],
                         }
-                    ) + "\n\n"
-                yield "data: " + json.dumps(
-                    {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": finish_reason(tokens, req),
-                            }
-                        ],
-                    }
-                ) + "\n\ndata: [DONE]\n\n"
-            except (OSError, RemoteWorkerError, ValueError) as exc:
-                yield "data: " + json.dumps(
-                    {"error": {"message": str(exc)}}
-                ) + "\n\ndata: [DONE]\n\n"
+                    )
+                    + "\n\ndata: [DONE]\n\n"
+                )
+            except (OSError, RemoteWorkerError, AdmissionError, ValueError) as exc:
+                yield (
+                    "data: " + json.dumps({"error": {"message": str(exc)}}) + "\n\ndata: [DONE]\n\n"
+                )
             finally:
                 cancel.set()
                 watcher.cancel()
@@ -154,6 +165,8 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
                     "total_tokens": len(ids) + len(tokens),
                 },
             }
+        except AdmissionError as exc:
+            raise HTTPException(429, str(exc)) from exc
         except (OSError, RemoteWorkerError, ValueError) as exc:
             raise HTTPException(503, str(exc)) from exc
         finally:
@@ -180,12 +193,20 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1940)
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--max-inflight-requests", type=int, default=128)
+    parser.add_argument("--max-inflight-tokens", type=int, default=1048576)
     args = parser.parse_args()
     import uvicorn
     from minisgl.utils import load_tokenizer
 
     app = create_app(
-        PDClient(args.prefill, args.decode, timeout=args.timeout),
+        PDClient(
+            args.prefill,
+            args.decode,
+            timeout=args.timeout,
+            max_inflight_requests=args.max_inflight_requests,
+            max_inflight_tokens=args.max_inflight_tokens,
+        ),
         load_tokenizer(args.model),
         args.model,
     )

@@ -14,7 +14,8 @@ Destination = TypeVar("Destination", contravariant=True)
 
 
 class KVTransferBackend(Protocol[Source, Destination]):
-    '''规定所有传输后端必须提供的接口'''
+    """规定所有传输后端必须提供的接口"""
+
     def prepare_receive(
         self, meta: KVTransferMetadata, local_layout: KVLayout, destination: Destination
     ) -> ReceiveTicket:
@@ -49,6 +50,10 @@ class TransferError(RuntimeError):
     """A transfer failed validation or completion; the caller must not admit it for decode."""
 
 
+class TransferCapacityError(TransferError):
+    """Bounded request, page, staging, or connection capacity is currently occupied."""
+
+
 class TransferBackendUnavailable(TransferError):
     """The backend cannot safely accept work; its Worker must stop serving.
 
@@ -77,7 +82,7 @@ class MockTransferBackend:
     """真正实现模拟传输;Host bytes only. A ticket contains neither a Python object nor the receiver's table index."""
 
     def __init__(self, endpoint: str, fabric: MockFabric) -> None:
-        '''创建传输端点,模拟 Worker 的数据通信接口'''
+        """创建传输端点,模拟 Worker 的数据通信接口"""
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError("endpoint must be a nonempty string")
         self.endpoint = endpoint
@@ -86,25 +91,25 @@ class MockTransferBackend:
     def prepare_receive(
         self, meta: KVTransferMetadata, local_layout: KVLayout, destination: bytearray
     ) -> ReceiveTicket:
-        #准备接受kv
-        '''
+        # 准备接受kv
+        """
         meta：Prefill 告诉 Decode 的 KV 传输描述。
         local_layout：Decode 本地允许接收的 KV Layout。
         destination：Decode 已经分配好的目标 Buffer。
-        '''
-        if meta.layout != local_layout:#检查布局一致性
+        """
+        if meta.layout != local_layout:  # 检查布局一致性
             raise TransferError("incompatible KV layout or model")
-        if not isinstance(destination, bytearray):#检查类型一致
+        if not isinstance(destination, bytearray):  # 检查类型一致
             raise TransferError("mock destination must be a bytearray")
         target = ReceiveTicket(meta.transfer_id, self.endpoint, str(uuid4()), meta.nbytes)
-        key = (self.endpoint, meta.transfer_id)#注册目标 Buffer
+        key = (self.endpoint, meta.transfer_id)  # 注册目标 Buffer
         with self._fabric._lock:
             reservations = self._fabric._reservations
             if key in reservations or any(
                 r.destination.obj is destination for r in reservations.values()
             ):
-                '''同一个 endpoint + transfer_id 已经被注册。
-                    同一个 bytearray 已经被其他接收任务占用。'''
+                """同一个 endpoint + transfer_id 已经被注册。
+                    同一个 bytearray 已经被其他接收任务占用。"""
                 raise TransferError("attempt or destination already reserved")
             view = memoryview(destination)
             if view.nbytes != target.nbytes:

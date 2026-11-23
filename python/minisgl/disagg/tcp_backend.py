@@ -9,12 +9,13 @@ import socket
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from .control import Channel, endpoint_address, endpoint_name, read_bytes, write_bytes
 from .protocol import KVLayout, KVTransferMetadata, ReceiveTicket
 from .transfer import MockFabric, MockTransferBackend, TransferError
 
-'''
+"""
 P Worker
     |
     | 1. Prefill 计算得到 KV Cache
@@ -41,37 +42,47 @@ D Worker GPU KV Cache
     v
 生成后续 Token
 
-'''
-class TcpTransferBackend(MockTransferBackend):  #继承MockTransferBackend
-    def __init__(   #初始化 TCP Backend
+"""
+
+
+class TcpTransferBackend(MockTransferBackend):  # 继承MockTransferBackend
+    def __init__(  # 初始化 TCP Backend
         self,
         bind: tuple[str, int] | None = None,
         *,
         advertise_host: str | None = None,
         timeout: float = 30.0,
+        max_transfer_bytes: int = 1024**3,
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive")
+        if type(max_transfer_bytes) is not int or max_transfer_bytes <= 0:
+            raise ValueError("max_transfer_bytes must be positive")
         self.timeout = timeout
+        self.max_transfer_bytes = max_transfer_bytes
         self._stop = threading.Event()
         self._listener = None
-        self._connection = None
+        self._connections = set()
         self._connection_lock = threading.Lock()
+        self._handler_slots = threading.BoundedSemaphore(32)
+        self._handlers = ThreadPoolExecutor(max_workers=32, thread_name_prefix="pd-tcp-receive")
         self._thread = None
         self._cancellations = {}
         endpoint = "tcp-sender"
-        if bind is not None:    #bind 参数决定是否开启接收服务
-            ''' 对于 P Worker，bind=None，不创建接收监听 Socket。
-                对于 D Worker，会在指定地址和端口创建 TCP 监听 Socket。'''
+        if bind is not None:  # bind 参数决定是否开启接收服务
+            """ 对于 P Worker，bind=None，不创建接收监听 Socket。
+                对于 D Worker，会在指定地址和端口创建 TCP 监听 Socket。"""
 
-            #创建 TCP 监听 socket。bind 通常是 (host, port)
+            # 创建 TCP 监听 socket。bind 通常是 (host, port)
             listener = socket.create_server(bind)
-            listener.settimeout(0.2)    #设置监听操作的等待时间
+            listener.settimeout(0.2)  # 设置监听操作的等待时间
             host, port = listener.getsockname()[:2]
 
-            #这行只修改准备公布的地址字符串，不会改变 socket 已经绑定的地址。
-            host = advertise_host or host   #如果提供了非空的 advertise_host，就使用它；否则使用实际绑定得到的 host。
-            if host in ("0.0.0.0", "::"):   #阻止公布通配监听地址
+            # 这行只修改准备公布的地址字符串，不会改变 socket 已经绑定的地址。
+            host = (
+                advertise_host or host
+            )  # 如果提供了非空的 advertise_host，就使用它；否则使用实际绑定得到的 host。
+            if host in ("0.0.0.0", "::"):  # 阻止公布通配监听地址
                 listener.close()
                 raise ValueError("wildcard bind requires an advertised host")
             endpoint = endpoint_name(host, port)
@@ -84,12 +95,17 @@ class TcpTransferBackend(MockTransferBackend):  #继承MockTransferBackend
     def prepare_receive(
         self, meta: KVTransferMetadata, local_layout: KVLayout, destination: bytearray
     ) -> ReceiveTicket:
+        self._check_payload(meta)
         if self._listener is None or self._stop.is_set():
             raise TransferError("TCP receive endpoint is unavailable")
         target = super().prepare_receive(meta, local_layout, destination)
         with self._fabric._lock:
             self._cancellations[target.locator] = threading.Event()
         return target
+
+    def _check_payload(self, meta):
+        if meta.nbytes > self.max_transfer_bytes:
+            raise TransferError("KV payload exceeds the TCP transfer limit")
 
     def finish_receive(self, target: ReceiveTicket) -> None:
         super().finish_receive(target)
@@ -113,6 +129,7 @@ class TcpTransferBackend(MockTransferBackend):  #继承MockTransferBackend
         *,
         cancel_check: Callable[[], None] | None = None,
     ) -> None:
+        self._check_payload(meta)
         if cancel_check is not None:
             cancel_check()
         if not isinstance(source, (bytes, bytearray)) or len(source) != meta.nbytes:
@@ -146,12 +163,13 @@ class TcpTransferBackend(MockTransferBackend):  #继承MockTransferBackend
             raise TransferError(f"TCP transfer failed: {exc}") from exc
 
     def _receive(self, sock: socket.socket) -> None:
-        channel = Channel(sock, self.timeout)
+        channel = Channel(sock, self.timeout, self._stop)
         try:
             header = channel.receive()
             if set(header) != {"metadata", "ticket", "sha256"}:
                 raise TransferError("incorrect transfer header")
             meta = KVTransferMetadata.from_wire(json.dumps(header["metadata"]).encode())
+            self._check_payload(meta)
             target = ReceiveTicket.from_wire(json.dumps(header["ticket"]).encode())
             with self._fabric._lock:
                 entry = self._lookup(target)
@@ -182,31 +200,37 @@ class TcpTransferBackend(MockTransferBackend):  #继承MockTransferBackend
                 continue
             except OSError:
                 return
+            if not self._handler_slots.acquire(blocking=False):
+                sock.close()
+                continue
+            with self._connection_lock:
+                self._connections.add(sock)
+            self._handlers.submit(self._handle, sock)
+
+    def _handle(self, sock):
+        try:
             with sock:
-                with self._connection_lock:
-                    if self._stop.is_set():
-                        return
-                    self._connection = sock
-                try:
-                    self._receive(sock)
-                finally:
-                    with self._connection_lock:
-                        self._connection = None
+                self._receive(sock)
+        finally:
+            with self._connection_lock:
+                self._connections.discard(sock)
+            self._handler_slots.release()
 
     def close(self) -> None:
         self._stop.set()
         if self._listener is not None:
             self._listener.close()
         with self._connection_lock:
-            if self._connection is not None:
+            for connection in self._connections:
                 try:
-                    self._connection.shutdown(socket.SHUT_RDWR)
+                    connection.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
         if self._thread is not None:
             self._thread.join(timeout=self.timeout + 1)
             if self._thread.is_alive():
                 raise TransferError("TCP receive thread did not stop")
+        self._handlers.shutdown(wait=True)
         with self._fabric._lock:
             for cancelled in self._cancellations.values():
                 cancelled.set()

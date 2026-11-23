@@ -35,6 +35,14 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    page_aligned_budget: bool = False
+
+    def _estimate(self, pending: PendingReq, cached_len: int) -> int:
+        total = pending.input_len + pending.output_len
+        if self.page_aligned_budget:
+            page = self.cache_manager.page_size
+            return ((total + page - 1) // page - (cached_len + page - 1) // page) * page
+        return total - cached_len
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -44,8 +52,7 @@ class PrefillAdder:
         handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
-        extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_len = self._estimate(req, cached_len)
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
@@ -74,7 +81,7 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        self.reserved_size += self._estimate(pending_req, cached_len)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -119,6 +126,7 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    page_aligned_budget: bool = False
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
@@ -133,6 +141,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            page_aligned_budget=self.page_aligned_budget,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
