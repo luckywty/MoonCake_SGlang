@@ -14,7 +14,7 @@ Python 包名和命令入口仍为 `minisgl`。
 
 对比基准固定为本地保留的官方提交
 [`9a91cfafe754aa85daee49998176275667eb58f2`](https://github.com/sgl-project/mini-sglang/tree/9a91cfafe754aa85daee49998176275667eb58f2)，
-下表覆盖当前版本的实现。完整版 SGLang `9f1a6dca98` 是新增选路算法的参考，和这个 mini-sglang 基线是两个项目。
+下表覆盖当前工作区的实现。完整版 SGLang `9f1a6dca98` 是新增选路算法的参考，和这个 mini-sglang 基线是两个项目。
 
 | 方面 | 官方基线 | 当前项目的保留与扩展 |
 |---|---|---|
@@ -40,6 +40,7 @@ Python 包名和命令入口仍为 `minisgl`。
 Mooncake 的逐层计算/通信重叠是独立机制；多节点使用显式地址池，尚未提供自动发现或请求故障迁移。
 当前接入的是 **Mooncake Transfer Engine**；缓存亲和查询 P 的本地 GPU 前缀，尚无全局 KV 目录或 DRAM/SSD 分层 KV 缓存。
 TCP 路径的 CPU 接收区用于传输暂存，不是 Mooncake 论文中的 L2/L3 缓存池；session/SLO 选路和 Decode retract 尚未移植。
+P/D 缓存独立管理，尚无 D→P 的 KV 回传或拉取；后续 prompt 包含历史回答时，P 未命中的这部分 KV 需要重算。
 
 模型源码包含 Llama、Qwen2、Qwen3、Qwen3MoE 和 Mistral；这些模型尚未全部通过新的
 P/D/RDMA 验收。上游性能结果也不代表本项目逐层传输版本的性能。
@@ -119,6 +120,18 @@ D 提前收到早期层 KV，也仍需等待 P 产生首 token，并确认所有
 排空已提交写入后归还 D 的预留资源。取消或超时不能证明 DMA 已停止；完成未知的地址、
 Tensor 和 ticket 必须保留，无法安全回收时后端要求 Worker 退役。
 详见 [逐层传输说明](docs/pd/layered_transfer.md)。
+
+### 多轮对话的 KV 重算成本
+
+**当前没有 D→P 的生成 KV 回传或拉取机制，D 在 Decode 中计算的 KV 不会自动更新 P 的缓存。**
+当下一轮 prompt 包含上轮回答，且所选 P 没有命中对应前缀缓存时，已在 D 上计算过的那部分生成 token KV 会在 P 上再次计算。
+这一限制同时适用于 TCP 和 Mooncake 后端，逐层传输与计算重叠不会消除这种跨轮次重算。
+
+例如首轮输入 `A`、D 生成回答 `B`；下一轮输入 `A+B+C` 时，若 P 仍命中 `A` 的缓存，就复用 `KV(A)`，
+并对 `B+C` 执行 Prefill。`B` 中已在 D 计算过、但 P 未缓存的 KV 因而发生第二次计算；历史回答的信息仍参与本轮推理。
+
+**这不等于所有输出 token 的 KV 都固定计算两次。** 没有后续请求就不会触发上述重算，后续缓存命中也可避免重算；
+最后一个刚采样出的 token 通常尚未在 D 的后续前向中计算 KV。实际计算次数取决于后续输入、选中的 P 和缓存是否命中或被淘汰。
 
 ## 环境与安装
 
