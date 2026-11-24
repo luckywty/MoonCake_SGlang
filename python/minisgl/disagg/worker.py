@@ -62,6 +62,13 @@ def validate_split_config(config) -> None:
 class PDWorkerScheduler(Scheduler):
     def __init__(self, config):
         validate_split_config(config)
+        self.decode_radix_cache = bool(
+            getattr(config, "disaggregation_decode_enable_radix_cache", False)
+        )
+        if config.worker_role is WorkerRole.DECODE:
+            config = replace(config, cache_type="radix" if self.decode_radix_cache else "naive")
+        elif self.decode_radix_cache:
+            raise ValueError("decode Radix caching requires a decode Worker")
         self._gpu_transfer = getattr(config, "pd_transfer_backend", "tcp") == "mooncake"
         if self._gpu_transfer:
             maximum = getattr(config, "pd_max_transfer_bytes", 1024**3)
@@ -105,6 +112,7 @@ class PDWorkerScheduler(Scheduler):
         self._owned_req = None
         self._allocated_len = 0
         self.pd_service_config = {
+            "decode_radix_cache": self.decode_radix_cache,
             "max_queued_requests": getattr(config, "pd_max_queued_requests", 128),
             "max_queued_tokens": getattr(config, "pd_max_queued_tokens", None),
             "batch_wait_ms": getattr(config, "pd_batch_wait_ms", 2.0),
@@ -361,6 +369,8 @@ class PDWorkerScheduler(Scheduler):
                 return
 
     def _reserve_decode(self, handoff: RequestHandoff) -> torch.Tensor:
+        if handoff.kv.prefix_len:
+            raise ValueError("suffix handoffs require the concurrent WorkerService")
         if handoff.kv.layout != self.layout or handoff.eos_token_id != self.eos_token_id:
             raise ValueError("incompatible model, KV layout or EOS configuration")
         self._validate_request(handoff.prompt_ids, handoff.max_tokens)
@@ -572,6 +582,7 @@ def launch_split_worker(args) -> None:
                                 "transfer_backend": getattr(backend, "name", "tcp"),
                                 "worker_pid": os.getpid(),
                                 "worker_id": getattr(args, "worker_id", ""),
+                                "decode_radix_cache": scheduler.decode_radix_cache,
                                 "kv_memory": (
                                     "cuda" if getattr(backend, "gpu_payload", False) else "host"
                                 ),

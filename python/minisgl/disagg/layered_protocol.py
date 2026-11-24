@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from .control import endpoint_address
 from .protocol import KVLayout, _array, _int, _load, _object, _token, _wire, check_transfer_id
 
+LAYERED_TICKET_VERSION = 3
+
 
 @dataclass(frozen=True)
 class LayeredReceiveTicket:
@@ -21,7 +23,8 @@ class LayeredReceiveTicket:
     layer_offsets: tuple[int, ...]
     eos_token_id: int | None
     packing: str = "layer-kv-token-head-dim-le"
-    version: int = 2
+    version: int = LAYERED_TICKET_VERSION
+    prefix_len: int = 0
 
     def __post_init__(self) -> None:
         check_transfer_id(self.transfer_id)
@@ -33,10 +36,15 @@ class LayeredReceiveTicket:
         _int("layers_per_chunk", self.layers_per_chunk, 1)
         if not isinstance(self.layout, KVLayout):
             raise ValueError("missing layer transfer layout")
+        _int("prefix_len", self.prefix_len)
+        if self.prefix_len % self.layout.page_size:
+            raise ValueError("decode prefix must contain whole KV pages")
         if self.eos_token_id is not None:
             _token(self.eos_token_id)
-        if type(self.version) is not int or self.version != 2:
+        if type(self.version) is not int or self.version not in (2, LAYERED_TICKET_VERSION):
             raise ValueError("unsupported layer transfer version")
+        if self.version == 2 and self.prefix_len:
+            raise ValueError("v2 requires a full-prompt layer transfer")
         if self.packing != "layer-kv-token-head-dim-le":
             raise ValueError("unsupported layer packing")
         expected = tuple(i * self.layer_bytes for i in range(self.layout.layers))
@@ -56,6 +64,10 @@ class LayeredReceiveTicket:
         return self.layer_bytes * self.layout.layers
 
     @property
+    def prompt_tokens(self) -> int:
+        return self.prefix_len + self.kv_tokens
+
+    @property
     def groups(self) -> tuple[tuple[int, int], ...]:
         return tuple(
             (start, min(start + self.layers_per_chunk, self.layout.layers))
@@ -67,7 +79,10 @@ class LayeredReceiveTicket:
 
     @classmethod
     def from_wire(cls, payload: bytes) -> LayeredReceiveTicket:
-        data = _object(cls, _load(payload))
+        obj = _load(payload)
+        if isinstance(obj, dict) and obj.get("version") == 2:
+            obj = {"prefix_len": 0, **obj}
+        data = _object(cls, obj)
         data["layout"] = KVLayout(**_object(KVLayout, data["layout"]))
         data["layer_offsets"] = _array(data["layer_offsets"])
         return cls(**data)

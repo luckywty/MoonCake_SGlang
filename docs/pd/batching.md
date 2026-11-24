@@ -17,9 +17,9 @@ GPU 循环每轮推进命令、传输完成与安装状态，然后组成下一�
 
 ## 六步数据流程
 
-1. D 在前置 `reserve` 时为请求分配私有 KV 页，并预留完整输出的页预算。
+1. D 在前置 `reserve` 时可匹配并锁住 GPU Radix 前缀，只为缺失后缀分配私有 KV 页，并预留输出页预算。
    `ReceiveAllocator` 从单个启动期注册的连续池切出 256 字节对齐的非重叠区间，释放时合并空闲区间。
-   票据 `address` 已包含切片偏移，`layer_offsets` 相对该请求的基地址，因此兼容版本 2 的票据格式。
+   v3 票据 `address` 已包含切片偏移，`layer_offsets` 相对后缀接收区的基地址；完整命中不分配接收切片。
    每个 locator/transfer_id 有独立状态、完成事件、取消标记和终态证明。
 2. P 调用 `prefill_manager.schedule_next_batch(prefill_budget)`。请求使用 Worker 内唯一 UID，
    对外保留客户端 UID，多个客户端都传 `uid=0` 也不会在调度器内混淆。

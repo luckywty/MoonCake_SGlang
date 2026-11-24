@@ -54,6 +54,7 @@ def parser():
     p.add_argument("--worker-advertise-host", default=None)
     p.add_argument("--pd-mooncake-host", default=None)
     p.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
+    p.add_argument("--disaggregation-decode-enable-radix-cache", action="store_true")
     p.add_argument("--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto")
     p.add_argument("--host", default="127.0.0.1", help="Gateway HTTP bind address")
     p.add_argument("--port", type=int, default=1940, help="Gateway HTTP port")
@@ -105,6 +106,8 @@ def worker_command(spec, args, worker_args):
         str(args.timeout),
         *worker_args,
     ]
+    if spec.role == "decode" and getattr(args, "disaggregation_decode_enable_radix_cache", False):
+        command.append("--disaggregation-decode-enable-radix-cache")
     if args.pd_transfer_backend == "mooncake":
         command += [
             "--pd-mooncake-host",
@@ -291,6 +294,7 @@ def main(argv=None):
                 )
                 or worker_args
                 or args.no_gateway
+                or args.disaggregation_decode_enable_radix_cache
             ):
                 raise ValueError(
                     "remote-address mode only starts a gateway; local GPU/Worker arguments do not apply"
@@ -311,19 +315,26 @@ def main(argv=None):
             from minisgl.server.args import parse_args
 
             specs = local_plan(args, visible_gpus())
-            parse_args(
-                [
-                    "--model",
-                    args.model,
-                    "--worker-role",
-                    "prefill",
-                    *worker_args,
-                    "--dtype",
-                    "bfloat16",
-                    "--model-source",
-                    "huggingface",
-                ]
-            )
+            for role in ("prefill", "decode"):
+                role_flags = (
+                    ["--disaggregation-decode-enable-radix-cache"]
+                    if role == "decode" and args.disaggregation_decode_enable_radix_cache
+                    else []
+                )
+                parse_args(
+                    [
+                        "--model",
+                        args.model,
+                        "--worker-role",
+                        role,
+                        *worker_args,
+                        *role_flags,
+                        "--dtype",
+                        "bfloat16",
+                        "--model-source",
+                        "huggingface",
+                    ]
+                )
             prefill = [spec.endpoint for spec in specs if spec.role == "prefill"]
             decode = [spec.endpoint for spec in specs if spec.role == "decode"]
         routing.validate_worker_ids(

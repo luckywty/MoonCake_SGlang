@@ -4,6 +4,7 @@ Mooncake split Worker 现在在层组 KV 就绪后异步传输，让早期层的
 RDMA 与后续层 Prefill 计算重叠。TCP 仍使用完整 Prefill 后的整体字节交接。
 本实现保持 TP=1、greedy，关闭 CUDA Graph；支持并发控制、Prefill batch 和 Continuous Batching Decode。
 多请求细节见[多请求调度说明](batching.md)。
+当前支持默认关闭的 [D GPU Radix Cache](decode_radix_cache.md)：命中时只传后缀，完整命中不创建数据传输。
 
 ## 启动与内存预算
 
@@ -27,8 +28,8 @@ D 池在总注册预算内容纳多个请求的切片；每请求仍限制在这
 ## 请求流程
 
 1. 客户端先与 P 协商能力；Mooncake 模式下，在发出 Prefill 前向 D 提交完整请求。
-2. D 校验 prompt/输出预算，预留本地私有 KV 页和接收池租约，返回版本 2 的票据。
-   票据包含模型布局、EOS、TE session、基地址、逐层偏移和层组大小。
+2. D 校验 prompt/输出预算；开启 Radix 时匹配并锁住前缀，仅分配后缀私有页和接收租约，返回版本 3 的票据。
+   票据包含模型布局、EOS、TE session、基地址、后缀逐层偏移、前缀边界和层组大小；完整命中返回空票据。
 3. P 校验票据。发送线程通过独立后端控制连接取得 D 对本次租约的写入许可。
    旧票据、已撤销租约、模型/分组/EOS 不匹配均不能启动写入。
 4. Prefill 的 attention 写完本层 KV 后，计算线程记录 CUDA event；层组边界只入队
@@ -49,8 +50,8 @@ D 池在总注册预算内容纳多个请求的切片；每请求仍限制在这
 
 ## Chunked Prefill 与源页所有权
 
-当前在**最后一个 token chunk** 中逐层发送完整 prompt KV：该层最后一个 chunk 写入后，
-此前 token chunk 和命中前缀的 KV 才共同构成完整层。较早 chunk 不重复发送。
+当前在**最后一个 token chunk** 中逐层发送 D 缺失的 prompt 后缀：该层最后一个 chunk 写入后，
+此前 token chunk 和 P 命中前缀的 KV 才共同构成该后缀的完整层。较早 chunk 不重复发送。
 因此不会把未完成层或部分 prompt 当作完整 KV；这不是 token chunk 级流式传输。
 后续若增加逐 token chunk 发送，需要额外的 token 区间、远端 scatter 描述和覆盖位图。
 

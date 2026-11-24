@@ -61,22 +61,27 @@ class CacheManager:
                 self.free_slots = torch.cat([self.free_slots, pages])
                 raise
 
-    def reserve_import(self, table_idx: int, num_tokens: int) -> torch.Tensor:
+    def reserve_import(self, table_idx: int, num_tokens: int, *, start: int = 0) -> torch.Tensor:
         '''为 D 端导入 KV 准备存储位置,它先检查参数类型、token 数、表行范围、页表宽度和可用容量，然后按页分配'''
         """Reserve private pages without registering uninitialized KV in the prefix cache."""
-        if type(num_tokens) is not int or type(table_idx) is not int:
+        if type(num_tokens) is not int or type(table_idx) is not int or type(start) is not int:
             raise ValueError("import token count and table row must be integers")
         pages = div_ceil(num_tokens, self.page_size)
-        if num_tokens <= 0 or not 0 <= table_idx < self.page_table.shape[0] - 1:
+        if (
+            num_tokens <= 0
+            or start < 0
+            or start % self.page_size
+            or not 0 <= table_idx < self.page_table.shape[0] - 1
+        ):
             raise ValueError("invalid import token count or request table row")
-        if pages * self.page_size > self.page_table.shape[1]:
+        if start + pages * self.page_size > self.page_table.shape[1]:
             raise ValueError("import exceeds page table capacity")
         if pages * self.page_size > self.available_size:
             raise RuntimeError("insufficient KV capacity for import")
         allocated_pages = self._allocate(pages)
         try:
             allocated = self._page_to_token(allocated_pages)
-            self.page_table[table_idx, : len(allocated)] = allocated
+            self.page_table[table_idx, start : start + len(allocated)] = allocated
         except Exception:
             self.free_slots = torch.cat([self.free_slots, allocated_pages])
             raise
@@ -93,7 +98,7 @@ class CacheManager:
         self._free(self.page_table[req.table_idx, start:end])
 
 
-    def cache_req(self, req: Req, *, finished: bool) -> None:
+    def cache_req(self, req: Req, *, finished: bool, rebind: bool = False) -> None:
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
@@ -107,11 +112,18 @@ class CacheManager:
         #                                           We should free it if the request has finished.
         insert_ids = req.input_ids[: req.cached_len]
         page_indices = self.page_table[req.table_idx, : req.cached_len]
+        if rebind and not finished:
+            page_indices = page_indices.clone()
         old_handle = req.cache_handle
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+        if rebind and not finished and new_handle.cached_len:
+            # Another received request may have published the same prefix.
+            # Adopt the canonical pages before returning duplicate private pages.
+            indices = new_handle.get_matched_indices()
+            self.page_table[req.table_idx, : new_handle.cached_len] = indices
         # unlock until all operations on handle is done
         self.unlock(old_handle)
-        # this part is already in the prefix cache, free it
+        # Return original private pages replaced by an already-cached prefix.
         self._free(page_indices[old_handle.cached_len : cached_len])
         if finished:  # this tail part should be freed
             self._free(page_indices[new_handle.cached_len :])

@@ -14,7 +14,7 @@ from .admission import AdmissionBudget, AdmissionError
 from .control import Channel, StartRequest, endpoint_address
 from .layered_protocol import LayeredReceiveTicket
 from .lifecycle import RequestLifecycle
-from .protocol import RequestHandoff, _token
+from .protocol import HANDOFF_VERSION, ReceiveTicket, RequestHandoff, _token
 
 """协调一次请求从 P 到 D 的全过程
 PDClient 本质上是一个 P/D Orchestrator（协调器）。"""
@@ -43,6 +43,130 @@ def response(channel: Channel, status: str) -> dict:
     if message.get("status") != status:
         raise ValueError(f"expected worker response {status}")
     return message
+
+
+def reservation_prefix(message, request, *, layered):
+    """Validate D's immutable reservation before any Prefill computation."""
+    prefix = message.get("decode_prefix_len")
+    if (
+        message.get("handoff_version") != HANDOFF_VERSION
+        or message.get("transfer_id") != request.transfer_id
+        or type(message.get("prompt_tokens")) is not int
+        or message["prompt_tokens"] != len(request.prompt_ids)
+        or type(prefix) is not int
+        or not 0 <= prefix <= len(request.prompt_ids)
+    ):
+        raise ValueError("invalid decode prefix reservation; upgrade Workers and clients together")
+    if layered:
+        if "ticket" not in message:
+            raise ValueError("layered reservation must include a ticket or explicit null")
+        wire_ticket = message.get("ticket")
+        if prefix == len(request.prompt_ids):
+            if wire_ticket is not None:
+                raise ValueError("a full decode cache hit must not expose a receive ticket")
+        else:
+            ticket = LayeredReceiveTicket.from_wire(json.dumps(wire_ticket).encode())
+            if (
+                ticket.transfer_id != request.transfer_id
+                or ticket.prompt_tokens != len(request.prompt_ids)
+                or ticket.prefix_len != prefix
+            ):
+                raise ValueError("receive ticket belongs to another request or suffix")
+    return prefix
+
+
+def stream_reserved(request, p, d, ready, *, layered, on_prefill_done=None):
+    """Common reserve-first handshake for direct sockets and routed channels."""
+    prefix = reservation_prefix(ready, request, layered=layered)
+    transfer_tokens = len(request.prompt_ids) - prefix
+    state = RequestLifecycle(request.uid, request.transfer_id)
+    state.begin_prefill()
+    if layered:
+        state.begin_prefill_transfer()
+    start = {
+        "op": "prefill",
+        "request": request.to_object(),
+        "decode_prefix_len": prefix,
+    }
+    if layered:
+        start["ticket"] = ready["ticket"]
+    try:
+        p.send(start)
+        wire = response(p, "handoff")["handoff"]
+        handoff = RequestHandoff.from_wire(json.dumps(wire).encode())
+        if (
+            handoff.version != HANDOFF_VERSION
+            or handoff.uid != request.uid
+            or handoff.kv.transfer_id != request.transfer_id
+            or handoff.prompt_ids != request.prompt_ids
+            or handoff.max_tokens != request.max_tokens
+            or handoff.ignore_eos != request.ignore_eos
+            or handoff.kv.prefix_len != prefix
+        ):
+            raise ValueError("prefill handoff does not match the decode reservation")
+        state.complete_prefill(handoff)
+        yield handoff.first_token_id
+        if not handoff.remaining_tokens:
+            if layered or not transfer_tokens:
+                if response(p, "retired").get("transfer_id") != request.transfer_id:
+                    raise ValueError("incorrect retirement acknowledgment")
+            if on_prefill_done is not None:
+                on_prefill_done()
+            d.send({"op": "release", "transfer_id": request.transfer_id})
+            if response(d, "released").get("transfer_id") != request.transfer_id:
+                raise ValueError("incorrect release acknowledgment")
+            if layered:
+                state.finish_without_decode()
+            return
+        if not layered:
+            state.begin_transfer()
+            d.send({"op": "prepare", "transfer_id": request.transfer_id, "handoff": wire})
+            prepared = response(d, "ready")
+            if reservation_prefix(prepared, request, layered=False) != prefix:
+                raise ValueError("decode prefix changed after reservation")
+            if transfer_tokens:
+                ticket = ReceiveTicket.from_wire(json.dumps(prepared["ticket"]).encode())
+                if ticket.transfer_id != request.transfer_id or ticket.nbytes != handoff.kv.nbytes:
+                    raise ValueError("incorrect suffix receive ticket")
+                p.send({"op": "send", "ticket": prepared["ticket"]})
+            elif prepared.get("ticket") is not None:
+                raise ValueError("a full decode cache hit must not allocate a receive buffer")
+        if response(p, "sent").get("transfer_id") != request.transfer_id:
+            raise ValueError("incorrect send acknowledgment")
+        if on_prefill_done is not None:
+            on_prefill_done()
+        commit = {"op": "commit", "transfer_id": request.transfer_id}
+        if layered:
+            commit["handoff"] = wire
+        d.send(commit)
+        if response(d, "installed").get("transfer_id") != request.transfer_id:
+            raise ValueError("incorrect installation acknowledgment")
+        state.accept_receive(request.transfer_id)
+        state.begin_decode()
+        for index in range(1, request.max_tokens):
+            item = response(d, "token")
+            token = item.get("token_id")
+            _token(token)
+            finished = index + 1 == request.max_tokens or (
+                not request.ignore_eos and token == handoff.eos_token_id
+            )
+            if (
+                item.get("transfer_id") != request.transfer_id
+                or item.get("index") != index
+                or type(item.get("finished")) is not bool
+                or item["finished"] != finished
+            ):
+                raise ValueError("invalid or out-of-order decode token")
+            yield token
+            if finished:
+                state.finish_decode()
+                return
+    except InterruptedError:
+        state.cancel()
+        raise
+    except Exception:
+        state.fail()
+        raise
 
 
 class PDClient:
@@ -88,9 +212,6 @@ class PDClient:
         request = StartRequest(
             request_id or str(uuid4()), 0, tuple(prompt_ids), max_tokens, ignore_eos
         )
-        state = RequestLifecycle(
-            request.uid, request.transfer_id
-        )  # 它用于跟踪请求经过的执行阶段，它记录和检查请求的阶段变化
         with ExitStack() as connections:
             channels = []
 
@@ -110,93 +231,29 @@ class PDClient:
                 if cancel is not None and cancel.is_set():
                     raise InterruptedError("request cancelled")
                 p = connect(self.prefill)  # 与prefillWorker建立连接
-                state.begin_prefill()  # 向prefillWorker发送prefill请求，更新客户端维护的请求状态。
                 p.send({"op": "capabilities"})
                 capabilities = response(p, "capabilities")
                 layered = capabilities.get("layered_transfer")
-                if type(layered) is not bool:
-                    raise ValueError("invalid worker transfer capabilities")
-                start = {"op": "prefill", "request": request.to_object()}
-                if layered:
-                    # This is before P starts any prompt computation. D reserves
-                    # final KV pages and a slice of its startup-registered pool.
-                    d = connect(self.decode)
-                    d.send({"op": "reserve", "request": request.to_object()})
-                    wire_ticket = response(d, "ready")["ticket"]
-                    ticket = LayeredReceiveTicket.from_wire(json.dumps(wire_ticket).encode())
-                    if ticket.transfer_id != request.transfer_id or ticket.kv_tokens != len(
-                        prompt_ids
-                    ):
-                        raise ValueError("early reservation belongs to another request")
-                    start["ticket"] = wire_ticket
-                    state.begin_prefill_transfer()
-                p.send(start)
-                envelope = response(p, "handoff")["handoff"]  # 等待 Prefill Worker 返回 Handoff
-                handoff = RequestHandoff.from_wire(json.dumps(envelope).encode())
                 if (
-                    handoff.uid != request.uid
-                    or handoff.kv.transfer_id != request.transfer_id
-                    or handoff.prompt_ids != request.prompt_ids
-                    or handoff.max_tokens != request.max_tokens
-                    or handoff.ignore_eos != request.ignore_eos
+                    type(layered) is not bool
+                    or capabilities.get("handoff_version") != HANDOFF_VERSION
+                    or capabilities.get("decode_prefix_reuse") is not True
                 ):
-                    raise ValueError("prefill handoff does not match the request")
-
-                # 提前返回首 Token
-                state.complete_prefill(handoff)
-                yield handoff.first_token_id
-
-                if layered:
-                    status = "sent" if handoff.remaining_tokens else "retired"
-                    if response(p, status).get("transfer_id") != request.transfer_id:
-                        raise ValueError("incorrect layer send acknowledgment")
-                    if not handoff.remaining_tokens:
-                        d.send({"op": "release", "transfer_id": request.transfer_id})
-                        if response(d, "released").get("transfer_id") != request.transfer_id:
-                            raise ValueError("incorrect reservation release acknowledgment")
-                        state.finish_without_decode()
-                        return
-                    d.send(
-                        {"op": "commit", "transfer_id": request.transfer_id, "handoff": envelope}
+                    raise ValueError(
+                        "incompatible Prefill protocol; upgrade Workers and clients together"
                     )
-                elif not handoff.remaining_tokens:
-                    return
-                else:
-                    d = connect(self.decode)
-                    d.send({"op": "decode", "handoff": envelope})
-                    ticket = response(d, "ready")["ticket"]
-                    state.begin_transfer()
-                    p.send({"op": "send", "ticket": ticket})
-                    if response(p, "sent").get("transfer_id") != request.transfer_id:
-                        raise ValueError("incorrect send acknowledgment")
-                    d.send({"op": "commit", "transfer_id": request.transfer_id})
-                if response(d, "installed").get("transfer_id") != request.transfer_id:
-                    raise ValueError("incorrect installation acknowledgment")
-                state.accept_receive(request.transfer_id)
-                state.begin_decode()
-                for index in range(1, max_tokens):
-                    item = response(d, "token")  # 负责从 Decode Worker 接收消息。
-                    if item.get("transfer_id") != request.transfer_id or item.get("index") != index:
-                        raise ValueError("out-of-order decode output")
-                    token = item.get("token_id")  # 从 Decode Worker 的响应消息中提取 Token ID
-                    _token(token)
-
-                    # 判断 Decode 是否应该结束
-                    finished = index + 1 == max_tokens or (
-                        not ignore_eos and token == handoff.eos_token_id
-                    )
-                    if type(item.get("finished")) is not bool or item["finished"] != finished:
-                        raise ValueError("incorrect decode completion flag")
-                    yield token
-                    if finished:
-                        state.finish_decode()
-                        return
-            except InterruptedError:
-                state.cancel()
-                raise
-            except Exception:
-                state.fail()
-                raise
+                d = connect(self.decode)
+                d.send({"op": "capabilities"})
+                decode_caps = response(d, "capabilities")
+                if (
+                    decode_caps.get("layered_transfer") is not layered
+                    or decode_caps.get("handoff_version") != HANDOFF_VERSION
+                    or decode_caps.get("decode_prefix_reuse") is not True
+                ):
+                    raise ValueError("incompatible Decode protocol or transfer mode")
+                d.send({"op": "reserve", "request": request.to_object()})
+                ready = response(d, "ready" if layered else "reserved")
+                yield from stream_reserved(request, p, d, ready, layered=layered)
             finally:
                 # Explicit cancellation also covers closing a generator directly
                 # after its first token. Socket closure remains the fallback.

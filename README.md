@@ -3,25 +3,29 @@
 基于 [Mini-SGLang](https://github.com/sgl-project/mini-sglang) 的大模型推理项目，
 保留 Unified 推理引擎，扩展 **Prefill/Decode（P/D）分离**，并接入 Mooncake Transfer Engine。
 当前支持多 P/D Worker 负载与缓存感知路由、多请求组批、逐层 KV 传输与后续 Prefill 计算重叠，
-以及按请求取消和资源回收。
+以及可选的 D GPU Radix 前缀复用、按请求取消和资源回收。
 Python 包名和命令入口仍为 `minisgl`。
 
-> **当前版本（2026-11-24）**：多 P/D Worker 启动、Bucket/准入筛选、负载选路与可选缓存亲和、长连接 request_id 复用、
-> Prefill/Decode 组批和 Mooncake 逐层传输已实现，有历史 CPU/TCP 记录及受控 CPU 测试。真实 GPU/RDMA 正确性、
-> 双服务器运行、实际重叠比例与性能收益尚未验收。下文部署命令是配置模板。
+新增 **D 本地 GPU Radix Cache 开关**，默认关闭；开启后匹配并锁定 D 前缀，
+TCP/Mooncake 只传缺失后缀，正常结束保留有效上下文及生成 KV。
+本次未新增或运行测试，实施细节和新协议说明见 [D Radix Cache](docs/pd/decode_radix_cache.md)。
+
+> **当前版本（2026-11-24）**：新增 D Radix 开关、前缀锁定、后缀传输与缓存去重，单端点及 Routed 客户端统一先向 D 预留资源。
+> 本次仅完成代码审查、Python 编译与差异检查，未新增或运行测试。此前组批、逐层传输和路由的 CPU/TCP 记录不代表本次功能已验收。
+> 真实 GPU/RDMA 正确性、双服务器运行、实际重叠比例与性能收益尚未验收。下文部署命令是配置模板。
 
 ## 相对官方 mini-sglang 的变化
 
 对比基准固定为本地保留的官方提交
 [`9a91cfafe754aa85daee49998176275667eb58f2`](https://github.com/sgl-project/mini-sglang/tree/9a91cfafe754aa85daee49998176275667eb58f2)，
-下表覆盖当前工作区的实现。完整版 SGLang `9f1a6dca98` 是新增选路算法的参考，和这个 mini-sglang 基线是两个项目。
+下表覆盖当前工作区的实现。完整版 SGLang `9f1a6dca98` 是选路及 D Radix 机制的参考，和这个 mini-sglang 基线是两个项目。
 
 | 方面 | 官方基线 | 当前项目的保留与扩展 |
 |---|---|---|
 | 执行角色 | 同一推理实例完成 Prefill 和 Decode，可用 TP 跨卡协同。 | 保留默认 `unified`；新增独立 `prefill` / `decode` Worker，各自加载模型、管理 KV。P 生成首 token，D 续算。 |
 | 多请求与组批 | 已有 Prefill/Decode 管理器、连续组批和 Chunked Prefill。 | 复用到独立 P/D 服务，新增并发控制面、GPU 调度循环、异步 KV 安装和按请求退出；单 Worker 可 batch>1。 |
-| KV 缓存与页管理 | 已有 GPU KV 池、分页和 Radix 前缀复用。 | 增加私有导入页、整体/分层 gather/scatter、分配回滚、后台 reader 保护及只读前缀命中查询。 |
-| 跨 Worker KV 交接 | 没有本项目的 P/D 交接协议及传输后端。 | 新增票据、生命周期与完成确认；TCP 默认在完整 Prefill 后传 CPU 字节并校验 SHA-256；Mooncake 按层组 GPU 直传。 |
+| KV 缓存与页管理 | 已有 GPU KV 池、分页和 Radix 前缀复用。 | 增加私有导入页、整体/分层 gather/scatter、分配回滚、后台 reader 保护及只读前缀命中查询。D 默认关闭 Radix，可显式开启本地前缀共享、安装后去重及生成 KV 缓存。 |
+| 跨 Worker KV 交接 | 没有本项目的 P/D 交接协议及传输后端。 | 新增票据、生命周期与完成确认；TCP 在完整 Prefill 后发送待传后缀的 CPU 字节并校验 SHA-256，Mooncake 按层组 GPU 直传；D 完整命中时省去 payload。 |
 | 计算重叠 | CPU 调度与 GPU 计算重叠，支持 CUDA Graph。 | Unified 保留；split 使用 eager、关闭原调度重叠和 CUDA Graph，独立实现 KV 传输与后续层 Prefill 计算重叠。 |
 | 多实例部署与选路 | TP rank 协同运行一个推理实例，没有本项目的独立 P/D 节点池。 | 新增 N 个 P、M 个 D 的启动器，隔离 GPU/端口/TE，支持 NUMA/HCA 映射、健康巡检、Bucket/准入、负载择优与 P 缓存亲和。 |
 | 对外服务 | 已有 Unified OpenAI 兼容 HTTP 服务与交互终端。 | 保留 Unified 入口，另增独立 tokenizer P/D 网关、Token ID 客户端和 request_id 长连接复用，支持 SSE/断连取消。 |
@@ -60,8 +64,8 @@ flowchart LR
 
 网关使用 `RoutedPDClient`，从健康地址池为请求选择固定的 P/D，通过长连接按 request_id 分流；
 网关的 `--prefill/--decode` 也是单节点地址池简写。Python `PDClient` 和 Token ID 客户端的
-单端点参数保留原有协议；Token ID 客户端使用地址列表时启用路由。两种客户端仅转发请求、票据、handoff 和确认消息；
-**完整 KV payload 由 P 直接交给 D，不经过客户端。** 两个 Worker 各自加载相同模型，
+单端点参数与 Routed 客户端均先向 D reserve；Token ID 客户端使用地址列表时启用路由。两种客户端仅转发请求、票据、handoff 和确认消息；
+**待传后缀 KV payload 由 P 直接交给 D，不经过客户端；D 缓存关闭时后缀覆盖整个 prompt。** 两个 Worker 各自加载相同模型，
 各自管理 KV 池和物理页，P 的页编号不会直接成为 D 的写入位置。
 
 ```text
@@ -77,18 +81,23 @@ P GPU KV 池 → transfer_stream gather → 预注册环形槽位
 ### 逐层 KV 传输如何工作
 
 本节用于 `--pd-transfer-backend mooncake`。`--pd-layers-per-chunk 1` 为逐层传输，2/4 为每 2/4 层一组；
-默认 `tcp` 仍在完整 Prefill 后整体发送 KV，选路策略不改变这两种数据路径。
+默认 `tcp` 仍在完整 Prefill 后整体发送待传后缀，选路策略不改变这两种数据路径。
 
 1. 启动时，P 创建独立 transfer stream、后台发送线程和固定环形槽位；D 创建连续接收池。
    显存只在启动时注册，正常请求不反复注册或注销。
-2. Prefill 前，客户端向 D 预留私有 KV 页与接收池租约，再把接收票据交给 P。
-3. P 写好一个层组的 KV 后，只记录 CUDA event、入队，继续发射后续层计算。
-   后台等待该 event，打包到空闲槽位，等待打包完成后提交异步 RDMA Write。
+2. Prefill 前，客户端向 D 发起 `reserve`。D 开启 Radix 时先匹配并锁定前缀，
+   只为缺失后缀预留私有 KV 页与接收池租约，再把前缀长度和接收票据交给 P。
+   关闭时前缀长度为 0；完整命中时无接收租约，票据为 `null`。
+3. 对需要传输的请求，P 写好一个层组的 KV 后，只记录 CUDA event、入队，继续发射后续层计算。
+   后台等待该 event，只 gather 后缀到空闲槽位，等待打包完成后提交异步 RDMA Write。
 4. 一个槽位的原生操作进入终态、且 `ticket.drained` 为真后，才允许复用。
    槽位满时由后台线程等待，逐层计算回调不等待传输。
 5. P 分别返回 batch 内各请求的首 token，按请求收敛传输、返回 `sent`。
-   D 收到 `commit` 后在独立 stream 安装 KV；主循环通过 `event.query()` 确认完成，
-   归还该接收切片，并将请求加入活跃 Decode batch。
+   D 收到 `commit` 后在独立 stream 安装后缀 KV，保留已锁定的前缀；主循环通过 `event.query()` 确认完成，
+   归还接收切片，开启 Radix 时发布 prompt 并重绑到去重后的缓存页，再将请求加入活跃 Decode batch。
+
+完整命中时，P 仍按自己的缓存状态完成 Prefill 和首 token 采样，返回 handoff/`sent`；
+D 经控制提交后复用缓存续算，跳过发送任务、接收租约与数据安装。
 
 D 的连续接收池支持多个互不重叠的租约；P 的 `BatchTransferPlan` 绑定批内各请求的 slots 和目标票据。
 同目标复用控制连接，不同目标独立提交；一个请求取消或首 token 为 EOS 不会取消同批其他请求。
@@ -107,19 +116,41 @@ Worker 控制线程持续接收请求；GPU 主循环通过 `PrefillManager` 和
   其余请求继续，已经就绪且容量允许的新请求可加入后续 batch。
 
 例如 Decode batch 为 `[A, B, C]`，B 结束且 D 已安装就绪时，后续 batch 可以是 `[A, C, D]`。
-回收表示容量可复用，不会逐层发送完就清零 KV。默认 Radix 前缀缓存可保留成功请求的 KV；
+回收表示容量可复用，不会逐层发送完就清零 KV。P 默认可保留 Radix 前缀；D 默认不保留，显式开启后可保留成功请求的有效 KV；
 没有其他请求引用的部分可被淘汰。显存池常驻，因此 `nvidia-smi` 的占用不必立即下降。
 TCP 路径在 KV 导出成 CPU bytes 后即可释放源 KV 的请求占用，发送期间保留主机副本。
 `n=1` 指一个 HTTP 请求生成一个候选，不限制多请求并发或 GPU batch 大小。
 
-当前使用 Chunked Prefill 时，**在最后一个 token chunk 中逐层发送完整 prompt KV**，
-其中包含较早 chunk 和命中前缀的 KV；尚未实现每个 token chunk 的增量发送。
+当前使用 Chunked Prefill 时，**在最后一个 token chunk 中逐层发送 D 缺失的 prompt 后缀 KV**，
+其中可包含较早 chunk 和 P 命中前缀的 KV；尚未实现每个 token chunk 的增量发送。
 D 提前收到早期层 KV，也仍需等待 P 产生首 token，并确认所有层安装完成才能续算。
 
 首 token 已触发 EOS 或满足生成预算时，不启动 D 续算。Mooncake 会取消未提交任务，
 排空已提交写入后归还 D 的预留资源。取消或超时不能证明 DMA 已停止；完成未知的地址、
 Tensor 和 ticket 必须保留，无法安全回收时后端要求 Worker 退役。
 详见 [逐层传输说明](docs/pd/layered_transfer.md)。
+
+### D 本地 GPU Radix Cache
+
+在 D 启动命令中追加 `--disaggregation-decode-enable-radix-cache` 即可开启；省略时关闭。
+本地多 Worker 启动器接受同名参数，只传给 D 子进程。该开关决定 D 使用 Radix 或 Naive，
+独立于原有 `--cache-type`；P 和 Unified 沿用原配置。仅支持启动时设置，远程 D 须在其启动命令中配置。
+
+| 阶段 | 关闭（默认） | 开启 |
+|---|---|---|
+| D 预留 | 为整个 prompt 分配私有 KV 页 | 锁定命中的整页前缀，只分配缺失后缀页 |
+| P→D 交接 | 传输并安装完整 prompt KV | 只传输并安装缺失后缀；完整命中无 payload |
+| 正常结束 | 归还请求 KV 页和表行 | 缓存有效上下文及生成 KV，归还重复页、私有尾页和表行，解除请求锁 |
+
+设 prompt 长度为 `N`、D 命中并锁定的整页前缀为 `L`，实际传输量对应 `N-L` 个 token。
+有效缓存仅覆盖已计算 KV 的整页前缀；最后刚采样出的 token 通常尚无 KV，不会把全部输出 ID 都当作已缓存。
+安装完成后才发布 prompt；并发相同前缀在所选 D 内重绑到已有缓存页，归还重复私有页。
+取消/失败保留已发布的有效前缀，只回收请求私有部分并解除锁；未被引用的缓存可按容量淘汰。
+
+这些 KV 位于所选 D 的 GPU HBM，不涉及 HiCache、Decode offload 或共享存储；不自动迁移到其他 D 或回传 P。
+P 的 Prefill 起点仍由 P 自己的缓存决定，D 命中只减少本次传输和 D 页分配，不能消除 P 对历史回答的缺失 KV 重算。
+handoff/metadata v2 中 `kv_tokens` 表示待传后缀，层组票据为 v3；客户端、P、D 须配套升级，健康池会拒绝不兼容的旧 Worker。
+参见 [D Radix Cache 实现说明](docs/pd/decode_radix_cache.md)。
 
 ### 多轮对话的 KV 重算成本
 
@@ -209,6 +240,9 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=python python -m minisgl \
   --attention-backend fi --page-size 1 --pd-transfer-backend tcp \
   --max-running-requests 32
 ```
+
+以上 D 默认关闭 Radix；需要跨请求复用 D 的 GPU KV 时，在 D 命令末尾追加
+`--disaggregation-decode-enable-radix-cache`。下文 Mooncake 的 D 命令同样适用。
 
 Worker 就绪后运行 Token ID 客户端：
 
@@ -302,6 +336,7 @@ PYTHONPATH=python python -m minisgl.disagg.launcher \
 也可用 `python -m minisgl --num-prefill-workers ...`。每个进程独占映射的 GPU 和控制端口，Mooncake 模式各有独立 TE；
 端口计划与 GPU 数量先校验，主进程退出统一回收本地子进程。Mooncake 使用 `--pd-transfer-backend mooncake`，
 可按卡配置 NUMA/HCA。默认 TE 端口从 19500 起，每 Worker 保留两个端口；不满足原生端口范围时直接报错。
+在本地启动器命令中追加 `--disaggregation-decode-enable-radix-cache`，可为全部 D 子进程开启缓存；不会传给 P。
 
 跨机已部署 Worker 时，在网关上改用地址列表：
 
@@ -311,6 +346,8 @@ PYTHONPATH=python python -m minisgl.disagg.gateway \
   --decode-addrs 10.0.0.21:1929 10.0.0.22:1929 --routing-seed 42 \
   --health-interval 2 --health-timeout 3 --max-quarantined-bytes 0 --port 1940
 ```
+
+远程 Worker 的缓存开关由各 D 的启动命令决定，网关不会替远程 D 修改配置；启动器的远程地址模式也不接受该 Worker 参数。
 
 网关每 Worker 维持一条复用连接；health、reserve、首 token、sent、commit、token 和 cancel 都携带 request_id。
 默认参考 SGLang `9f1a6dca98` 的重构路由：匹配长度 Bucket，筛选健康且可准入的节点，
@@ -328,6 +365,7 @@ P 开始计算后保持绑定，不因容量不足重选或重放。
 | 参数 | 默认值 / 含义 |
 |---|---|
 | `--worker-role` | 默认 `unified`；split 选择 `prefill` 或 `decode`。 |
+| `--disaggregation-decode-enable-radix-cache` | 默认关闭；仅 D 使用 GPU Radix 前缀复用，启动器只传给 D。 |
 | `--max-running-requests` | 默认 256；Worker 的请求表行容量，实际并发还受页、准入和传输预算限制。 |
 | `--max-prefill-length` | 默认 8192；每个 Prefill batch 的 token 预算，可分块处理长 prompt。 |
 | `--pd-transfer-backend` | 默认 `tcp`；`mooncake` 启用逐层 GPU 路径。 |
@@ -340,7 +378,7 @@ P 开始计算后保持绑定，不因容量不足重选或重放。
 | `--pd-mooncake-device` | 可选的逗号分隔 HCA 名称。 |
 | `--worker-id` | Worker 健康信息中的身份；本地启动器分配 `p-0`、`d-0` 等。 |
 | `--pd-timeout` | 默认 120 秒；超时不能证明原生 DMA 已停止。 |
-| `--pd-max-transfer-bytes` | 默认 1 GiB；限制完整 prompt KV 大小，并用于计算启动池容量。 |
+| `--pd-max-transfer-bytes` | 默认 1 GiB；限制实际待传后缀 KV 大小，并用于计算启动池容量。 |
 | `--pd-max-registered-bytes` | 默认单次上限的两倍；每个 Worker 的注册显存预算。 |
 | `--pd-max-pending-transfers` | 默认 32；限制注册数及 Mooncake 在途请求、接收租约和目标连接数。 |
 | `--pd-max-queued-requests` | 默认 128；尚未回收的已准入请求上限。 |
@@ -362,10 +400,12 @@ Mooncake 模式的 Engine 先为总注册预算预留显存，再确定 KV 页�
 | Worker 启动 | 加载模型、确定 KV 页容量并创建常驻显存池；Mooncake 还预留和注册传输池。 |
 | 网关准入 | 检查 `--max-inflight-requests` 和 `--max-inflight-tokens`；不查询每张 GPU 的实时空闲显存。 |
 | 路由筛选 | 按健康负载快照与可选阈值筛选，不预分配显存；缺失/过期指标不当作零，最终仍由 Worker 检查。 |
-| D `reserve` | 按页对齐检查新请求的 `prompt_len + max_tokens`，同时计入现有请求尚未分配的未来输出预算；检查表行和接收资源。实际先分配 prompt KV 页，后续输出页随 Decode 增长分配。 |
+| D `reserve` | 开启缓存时先锁定命中前缀 `L`，再按 `align(prompt_len + max_tokens) - L` 检查额外容量，同时计入已有请求的未来未分配预算；检查表行和后缀接收资源。只先分配后缀私有页，输出页随 Decode 增长分配；关闭时 `L=0`。 |
 | P 收到请求 | 检查序列长度、请求数、token 及传输预算；实际页容量在 Prefill 组批时检查，前向前分配本轮需要的页。暂时容量不足则排队。 |
 
+`align` 按页向上取整，`L` 为整页 token 数；额外需求与锁定前缀后的空闲及其余可淘汰容量比较。
 D 的 Mooncake 接收租约是预注册池的独立切片，与最终模型 KV 页是两份资源；TCP 则检查主机接收预算。
+两者按缺失后缀计算，完整命中无接收切片或主机 payload；序列长度和排队 token 准入仍按完整请求计算。
 D 拒绝 reserve 时，网关可重选其他健康 D；全部拒绝则不启动 P 计算。
 健康检查通过不保证 P 立即有可用页；P 排队时，D 已预留的页和接收区仍被该请求占用。
 正常请求依赖池内页和预算管理，不会每次 reserve 都重新申请一块 GPU 显存。
@@ -377,11 +417,17 @@ D 拒绝 reserve 时，网关可重选其他健康 D；全部拒绝则不启动 
 `pending_operations`、`quarantined_buffers`、`oldest_quarantine_seconds`、`layered.receive_leases` 和 `layered.receive_available_bytes`。
 调度快照还有 `active_requests`、`max_prefill_batch`、`max_decode_batch` 和 `load` 中的等待/运行请求、未缓存 token、KV 占用与可用时的排队时间估计。
 注册池会一直驻留，空闲时应与启动基线一致，而非要求注册字节归零。
+`decode_radix_cache` 表示 D 开关；`decode_cache_hit_requests` / `decode_cache_hit_tokens` 累计成功 reserve 的命中情况，
+包括后续主动释放的预留；`received_kv_tokens` 累计成功安装的后缀 token，完整命中增加 0。
+结合 `free_pages`、`protected_tokens`、`evictable_tokens` 判断 KV 占用；开启缓存后空闲时允许保留可淘汰页，不要求所有页回到 free list。
 
 Worker 健康检查使用自定义 `Channel` 消息 `{"op":"health"}`，不能直接 `curl` 控制端口。
 后端完成未知、隔离超期或不可恢复错误可能触发非零退出，需要外部进程监管重启。
 
 ## 测试与验收
+
+本次 D Radix 和后缀协议改动按要求未新增或运行测试，仅通过 Python 编译和 `git diff --check`。
+下列命令与测试清单为已有工具入口，尚未据此验证新开关、v2/v3 协议或完整命中路径。
 
 ### 标准库协议检查
 
@@ -415,7 +461,7 @@ FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
 | `test_pd_tensor_cache.py` | dtype、稀疏 slots、dummy 页、页分配回滚与 Radix 借用保护。 |
 | `test_pd_pipeline.py` | 两进程 CPU attention 模型经实际 TCP 续算并对照 token。 |
 | `test_pd_failures.py`、`test_pd_gateway.py` | 失败清理、HTTP/SSE、结束原因与断连；网关主要使用桩客户端。 |
-| `test_pd_layered.py` | 受控 DMA/event 下的实际发送队列/runtime、背压、槽位与租约、终态、取消和新握手续算。 |
+| `test_pd_layered.py` | 受控 DMA/event 下的实际发送队列/runtime、背压、槽位与租约、终态、取消和逐层握手续算。 |
 | `test_pd_batching.py` | 多请求实际组批、参考输出一致、不同 D 独立完成、分块/EOS 取消、页预算与安装 event。 |
 | `test_pd_control_loop.py` | 内存通道驱动完整并发 Worker 服务和 PDClient；4 请求并发及关闭单个 generator。 |
 | `test_pd_cluster_config.py`、`test_pd_routing.py` | GPU/端口/亲和校验、子进程回收、种子路由、2P/2D 复用、reserve 重选及健康巡检。 |
@@ -427,7 +473,7 @@ FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
 不下载 Hugging Face 权重。逐层所有权测试使用内存控制通道，端到端用例另使用真实 socket；
 CUDA event 和原生 DMA 的 CPU 适配器不能证明真实 GPU/RDMA 并发。
 
-2026-11-24 无 socket 回归为 **190 passed、10 skipped、5 deselected、113 subtests passed**，包含新增路由策略测试。
+引入 D Radix Cache 前的 2026-11-24 历史无 socket 回归为 **190 passed、10 skipped、5 deselected、113 subtests passed**，包含路由策略测试；本次 D Radix 改动未运行测试。
 测试使用确定性 CPU attention 验证多请求组批、独立参考 token 对照，以及内存通道中的完整并发 Worker/PDClient 控制循环。
 10 项 GPU 用例跳过，5 项逐层 socket 用例排除；独立 TCP 与 HTTP 回归未纳入此子集。
 当前验证环境不支持本机 socket；真实 TCP/HTTP 网络、多进程 GPU、跨服务器和 RDMA 尚待验收。
@@ -454,6 +500,7 @@ PYTHONPATH=python python tools/pd/verify_phase2_gpu.py \
 ```
 
 工具还对比开始/结束健康信息，检查注册池稳定、无遗留操作、隔离或接收租约。
+这里的 `--cache-type radix` 不会打开新的 D 缓存开关；现有对照工具尚未用于验收 D Radix。
 pytest 模型入口需要 `FLUXINFER_PD_GPU_MODEL` 和 CUDA；可用
 `FLUXINFER_PD_TRANSFER_BACKEND=mooncake`、`FLUXINFER_PD_LAYERS_PER_CHUNK`、
 `FLUXINFER_PD_MOONCAKE_HOST`、`FLUXINFER_PD_MOONCAKE_DEVICE` 选择对应配置。
@@ -497,6 +544,7 @@ docs/pd/                # P/D 专项设计和阶段记录
 ```
 
 - [逐层 KV 传输](docs/pd/layered_transfer.md)：缓冲池、层组流水线、所有权、取消与验收入口。
+- [D Radix Cache](docs/pd/decode_radix_cache.md)：默认关闭、页级共享、后缀传输、完整命中及回收规则。
 - [多请求调度](docs/pd/batching.md)：异步控制面、批量传输、动态 Decode、显存与准入参数。
 - [P/D 选择算法](docs/pd/routing.md)：Bucket、准入阈值、两候选择优、缓存亲和与分配时机。
 - [多 Worker 与路由](docs/pd/multi_worker.md)：资源隔离、健康池、长连接、重选与跨机配置。

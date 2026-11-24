@@ -26,7 +26,7 @@ from minisgl.scheduler.utils import PendingReq
 from .control import CancelledError, Channel, StartRequest
 from .layered_protocol import LayeredReceiveTicket
 from .layered_sender import BatchTransferEntry, BatchTransferPlan
-from .protocol import KVTransferMetadata, ReceiveTicket, RequestHandoff
+from .protocol import HANDOFF_VERSION, KVTransferMetadata, ReceiveTicket, RequestHandoff
 from .role import WorkerRole
 from .transfer import TransferBackendUnavailable, TransferCapacityError
 
@@ -63,6 +63,7 @@ class RequestContext:
     req: Req | None = None
     allocated: int = 0
     prefix_hit_tokens: int = 0
+    decode_prefix_len: int = 0
     ticket: object = None
     job: object = None
     handoff: RequestHandoff | None = None
@@ -73,6 +74,10 @@ class RequestContext:
     success: bool = False
     release_requested: bool = False
     enqueued_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def transfer_tokens(self):
+        return len(self.request.prompt_ids) - self.decode_prefix_len
 
 
 class WorkerService:
@@ -92,13 +97,22 @@ class WorkerService:
         self.next_uid = 0
         self.layered = bool(getattr(backend, "layered_transfer", False))
         self.is_prefill = scheduler.role is WorkerRole.PREFILL
+        self.decode_radix_cache = not self.is_prefill and bool(
+            config.get("decode_radix_cache", False)
+        )
         if self.is_prefill:
             scheduler.prefill_manager.page_aligned_budget = True
         self.io = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pd-transfer")
         self.install_stream = (
             torch.cuda.Stream(device=scheduler.device) if scheduler.device.type == "cuda" else None
         )
-        self.stats = {"max_prefill_batch": 0, "max_decode_batch": 0}
+        self.stats = {
+            "max_prefill_batch": 0,
+            "max_decode_batch": 0,
+            "decode_cache_hit_requests": 0,
+            "decode_cache_hit_tokens": 0,
+            "received_kv_tokens": 0,
+        }
         self.prefill_ms_per_token = None
         self.snapshot = {}
         self._update_snapshot()
@@ -142,6 +156,9 @@ class WorkerService:
             "queued_requests": sum(c.phase == "prefill" for c in self.contexts.values()),
             "installing_requests": sum(c.phase == "installing" for c in self.contexts.values()),
             "routing_version": 1,
+            "handoff_version": HANDOFF_VERSION,
+            "decode_prefix_reuse": True,
+            "decode_radix_cache": self.decode_radix_cache,
             "max_sequence_tokens": s.engine.max_seq_len,
             "load": {
                 "waiting_requests": waiting,
@@ -165,6 +182,8 @@ class WorkerService:
             "layered_transfer": self.layered,
             "concurrent_requests": True,
             "multiplex_version": 1,
+            "handoff_version": HANDOFF_VERSION,
+            "decode_prefix_reuse": True,
         }
 
     def health(self):
@@ -183,31 +202,46 @@ class WorkerService:
         p = self.s.layout.page_size
         return (n + p - 1) // p * p
 
-    def _reserve_pages(self, ctx):
+    def _reserve_pages(self, ctx, *, reuse_prefix=True):
         s, request = self.s, ctx.request
-        needed = self._aligned(len(request.prompt_ids) + request.max_tokens)
-        future_tokens = sum(
-            max(
-                0,
-                self._aligned(len(c.request.prompt_ids) + c.request.max_tokens)
-                - self._aligned(c.allocated),
-            )
-            for c in self.contexts.values()
-            if c.req is not None
-        )
-        if (
-            not s.table_manager.available_size
-            or needed + future_tokens > s.cache_manager.available_size
-        ):
-            raise TransferCapacityError("decode KV page or output-token budget is busy")
-        row = s.table_manager.allocate()
+        row = None
         slots = handle = None
+        locked = False
         try:
-            slots = s.cache_manager.reserve_import(row, len(request.prompt_ids))
             handle = s.cache_manager.prefix_cache.match_prefix(
-                torch.empty(0, dtype=torch.int32)
+                torch.tensor(
+                    request.prompt_ids if self.decode_radix_cache and reuse_prefix else (),
+                    dtype=torch.int32,
+                )
             ).cuda_handle
             s.cache_manager.lock(handle)
+            locked = True
+            prefix_len = ctx.decode_prefix_len = handle.cached_len
+            # A matched page used to be evictable. Lock it before pricing the
+            # remaining private/output pages against available_size.
+            needed = self._aligned(len(request.prompt_ids) + request.max_tokens) - prefix_len
+            future_tokens = sum(
+                max(
+                    0,
+                    self._aligned(len(c.request.prompt_ids) + c.request.max_tokens)
+                    - self._aligned(c.allocated),
+                )
+                for c in self.contexts.values()
+                if c.req is not None
+            )
+            if (
+                not s.table_manager.available_size
+                or needed + future_tokens > s.cache_manager.available_size
+            ):
+                raise TransferCapacityError("decode KV page or output-token budget is busy")
+            row = s.table_manager.allocate()
+            if prefix_len:
+                s.engine.page_table[row, :prefix_len] = handle.get_matched_indices()
+            slots = (
+                s.cache_manager.reserve_import(row, ctx.transfer_tokens, start=prefix_len)
+                if ctx.transfer_tokens
+                else s.engine.page_table[row, prefix_len:prefix_len]
+            )
             ctx.req = Req(
                 torch.tensor((*request.prompt_ids, 0), dtype=torch.int32),
                 row,
@@ -219,17 +253,32 @@ class WorkerService:
             )
             ctx.allocated = len(request.prompt_ids)
         except BaseException:
-            if handle is not None:
+            if locked:
                 s.cache_manager.unlock(handle)
             if slots is not None:
                 s.cache_manager._free(slots)
-            s.table_manager.free(row)
+            if row is not None:
+                s.table_manager.free(row)
             raise
+
+    def _reservation_reply(self, ctx, status):
+        reply = {
+            "status": status,
+            "transfer_id": ctx.request.transfer_id,
+            "decode_prefix_len": ctx.decode_prefix_len,
+            "prompt_tokens": len(ctx.request.prompt_ids),
+            "handoff_version": HANDOFF_VERSION,
+        }
+        if status == "ready":
+            reply["ticket"] = json.loads(ctx.ticket.to_wire()) if ctx.ticket is not None else None
+        return reply
 
     def _start(self, session, message):
         op = message.get("op")
         if op == "prefill" and self.is_prefill:
             allowed = {"op", "request", "ticket"} if self.layered else {"op", "request"}
+            if "decode_prefix_len" in message:
+                allowed.add("decode_prefix_len")
             if set(message) != allowed:
                 raise ValueError("prefill requires the worker's transfer protocol")
             request = StartRequest.from_object(message["request"])
@@ -253,6 +302,13 @@ class WorkerService:
         else:
             raise ValueError("operation does not match worker role")
         self.s._validate_request(request.prompt_ids, request.max_tokens)
+        prefix_len = message.get("decode_prefix_len", 0) if self.is_prefill else 0
+        if (
+            type(prefix_len) is not int
+            or not 0 <= prefix_len <= len(request.prompt_ids)
+            or prefix_len % self.s.layout.page_size
+        ):
+            raise ValueError("invalid decode prefix length")
         if session.request_id is not None and session.request_id != request.transfer_id:
             raise ValueError("request_id does not match transfer_id")
         if request.transfer_id in self.recent:
@@ -265,28 +321,32 @@ class WorkerService:
             > self.token_limit
         ):
             raise TransferCapacityError("worker request or token admission budget is busy")
-        limit = getattr(self.backend, "max_transfer_bytes", 1024**3)
-        if len(request.prompt_ids) * self.s.layout.bytes_per_token > limit:
-            raise ValueError("prompt KV exceeds the backend transfer limit")
         ctx = RequestContext(
             session, request, self.next_uid, "prefill" if self.is_prefill else "reserved"
         )
+        ctx.decode_prefix_len = prefix_len
         self.next_uid += 1
         self.contexts[session] = ctx
         self.by_uid[ctx.uid] = ctx
         self.recent.append(request.transfer_id)
         if self.is_prefill:
+            self._check_transfer_size(ctx)
             ctx.prefix_hit_tokens = self.s.cache_manager.prefix_cache.peek_prefix_len(
                 torch.tensor(request.prompt_ids[:-1], dtype=torch.int32)
             )
-            if self.layered:
+            if self.layered and ctx.transfer_tokens:
                 ticket = LayeredReceiveTicket.from_wire(json.dumps(message["ticket"]).encode())
-                if ticket.eos_token_id != self.s.eos_token_id:
-                    raise ValueError("incompatible EOS configuration")
+                if (
+                    ticket.eos_token_id != self.s.eos_token_id
+                    or ticket.prefix_len != ctx.decode_prefix_len
+                ):
+                    raise ValueError("incompatible EOS configuration or decode prefix")
                 ctx.ticket = ticket
                 ctx.job = self.backend.begin_layer_send(
                     ticket, request, self.s.engine.kv_cache, session.check_cancel, wait=False
                 )
+            elif self.layered and message["ticket"] is not None:
+                raise ValueError("a full decode cache hit must not expose a receive ticket")
             self.s.prefill_manager.pending_list.append(
                 PendingReq(
                     ctx.uid,
@@ -295,20 +355,37 @@ class WorkerService:
                 )
             )
         else:
-            self._reserve_pages(ctx)
-            if self.layered:
-                ctx.ticket = self.backend.reserve_layers(request, self.s.eos_token_id)
-            else:
+            # Legacy post-prefill TCP handoffs already contain a full payload;
+            # only the reserve-first protocol may promise a reusable prefix.
+            self._reserve_pages(ctx, reuse_prefix=op != "decode")
+            self._check_transfer_size(ctx)
+            if self.layered and ctx.transfer_tokens:
+                ctx.ticket = self.backend.reserve_layers(
+                    request, self.s.eos_token_id, prefix_len=ctx.decode_prefix_len
+                )
+            elif not self.layered:
                 # Host payloads are admission-bounded too, independently of KV pages.
-                size = len(request.prompt_ids) * self.s.layout.bytes_per_token
-                self._check_host_budget(size)
-                ctx.staging = bytearray(size)
+                size = ctx.transfer_tokens * self.s.layout.bytes_per_token
+                if size:
+                    self._check_host_budget(size)
+                    ctx.staging = bytearray(size)
                 if op == "reserve":
-                    session.emit({"status": "reserved", "transfer_id": request.transfer_id})
+                    if ctx.decode_prefix_len:
+                        self.stats["decode_cache_hit_requests"] += 1
+                        self.stats["decode_cache_hit_tokens"] += ctx.decode_prefix_len
+                    session.emit(self._reservation_reply(ctx, "reserved"))
                     return
                 ctx.handoff = handoff
                 ctx.ticket = self.backend.prepare_receive(handoff.kv, self.s.layout, ctx.staging)
-            session.emit({"status": "ready", "ticket": json.loads(ctx.ticket.to_wire())})
+            if ctx.decode_prefix_len:
+                self.stats["decode_cache_hit_requests"] += 1
+                self.stats["decode_cache_hit_tokens"] += ctx.decode_prefix_len
+            session.emit(self._reservation_reply(ctx, "ready"))
+
+    def _check_transfer_size(self, ctx):
+        limit = getattr(self.backend, "max_transfer_bytes", 1024**3)
+        if ctx.transfer_tokens * self.s.layout.bytes_per_token > limit:
+            raise ValueError("KV suffix exceeds the backend transfer limit")
 
     def _check_host_budget(self, nbytes):
         used = sum(
@@ -320,7 +397,7 @@ class WorkerService:
         if used + nbytes > limit:
             raise TransferCapacityError("host KV staging budget is busy")
 
-    def _validate_handoff(self, request, handoff):
+    def _validate_handoff(self, request, handoff, *, prefix_len=0):
         if (
             handoff.uid != request.uid
             or handoff.kv.transfer_id != request.transfer_id
@@ -328,6 +405,7 @@ class WorkerService:
             or handoff.max_tokens != request.max_tokens
             or handoff.ignore_eos != request.ignore_eos
             or handoff.kv.layout != self.s.layout
+            or handoff.kv.prefix_len != prefix_len
             or handoff.eos_token_id != self.s.eos_token_id
             or handoff.first_token_id >= self.s.vocab_size
             or not handoff.remaining_tokens
@@ -358,9 +436,10 @@ class WorkerService:
             ):
                 raise ValueError("invalid reserved payload preparation")
             ctx.handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
-            self._validate_handoff(ctx.request, ctx.handoff)
-            ctx.ticket = self.backend.prepare_receive(ctx.handoff.kv, self.s.layout, ctx.staging)
-            session.emit({"status": "ready", "ticket": json.loads(ctx.ticket.to_wire())})
+            self._validate_handoff(ctx.request, ctx.handoff, prefix_len=ctx.decode_prefix_len)
+            if ctx.transfer_tokens:
+                ctx.ticket = self.backend.prepare_receive(ctx.handoff.kv, self.s.layout, ctx.staging)
+            session.emit(self._reservation_reply(ctx, "ready"))
             return
         if op in ("cancel", "release") and message == {
             "op": op,
@@ -376,8 +455,8 @@ class WorkerService:
                 raise ValueError("invalid transfer commit")
             if self.layered:
                 ctx.handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
-                self._validate_handoff(ctx.request, ctx.handoff)
-            elif ctx.handoff is None or ctx.ticket is None:
+                self._validate_handoff(ctx.request, ctx.handoff, prefix_len=ctx.decode_prefix_len)
+            elif ctx.handoff is None or (ctx.transfer_tokens and ctx.ticket is None):
                 raise ValueError("payload must be prepared before commit")
             ctx.phase = "committed"
             return
@@ -404,7 +483,7 @@ class WorkerService:
             return
         try:
             self.s.decode_manager.remove_req(ctx.req)
-            if ctx.success:
+            if ctx.success and (self.is_prefill or self.decode_radix_cache):
                 self.s.cache_manager.cache_req(ctx.req, finished=True)
             else:
                 self.s.cache_manager.discard_private(ctx.req, ctx.allocated)
@@ -440,7 +519,7 @@ class WorkerService:
             if not self._installation_ready(ctx):
                 return
             ctx.install_event = None
-            if self.layered:
+            if self.layered and ctx.ticket is not None:
                 self.backend.release_layers(ctx.ticket, consumer_complete=True)
                 ctx.ticket = None
             ctx.phase = "cancelled"
@@ -505,13 +584,17 @@ class WorkerService:
                 entries = [
                     BatchTransferEntry(
                         self.by_uid[r.uid].request.transfer_id,
-                        s.engine.page_table[r.table_idx, : r.device_len].to(torch.int64),
+                        s.engine.page_table[
+                            r.table_idx, self.by_uid[r.uid].decode_prefix_len : r.device_len
+                        ].to(torch.int64),
                         not isinstance(r, ChunkedReq),
                         self.by_uid[r.uid].job,
                     )
                     for r in batch.reqs
+                    if self.by_uid[r.uid].job is not None
                 ]
-                s.engine.kv_cache.layer_ready = BatchTransferPlan(self.backend, entries).layer_ready
+                if entries:
+                    s.engine.kv_cache.layer_ready = BatchTransferPlan(self.backend, entries).layer_ready
             try:
                 output = s._forward(prepared)
             finally:
@@ -553,9 +636,13 @@ class WorkerService:
     def _prefill_result(self, ctx, req, token):
         s, request = self.s, ctx.request
         req.append_host(token)
-        slots = s.engine.page_table[req.table_idx, : req.cached_len]
+        slots = s.engine.page_table[req.table_idx, ctx.decode_prefix_len : req.cached_len]
         meta = KVTransferMetadata.from_slots(
-            request.transfer_id, s.layout, slots.tolist(), num_pool_pages=s.engine.num_pages
+            request.transfer_id,
+            s.layout,
+            slots.tolist(),
+            num_pool_pages=s.engine.num_pages,
+            prefix_len=ctx.decode_prefix_len,
         )
         ctx.handoff = RequestHandoff(
             request.uid,
@@ -569,6 +656,19 @@ class WorkerService:
         ctx.success = True
         ctx.phase = "handoff"
         ctx.session.emit({"status": "handoff", "handoff": json.loads(ctx.handoff.to_wire())})
+        if not ctx.transfer_tokens:
+            # No staging allocation, registration, gather or native operation.
+            # P still computed its own logits and sampled the first token.
+            self._free_pages(ctx)
+            ctx.session.emit(
+                {
+                    "status": "sent" if ctx.handoff.remaining_tokens else "retired",
+                    "transfer_id": request.transfer_id,
+                },
+                final=True,
+            )
+            self._remove(ctx)
+            return
         if self.layered:
             ctx.job.seal(cancel=not ctx.handoff.remaining_tokens)
         else:
@@ -592,27 +692,29 @@ class WorkerService:
             ) from exc
 
     def _install(self, ctx):
-        if self.layered:
+        if self.layered and ctx.transfer_tokens:
             staging = self.backend.finish_layers(ctx.ticket, wait=False)
             if staging is None:
                 return
             ctx.staging = staging
-        else:
+        elif ctx.transfer_tokens:
             self.backend.finish_receive(ctx.ticket)
         req, s = ctx.req, self.s
         stream = self.install_stream
         ctx.phase = "installing"
         try:
             req.input_ids[-1] = ctx.handoff.first_token_id
-            slots = s.engine.page_table[req.table_idx, : len(ctx.request.prompt_ids)]
+            slots = s.engine.page_table[
+                req.table_idx, ctx.decode_prefix_len : len(ctx.request.prompt_ids)
+            ]
             if stream is not None:
                 stream.wait_stream(s.engine.stream)
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
-                if self.layered:
+                if self.layered and ctx.transfer_tokens:
                     s.engine.kv_cache.import_layered_tensor(
                         ctx.staging, slots, num_pool_pages=s.engine.num_pages
                     )
-                else:
+                elif ctx.transfer_tokens:
                     s.engine.kv_cache.import_tokens(
                         ctx.staging, slots, num_pool_pages=s.engine.num_pages
                     )
@@ -667,9 +769,19 @@ class WorkerService:
                 elif ctx.phase == "committed":
                     self._install(ctx)
                 if ctx.phase == "installing" and self._installation_ready(ctx):
-                    if self.layered:
+                    if self.layered and ctx.ticket is not None:
                         self.backend.release_layers(ctx.ticket, consumer_complete=True)
                     ctx.ticket = ctx.staging = ctx.install_event = None
+                    if self.decode_radix_cache:
+                        try:
+                            self.s.cache_manager.cache_req(ctx.req, finished=False, rebind=True)
+                        except Exception as exc:
+                            # Insertion may already have adopted/freed pages.
+                            # Never run private-page cleanup on ambiguous ownership.
+                            raise TransferBackendUnavailable(
+                                "cannot publish installed decode KV safely"
+                            ) from exc
+                    self.stats["received_kv_tokens"] += ctx.transfer_tokens
                     self.s.decode_manager.filter_reqs([ctx.req])
                     ctx.phase = "decode"
                     ctx.session.emit(

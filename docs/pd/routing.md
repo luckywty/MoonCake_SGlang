@@ -115,7 +115,7 @@ KV 压力不计可淘汰的 Radix 前缀；实际分配仍可能为新请求淘�
 |---|---|
 | Worker 启动 | 创建模型 KV 池；Mooncake 预注册独立传输池 |
 | 路由 | 长度、健康、当前负载筛选，不分配或承诺物理 KV 页 |
-| D reserve | 检查表行、接收资源、按页对齐的完整 prompt+输出预算及现有未来预算；先分配 prompt 私有页和接收租约 |
+| D reserve | 可锁住 D Radix 前缀，按锁后容量检查 `align(prompt+输出)-命中前缀` 及现有未来预算；只分配后缀私有页和接收租约 |
 | P 组批/前向 | PrefillManager 检查本轮 token、表行与页预算，前向前分配需要的页，暂时不足则排队 |
 | D 安装/Decode | 安装 event 完成后归还接收租约并加入 continuous batch，输出页随 Decode 逐步分配 |
 

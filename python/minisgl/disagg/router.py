@@ -15,6 +15,7 @@ from uuid import uuid4
 from .client import RemoteCapacityError
 from .control import endpoint_address
 from .multiplex import MUX_VERSION, WorkerConnection
+from .protocol import HANDOFF_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,8 @@ class WorkerPool:
             and health.get("role") == node.role
             and type(health.get("multiplex_version")) is int
             and health.get("multiplex_version") == MUX_VERSION
+            and health.get("handoff_version") == HANDOFF_VERSION
+            and health.get("decode_prefix_reuse") is True
             and type(health.get("layered_transfer")) is bool
             and isinstance(health.get("layout"), dict)
             and transfer.get("status", "ready") in ("ready", "degraded")
@@ -202,6 +205,7 @@ class WorkerPool:
             return (
                 health.get("layout"),
                 health.get("layered_transfer"),
+                health.get("handoff_version"),
                 group if health.get("layered_transfer") else None,
             )
 

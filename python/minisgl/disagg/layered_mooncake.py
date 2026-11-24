@@ -27,7 +27,7 @@ from .mooncake_backend import MooncakeTransferBackend
 from .role import WorkerRole
 from .transfer import TransferBackendUnavailable, TransferCapacityError, TransferError
 
-_TRANSPORT = "mooncake-layered-gpu-v2"
+_TRANSPORT = "mooncake-layered-gpu-v3"
 
 
 @dataclass
@@ -120,8 +120,17 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         if type(nbytes) is not int or not 0 < nbytes <= self._pool_bytes:
             raise TransferError("prompt KV exceeds the startup transfer pool")
 
-    def reserve_layers(self, request: StartRequest, eos_token_id) -> LayeredReceiveTicket:
-        nbytes = len(request.prompt_ids) * self._layout.bytes_per_token
+    def reserve_layers(
+        self, request: StartRequest, eos_token_id, *, prefix_len: int = 0
+    ) -> LayeredReceiveTicket:
+        if (
+            type(prefix_len) is not int
+            or not 0 <= prefix_len < len(request.prompt_ids)
+            or prefix_len % self._layout.page_size
+        ):
+            raise TransferError("invalid layered transfer suffix")
+        transfer_tokens = len(request.prompt_ids) - prefix_len
+        nbytes = transfer_tokens * self._layout.bytes_per_token
         self.check_capacity(nbytes)
         with self._lock:
             if request.transfer_id in self._lease_attempts:
@@ -139,10 +148,11 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                     self.runtime.session,
                     self._receive_buffer.address + offset,
                     self._layout,
-                    len(request.prompt_ids),
+                    transfer_tokens,
                     self.layers_per_chunk,
                     tuple(i * layer_bytes for i in range(self._layout.layers)),
                     eos_token_id,
+                    prefix_len=prefix_len,
                 )
             except Exception:
                 self._allocator.release(locator)
@@ -156,7 +166,7 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         if (
             ticket.layout != self._layout
             or ticket.transfer_id != request.transfer_id
-            or ticket.kv_tokens != len(request.prompt_ids)
+            or ticket.prompt_tokens != len(request.prompt_ids)
             or ticket.layers_per_chunk != self.layers_per_chunk
         ):
             raise TransferError("incompatible early receive ticket")

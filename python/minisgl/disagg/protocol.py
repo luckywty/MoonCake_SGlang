@@ -1,4 +1,4 @@
-"""Version 1 handoff. Wire data contains JSON scalars and arrays, never local tensor handles."""
+"""P/D handoff and suffix metadata; wire data never contains local tensor handles."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from uuid import UUID
 
 DTYPE_BYTES = {"float16": 2, "bfloat16": 2, "float32": 4}
 MAX_INT32 = 2**31 - 1
+HANDOFF_VERSION = 2
 
 
 def _int(name: str, value: int, minimum: int = 0) -> None:
@@ -108,21 +109,30 @@ class KVTransferMetadata:
     KVLayout 描述一类 KV Cache 的格式。
     KVTransferMetadata 描述某次具体传输涉及的 KV Cache。
     '''
-    """Source page IDs are in logical order. Only kv_tokens tokens are valid in the payload."""
+    """Source pages cover the suffix after prefix_len; kv_tokens may be zero on a full hit."""
 
     transfer_id: str
     layout: KVLayout
     kv_tokens: int
     source_pages: tuple[int, ...]
-    version: int = 1
+    version: int = HANDOFF_VERSION
+    prefix_len: int = 0
 
     def __post_init__(self) -> None:
-        _v1(self.version)
+        if type(self.version) is not int or self.version not in (1, HANDOFF_VERSION):
+            raise ValueError("unsupported KV metadata version")
         check_transfer_id(self.transfer_id)
         if not isinstance(self.layout, KVLayout):
             raise ValueError("missing KV layout")
-        _int("kv_tokens", self.kv_tokens, 1)
+        _int("kv_tokens", self.kv_tokens)
+        _int("prefix_len", self.prefix_len)
+        if not self.prefix_len + self.kv_tokens:
+            raise ValueError("KV metadata must describe a nonempty prompt")
+        if self.version == 1 and (self.prefix_len or not self.kv_tokens):
+            raise ValueError("v1 requires a nonempty full-prompt transfer")
         p = self.layout.page_size
+        if self.prefix_len % p:
+            raise ValueError("decode prefix must contain whole KV pages")
         if (
             not isinstance(self.source_pages, tuple)
             or len(self.source_pages) != (self.kv_tokens + p - 1) // p
@@ -137,9 +147,19 @@ class KVTransferMetadata:
     def nbytes(self) -> int:
         return self.kv_tokens * self.layout.bytes_per_token
 
+    @property
+    def prompt_tokens(self) -> int:
+        return self.prefix_len + self.kv_tokens
+
     @classmethod
     def from_slots(
-        cls, transfer_id: str, layout: KVLayout, slots: Iterable[int], *, num_pool_pages: int
+        cls,
+        transfer_id: str,
+        layout: KVLayout,
+        slots: Iterable[int],
+        *,
+        num_pool_pages: int,
+        prefix_len: int = 0,
     ) -> KVTransferMetadata:
         """Consume only the valid CPU slot snapshot. num_pool_pages excludes the graph dummy."""
         _int("num_pool_pages", num_pool_pages, 1)
@@ -155,13 +175,15 @@ class KVTransferMetadata:
             elif pages[-1] != page:
                 raise ValueError("physical page changed within a logical page")
             count += 1
-        return cls(transfer_id, layout, count, tuple(pages))
+        return cls(transfer_id, layout, count, tuple(pages), prefix_len=prefix_len)
 
     def to_wire(self) -> bytes:
         return _wire(self)
 
     @classmethod
     def _from_object(cls, obj: Any) -> KVTransferMetadata:
+        if isinstance(obj, dict) and obj.get("version") == 1:
+            obj = {"prefix_len": 0, **obj}
         data = _object(cls, obj)
         data["layout"] = KVLayout(**_object(KVLayout, data["layout"]))
         data["source_pages"] = _array(data["source_pages"])
@@ -188,23 +210,29 @@ class RequestHandoff:
     eos_token_id: int | None
     kv: KVTransferMetadata
     sampling: str = "greedy"
-    version: int = 1
+    version: int = HANDOFF_VERSION
 
     def __post_init__(self) -> None:
-        _v1(self.version)
+        if type(self.version) is not int or self.version not in (1, HANDOFF_VERSION):
+            raise ValueError("unsupported handoff version")
         _int("uid", self.uid)
         _int("max_tokens", self.max_tokens, 1)
         if not isinstance(self.kv, KVTransferMetadata):
             raise ValueError("missing KV metadata")
-        if not isinstance(self.prompt_ids, tuple) or len(self.prompt_ids) != self.kv.kv_tokens:
-            raise ValueError("KV must cover the entire prompt, excluding the sampled first token")
+        if self.version == 1 and (self.kv.prefix_len or not self.kv.kv_tokens):
+            raise ValueError("v1 requires a nonempty full-prompt transfer")
+        if (
+            not isinstance(self.prompt_ids, tuple)
+            or len(self.prompt_ids) != self.kv.prompt_tokens
+        ):
+            raise ValueError("decode prefix and transferred KV must cover the complete prompt")
         for token in self.prompt_ids:
             _token(token)
         _token(self.first_token_id)
         if self.eos_token_id is not None:
             _token(self.eos_token_id)
         if type(self.ignore_eos) is not bool or self.sampling != "greedy":
-            raise ValueError("v1 requires a boolean ignore_eos and greedy sampling")
+            raise ValueError("handoff requires a boolean ignore_eos and greedy sampling")
 
     @property
     def remaining_tokens(self) -> int:

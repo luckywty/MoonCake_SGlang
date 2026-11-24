@@ -37,6 +37,7 @@ class ServerArgs(SchedulerConfig):
     pd_output_queue_size: int = 128
     worker_id: str = ""
     pd_mooncake_port: int | None = None
+    disaggregation_decode_enable_radix_cache: bool = False
 
     @property
     def share_tokenizer(self) -> bool:
@@ -99,6 +100,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
     parser.add_argument("--pd-mooncake-host", default=None)
     parser.add_argument("--worker-id", default="")
+    parser.add_argument(
+        "--disaggregation-decode-enable-radix-cache",
+        action="store_true",
+        help="Keep and reuse page-aligned GPU prefixes on decode Workers (default: disabled).",
+    )
     parser.add_argument("--pd-mooncake-port", type=int, default=None)
     parser.add_argument("--pd-layers-per-chunk", type=int, default=ServerArgs.pd_layers_per_chunk)
     parser.add_argument("--pd-staging-slots", type=int, default=ServerArgs.pd_staging_slots)
@@ -287,6 +293,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    if (
+        kwargs["disaggregation_decode_enable_radix_cache"]
+        and kwargs["worker_role"] != WorkerRole.DECODE.value
+    ):
+        parser.error("--disaggregation-decode-enable-radix-cache requires --worker-role decode")
     if kwargs["worker_role"] == WorkerRole.UNIFIED.value and kwargs["pd_transfer_backend"] != "tcp":
         parser.error("--pd-transfer-backend mooncake requires a split worker role")
     if kwargs["worker_role"] != WorkerRole.UNIFIED.value:

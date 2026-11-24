@@ -1,6 +1,5 @@
 """Bind admitted P/D Workers before Prefill, retaining the layered data plane."""
 
-import json
 import math
 import threading
 from uuid import uuid4
@@ -9,11 +8,11 @@ from .client import (
     PDClient,
     RemoteCapacityError,
     RemoteUnavailableError,
+    reservation_prefix,
     response,
+    stream_reserved,
 )
 from .control import StartRequest
-from .layered_protocol import LayeredReceiveTicket
-from .protocol import RequestHandoff, _token
 from .router import NoHealthyWorker, WorkerPool
 from .routing_policy import PolicyRouter
 
@@ -149,14 +148,7 @@ class RoutedPDClient(PDClient):
                 channel = self.pool.connect(node).open(request.transfer_id, cancel)
                 channel.send({"op": "reserve", "request": request.to_object()})
                 ready = response(channel, "ready" if layered else "reserved")
-                if layered:
-                    ticket = LayeredReceiveTicket.from_wire(json.dumps(ready["ticket"]).encode())
-                    if ticket.transfer_id != request.transfer_id or ticket.kv_tokens != len(
-                        request.prompt_ids
-                    ):
-                        raise ValueError("receive ticket belongs to another request")
-                elif ready.get("transfer_id") != request.transfer_id:
-                    raise ValueError("reservation belongs to another request")
+                reservation_prefix(ready, request, layered=layered)
                 self.router.record(request.transfer_id, prefill, node, attempt, bucket=bucket)
                 return node, channel, ready
             except InterruptedError:
@@ -213,65 +205,15 @@ class RoutedPDClient(PDClient):
                 self.active_routes[request.transfer_id] = (prefill.worker_id, decode.worker_id)
             p = self.pool.connect(prefill).open(request.transfer_id, cancel)
             layered = prefill.health["layered_transfer"]
-            start = {"op": "prefill", "request": request.to_object()}
-            if layered:
-                start["ticket"] = ready["ticket"]
-            p.send(start)
-            wire = response(p, "handoff")["handoff"]
-            handoff = RequestHandoff.from_wire(json.dumps(wire).encode())
-            if (
-                handoff.uid != request.uid
-                or handoff.kv.transfer_id != request.transfer_id
-                or handoff.prompt_ids != request.prompt_ids
-                or handoff.max_tokens != max_tokens
-                or handoff.ignore_eos != ignore_eos
-            ):
-                raise ValueError("prefill handoff does not match the routed request")
-            yield handoff.first_token_id
-            if not handoff.remaining_tokens:
-                if layered:
-                    if response(p, "retired").get("transfer_id") != request.transfer_id:
-                        raise ValueError("incorrect retirement acknowledgment")
+
+            def release_prefill():
+                nonlocal held_prefill
                 self.router.release(held_prefill)
                 held_prefill = None
-                d.send({"op": "release", "transfer_id": request.transfer_id})
-                if response(d, "released").get("transfer_id") != request.transfer_id:
-                    raise ValueError("incorrect release acknowledgment")
-                return
-            if layered:
-                if response(p, "sent").get("transfer_id") != request.transfer_id:
-                    raise ValueError("incorrect send acknowledgment")
-                self.router.release(held_prefill)
-                held_prefill = None
-                d.send({"op": "commit", "transfer_id": request.transfer_id, "handoff": wire})
-            else:
-                d.send({"op": "prepare", "transfer_id": request.transfer_id, "handoff": wire})
-                ticket = response(d, "ready")["ticket"]
-                p.send({"op": "send", "ticket": ticket})
-                if response(p, "sent").get("transfer_id") != request.transfer_id:
-                    raise ValueError("incorrect send acknowledgment")
-                self.router.release(held_prefill)
-                held_prefill = None
-                d.send({"op": "commit", "transfer_id": request.transfer_id})
-            if response(d, "installed").get("transfer_id") != request.transfer_id:
-                raise ValueError("incorrect installation acknowledgment")
-            for index in range(1, max_tokens):
-                message = response(d, "token")
-                token = message.get("token_id")
-                _token(token)
-                finished = index + 1 == max_tokens or (
-                    not ignore_eos and token == handoff.eos_token_id
-                )
-                if (
-                    message.get("transfer_id") != request.transfer_id
-                    or message.get("index") != index
-                    or type(message.get("finished")) is not bool
-                    or message["finished"] != finished
-                ):
-                    raise ValueError("invalid or out-of-order routed decode token")
-                yield token
-                if finished:
-                    return
+
+            yield from stream_reserved(
+                request, p, d, ready, layered=layered, on_prefill_done=release_prefill
+            )
         finally:
             try:
                 if p is not None:

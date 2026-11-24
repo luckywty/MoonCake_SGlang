@@ -14,7 +14,7 @@ import torch
 
 from .transfer import TransferBackendUnavailable, TransferError
 
-TRANSPORT = "mooncake-layered-gpu-v2"
+TRANSPORT = "mooncake-layered-gpu-v3"
 
 
 class ControlSession:

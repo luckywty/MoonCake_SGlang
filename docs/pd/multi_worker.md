@@ -75,8 +75,12 @@ PYTHONPATH=python python -m minisgl.disagg.gateway \
 
 网关和 Token ID 客户端都接受 `--prefill-addrs/--decode-addrs`；可显式传 N/M 校验列表长度，否则由列表推导。
 地址必须跨角色唯一。`launcher` 的远程地址模式只启动网关，不要求本机有 GPU，也不会管理远程 Worker 进程。
-原有 Gateway `--prefill/--decode` 可作为单节点地址池简写；Python `PDClient` 保留原有单端点协议，
+原有 Gateway `--prefill/--decode` 可作为单节点地址池简写；Python `PDClient` 也使用先 reserve D 的单端点协议，
 `RoutedPDClient` 提供多节点池。不能混用单端点与地址列表参数。
+
+本地启动器可添加 `--disaggregation-decode-enable-radix-cache`，只对 D 子进程开启 GPU 前缀复用；
+远程模式须在远程 D 的启动命令设置。handoff v2/层组票据 v3 要求配套客户端和 Worker，
+详见 [D Radix Cache](decode_radix_cache.md)。
 
 ## 连接与请求流程
 

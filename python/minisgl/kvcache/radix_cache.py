@@ -95,7 +95,7 @@ class RadixCacheHandle(BaseCacheHandle):
             value_list.append(node.value)
             node = node.parent
         value_list.reverse()
-        return torch.cat(value_list)
+        return torch.cat(value_list) if value_list else node.value
 
 
 class RadixPrefixCache(BasePrefixCache):
@@ -108,6 +108,7 @@ class RadixPrefixCache(BasePrefixCache):
         self.evictable_size = 0
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
+        self.root_node.set_key_value(torch.empty(0, dtype=torch.int32), self.empty_tensor)
         self.root_node.ref_count = 1  # root is always protected
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
