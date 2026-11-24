@@ -24,6 +24,9 @@ def validate_mooncake_port(port):
 
 
 def add_routing_args(parser):
+    from .routing_policy import add_policy_args
+
+    add_policy_args(parser)
     parser.add_argument("--num-prefill-workers", type=int, default=None)
     parser.add_argument("--num-decode-workers", type=int, default=None)
     parser.add_argument("--prefill-addrs", nargs="+", default=None)

@@ -1,4 +1,4 @@
-"""Health-filtered Worker pools and seeded per-request random routing."""
+"""Persistent health-filtered Worker pools; RandomRouter remains a legacy API."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ class WorkerNode:
     endpoint: str
     healthy: bool = False
     health: dict = field(default_factory=dict)
+    load_updated_at: float = 0.0
     reason: str | None = "not probed"
     connection: object = None
     connection_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -163,6 +164,7 @@ class WorkerPool:
         )
         with self.lock:
             node.health = health
+            node.load_updated_at = time.monotonic()
             node.healthy = bool(valid)
             node.reason = (
                 None if valid else "Worker health, protocol, or quarantine budget rejected"

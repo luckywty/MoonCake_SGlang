@@ -230,6 +230,7 @@ def main() -> None:
         if not prefill:
             raise ValueError("prefill and decode addresses are required")
         from .routed_client import RoutedPDClient
+        from .routing_policy import policy_config
 
         client = RoutedPDClient(
             prefill,
@@ -242,8 +243,9 @@ def main() -> None:
             health_timeout=args.health_timeout,
             ready_timeout=args.worker_ready_timeout,
             max_quarantined_bytes=args.max_quarantined_bytes,
+            routing_config=policy_config(args),
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         parser.error(str(exc))
     logging.basicConfig(level=logging.INFO)
     import uvicorn

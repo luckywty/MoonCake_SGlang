@@ -65,6 +65,10 @@ class MatchResult(NamedTuple):
 
 
 class BasePrefixCache(ABC):
+    def peek_prefix_len(self, input_ids: torch.Tensor) -> int:
+        """Read-only routing hint. Caches without prefix reuse return zero."""
+        return 0
+
     @abstractmethod
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         """

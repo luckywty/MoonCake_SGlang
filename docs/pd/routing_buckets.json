@@ -1,0 +1,24 @@
+{
+  "buckets": [
+    {
+      "id": "short",
+      "max_input_tokens": 2048,
+      "max_context_tokens": 4096,
+      "prefill": {
+        "worker_ids": ["p-0"],
+        "admission": {"max_waiting_requests": 16}
+      },
+      "decode": {
+        "worker_ids": ["d-0"],
+        "admission": {"max_kv_usage": 0.9}
+      }
+    },
+    {
+      "id": "general",
+      "max_input_tokens": 8192,
+      "max_context_tokens": 16384,
+      "prefill": {"worker_ids": ["p-0", "p-1"]},
+      "decode": {"worker_ids": ["d-0", "d-1"]}
+    }
+  ]
+}

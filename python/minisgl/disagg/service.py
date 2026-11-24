@@ -62,6 +62,7 @@ class RequestContext:
     phase: str
     req: Req | None = None
     allocated: int = 0
+    prefix_hit_tokens: int = 0
     ticket: object = None
     job: object = None
     handoff: RequestHandoff | None = None
@@ -98,6 +99,7 @@ class WorkerService:
             torch.cuda.Stream(device=scheduler.device) if scheduler.device.type == "cuda" else None
         )
         self.stats = {"max_prefill_batch": 0, "max_decode_batch": 0}
+        self.prefill_ms_per_token = None
         self.snapshot = {}
         self._update_snapshot()
 
@@ -112,6 +114,21 @@ class WorkerService:
 
     def _update_snapshot(self):
         s = self.s
+        capacity = s.engine.num_pages * s.layout.page_size
+        waiting = sum(
+            c.phase == "prefill" if self.is_prefill else c.phase != "decode"
+            for c in self.contexts.values()
+        )
+        running = (
+            sum(c.req is not None for c in self.contexts.values())
+            if self.is_prefill
+            else len(s.decode_manager.running_reqs)
+        )
+        pending_tokens = sum(
+            max(0, len(c.request.prompt_ids) - max(c.allocated, c.prefix_hit_tokens))
+            for c in self.contexts.values()
+            if c.phase == "prefill"
+        )
         self.snapshot = {
             "status": "ready",
             "role": s.role.value,
@@ -124,8 +141,23 @@ class WorkerService:
             "active_requests": len(self.contexts),
             "queued_requests": sum(c.phase == "prefill" for c in self.contexts.values()),
             "installing_requests": sum(c.phase == "installing" for c in self.contexts.values()),
+            "routing_version": 1,
+            "max_sequence_tokens": s.engine.max_seq_len,
+            "load": {
+                "waiting_requests": waiting,
+                "running_requests": running,
+                "running_capacity": s.table_manager._max_running_reqs,
+                "pending_prefill_tokens": pending_tokens,
+                # Evictable prefixes can make room; count private/protected KV pressure.
+                "kv_tokens": max(0, capacity - s.cache_manager.available_size),
+                "kv_capacity": capacity,
+            },
             **self.stats,
         }
+        if self.prefill_ms_per_token is not None:
+            self.snapshot["load"]["estimated_prefill_queue_ms"] = (
+                pending_tokens * self.prefill_ms_per_token
+            )
 
     def capabilities(self):
         return {
@@ -244,6 +276,9 @@ class WorkerService:
         self.by_uid[ctx.uid] = ctx
         self.recent.append(request.transfer_id)
         if self.is_prefill:
+            ctx.prefix_hit_tokens = self.s.cache_manager.prefix_cache.peek_prefix_len(
+                torch.tensor(request.prompt_ids[:-1], dtype=torch.int32)
+            )
             if self.layered:
                 ticket = LayeredReceiveTicket.from_wire(json.dumps(message["ticket"]).encode())
                 if ticket.eos_token_id != self.s.eos_token_id:
@@ -303,6 +338,16 @@ class WorkerService:
         ctx = self.contexts.get(session)
         if ctx is None:
             if session.done.is_set() or session.cancelled.is_set():
+                return
+            if message.get("op") == "prefix_match":
+                if not self.is_prefill or set(message) != {"op", "prompt_ids"}:
+                    raise ValueError("prefix_match requires a Prefill Worker and prompt_ids")
+                ids = message["prompt_ids"]
+                self.s._validate_request(ids, 1)
+                matched = self.s.cache_manager.prefix_cache.peek_prefix_len(
+                    torch.tensor(ids[:-1], dtype=torch.int32)
+                )
+                session.emit({"status": "prefix_match", "matched_tokens": matched}, final=True)
                 return
             return self._start(session, message)
         op = message.get("op")
@@ -452,6 +497,8 @@ class WorkerService:
         if batch is None:
             return
         self.stats["max_prefill_batch"] = max(self.stats["max_prefill_batch"], batch.size)
+        compute_started = time.monotonic()
+        new_tokens = sum(req.extend_len for req in batch.reqs)
         try:
             prepared = self._prepare(batch)
             if self.layered:
@@ -471,6 +518,12 @@ class WorkerService:
                 s.engine.kv_cache.layer_ready = None
             # One batch-tail sampling fence; no transfer or packing wait here.
             output.copy_done_event.synchronize()
+            measured = (time.monotonic() - compute_started) * 1000 / max(1, new_tokens)
+            self.prefill_ms_per_token = (
+                measured
+                if self.prefill_ms_per_token is None
+                else 0.8 * self.prefill_ms_per_token + 0.2 * measured
+            )
         except TransferBackendUnavailable:
             raise
         except Exception as exc:

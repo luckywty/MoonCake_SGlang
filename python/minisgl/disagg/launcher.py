@@ -1,4 +1,4 @@
-"""Launch isolated TP=1 P/D Workers and a health-aware random-routing gateway."""
+"""Launch isolated TP=1 P/D Workers and a load-aware routing gateway."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import time
 from dataclasses import asdict
 
 from .cluster_config import add_routing_args, local_plan, remote_addresses
+from .routing_policy import policy_cli_args, policy_config
 
 CLUSTER_FLAGS = {
     "--num-prefill-workers",
@@ -26,6 +27,10 @@ CLUSTER_FLAGS = {
     "--prefill-addrs",
     "--decode-addrs",
     "--routing-seed",
+    "--routing-policy",
+    "--policy",
+    "--decode-policy",
+    "--bucket-config",
 }
 
 
@@ -195,6 +200,7 @@ class ClusterSupervisor:
         ]
         if self.args.routing_seed is not None:
             command += ["--routing-seed", str(self.args.routing_seed)]
+        command += policy_cli_args(self.args)
         self.children.append(
             (
                 "gateway",
@@ -253,6 +259,7 @@ def main(argv=None):
     p = parser()
     args, worker_args = p.parse_known_args(argv)
     try:
+        routing = policy_config(args)
         for value in (
             args.timeout,
             args.health_timeout,
@@ -319,7 +326,10 @@ def main(argv=None):
             )
             prefill = [spec.endpoint for spec in specs if spec.role == "prefill"]
             decode = [spec.endpoint for spec in specs if spec.role == "decode"]
-    except (ValueError, RuntimeError) as exc:
+        routing.validate_worker_ids(
+            [f"p-{i}" for i in range(len(prefill))], [f"d-{i}" for i in range(len(decode))]
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
         p.error(str(exc))
     supervisor = ClusterSupervisor(args, specs, prefill, decode, worker_args)
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}

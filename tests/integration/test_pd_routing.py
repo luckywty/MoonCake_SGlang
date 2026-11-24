@@ -16,6 +16,7 @@ from minisgl.disagg.client import RemoteCapacityError
 from minisgl.disagg.multiplex import WorkerConnection
 from minisgl.disagg.routed_client import RoutedPDClient
 from minisgl.disagg.router import WorkerPool
+from minisgl.disagg.routing_policy import RoutingConfig
 from minisgl.disagg.service import WorkerService
 from minisgl.disagg.transfer import MockFabric, MockTransferBackend
 from pd_reference import cpu_scheduler, reference_tokens
@@ -24,7 +25,7 @@ from test_pd_control_loop import MemoryChannel, MemoryListener, readable
 
 
 @contextmanager
-def running_cluster(monkeypatch, mode="layered", seed=12):
+def running_cluster(monkeypatch, mode="layered", seed=12, routing_config=None):
     services, backends, threads, errors = [], [], [], []
     stop, fabric = threading.Event(), MockFabric()
     counts, frames = {}, []
@@ -101,7 +102,14 @@ def running_cluster(monkeypatch, mode="layered", seed=12):
                 endpoint, connect=connect, **kwargs
             ),
         )
-        client = RoutedPDClient(prefill, decode, pool=pool, routing_seed=seed, ready_timeout=2)
+        client = RoutedPDClient(
+            prefill,
+            decode,
+            pool=pool,
+            routing_seed=seed,
+            ready_timeout=2,
+            routing_config=routing_config or RoutingConfig(policy="random", decode_policy="random"),
+        )
         try:
             client.start()
             yield client, services, counts, frames
@@ -289,10 +297,12 @@ def test_two_prefill_workers_concurrently_fan_out_to_both_decode_workers(monkeyp
             monkeypatch.setattr(source, "_prefill", wait_for_batch)
         route = threading.local()
         monkeypatch.setattr(
-            client.router, "select_prefill", lambda: client.pool.prefill_pool[route.p]
+            client.router, "select_prefill", lambda **kwargs: client.pool.prefill_pool[route.p]
         )
         monkeypatch.setattr(
-            client.router, "select_decode", lambda exclude=(): client.pool.decode_pool[route.d]
+            client.router,
+            "select_decode",
+            lambda exclude=(), **kwargs: client.pool.decode_pool[route.d],
         )
         barrier = threading.Barrier(4)
 

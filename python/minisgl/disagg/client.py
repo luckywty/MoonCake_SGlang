@@ -237,6 +237,7 @@ def main() -> None:
             if args.prefill or args.decode:
                 raise ValueError("use either single endpoints or address lists")
             from .routed_client import RoutedPDClient
+            from .routing_policy import policy_config
 
             client = RoutedPDClient(
                 prefill,
@@ -247,12 +248,13 @@ def main() -> None:
                 health_timeout=args.health_timeout,
                 ready_timeout=args.worker_ready_timeout,
                 max_quarantined_bytes=args.max_quarantined_bytes,
+                routing_config=policy_config(args),
             )
         elif args.prefill and args.decode:
             client = PDClient(args.prefill, args.decode, timeout=args.timeout)
         else:
             raise ValueError("both P and D endpoints or address lists are required")
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         parser.error(str(exc))
     try:
         tokens = client.generate(

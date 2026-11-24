@@ -1,4 +1,4 @@
-"""Randomly bind one request to healthy P/D Workers and persistent channels."""
+"""Bind admitted P/D Workers before Prefill, retaining the layered data plane."""
 
 import json
 import math
@@ -14,7 +14,8 @@ from .client import (
 from .control import StartRequest
 from .layered_protocol import LayeredReceiveTicket
 from .protocol import RequestHandoff, _token
-from .router import NoHealthyWorker, RandomRouter, WorkerPool
+from .router import NoHealthyWorker, WorkerPool
+from .routing_policy import PolicyRouter
 
 
 class RoutedPDClient(PDClient):
@@ -32,6 +33,7 @@ class RoutedPDClient(PDClient):
         ready_timeout=30.0,
         max_quarantined_bytes=0,
         pool=None,
+        routing_config=None,
     ):
         if not prefill_addrs or not decode_addrs:
             raise ValueError("nonempty P and D address lists are required")
@@ -53,7 +55,7 @@ class RoutedPDClient(PDClient):
             max_quarantined_bytes=max_quarantined_bytes,
             max_requests=max_inflight_requests + 16,
         )
-        self.router = RandomRouter(self.pool, routing_seed)
+        self.router = PolicyRouter(self.pool, routing_seed, routing_config)
         self.ready_timeout = ready_timeout
         self.active_lock = threading.Lock()
         self.active_routes = {}
@@ -64,16 +66,81 @@ class RoutedPDClient(PDClient):
     def close(self):
         self.pool.close()
 
-    def _reserve(self, request, prefill, cancel):
-        excluded, last_error = set(), None
-        layered = prefill.health["layered_transfer"]
-        for attempt in range(len(self.pool.decode_pool)):
+    def _prefix_matches(self, request, bucket, cancel):
+        if (bucket.prefill.policy or self.router.config.policy) != "cache_aware":
+            return {}
+
+        def query(node):
+            if node.health.get("routing_version") != 1:
+                return 0
+            channel = None
             try:
-                node = self.router.select_decode(excluded)
+                channel = self.pool.connect(node).open(str(uuid4()), cancel)
+                channel.send(
+                    {"op": "prefix_match", "prompt_ids": list(request.prompt_ids)},
+                    timeout=self.pool.health_timeout,
+                )
+                reply = channel.receive(timeout=self.pool.health_timeout)
+                matched = reply.get("matched_tokens")
+                if (
+                    reply.get("status") != "prefix_match"
+                    or type(matched) is not int
+                    or not 0 <= matched < len(request.prompt_ids)
+                ):
+                    return 0
+                return matched
+            except InterruptedError:
+                raise
+            except (OSError, RuntimeError, ValueError):
+                # Hints are optional. A busy GPU owner must not retire a healthy Worker.
+                return 0
+            finally:
+                if channel is not None:
+                    channel.close()
+
+        nodes = self.router.candidates("prefill", request, bucket)
+        futures = [(n, self.pool.probes.submit(query, n)) for n in nodes]
+        return {node.worker_id: future.result() for node, future in futures}
+
+    def _route_and_reserve(self, request, cancel):
+        last_error = None
+        attempted_decode = set()
+        for bucket in self.router.buckets_for(request):
+            prefill = None
+            try:
+                hits = self._prefix_matches(request, bucket, cancel)
+                prefill = self.router.acquire_prefill(
+                    request=request, bucket=bucket, prefix_hits=hits
+                )
+                decode, channel, ready = self._reserve(
+                    request, prefill, cancel, bucket=bucket, excluded=attempted_decode
+                )
+                return prefill, decode, channel, ready, bucket
+            except InterruptedError:
+                if prefill is not None:
+                    self.router.release(prefill)
+                raise
+            except (RemoteCapacityError, RemoteUnavailableError, OSError) as exc:
+                if prefill is not None:
+                    self.router.release(prefill)
+                last_error = exc
+            except BaseException:
+                if prefill is not None:
+                    self.router.release(prefill)
+                raise
+        raise last_error or NoHealthyWorker("no routing bucket can supply a P/D pair")
+
+    def _reserve(self, request, prefill, cancel, *, bucket, excluded):
+        last_error = None
+        layered = prefill.health["layered_transfer"]
+        for _ in range(len(self.pool.decode_pool)):
+            try:
+                node = self.router.acquire_decode(excluded, request=request, bucket=bucket)
             except NoHealthyWorker:
                 if last_error is not None:
                     raise last_error
                 raise
+            attempt = len(excluded)
             excluded.add(node.worker_id)
             channel = None
             try:
@@ -90,20 +157,25 @@ class RoutedPDClient(PDClient):
                         raise ValueError("receive ticket belongs to another request")
                 elif ready.get("transfer_id") != request.transfer_id:
                     raise ValueError("reservation belongs to another request")
-                self.router.record(request.transfer_id, prefill, node, attempt)
+                self.router.record(request.transfer_id, prefill, node, attempt, bucket=bucket)
                 return node, channel, ready
             except InterruptedError:
+                self.router.release(node)
                 if channel is not None:
                     channel.close()
                 raise
             except (RemoteCapacityError, RemoteUnavailableError, OSError) as exc:
+                self.router.release(node)
                 last_error = exc
                 if not isinstance(exc, RemoteCapacityError):
                     self.pool.mark_unhealthy(node, exc)
-                self.router.record(request.transfer_id, prefill, node, attempt, "reserve_retry")
+                self.router.record(
+                    request.transfer_id, prefill, node, attempt, "reserve_retry", bucket=bucket
+                )
                 if channel is not None:
                     channel.close()
             except BaseException:
+                self.router.release(node)
                 if channel is not None:
                     channel.close()
                 raise
@@ -132,10 +204,11 @@ class RoutedPDClient(PDClient):
         )
         if cancel is not None and cancel.is_set():
             raise InterruptedError("request cancelled")
-        prefill = self.router.select_prefill()
         p = d = None
+        held_prefill = held_decode = None
         try:
-            decode, d, ready = self._reserve(request, prefill, cancel)
+            prefill, decode, d, ready, bucket = self._route_and_reserve(request, cancel)
+            held_prefill, held_decode = prefill, decode
             with self.active_lock:
                 self.active_routes[request.transfer_id] = (prefill.worker_id, decode.worker_id)
             p = self.pool.connect(prefill).open(request.transfer_id, cancel)
@@ -159,6 +232,8 @@ class RoutedPDClient(PDClient):
                 if layered:
                     if response(p, "retired").get("transfer_id") != request.transfer_id:
                         raise ValueError("incorrect retirement acknowledgment")
+                self.router.release(held_prefill)
+                held_prefill = None
                 d.send({"op": "release", "transfer_id": request.transfer_id})
                 if response(d, "released").get("transfer_id") != request.transfer_id:
                     raise ValueError("incorrect release acknowledgment")
@@ -166,6 +241,8 @@ class RoutedPDClient(PDClient):
             if layered:
                 if response(p, "sent").get("transfer_id") != request.transfer_id:
                     raise ValueError("incorrect send acknowledgment")
+                self.router.release(held_prefill)
+                held_prefill = None
                 d.send({"op": "commit", "transfer_id": request.transfer_id, "handoff": wire})
             else:
                 d.send({"op": "prepare", "transfer_id": request.transfer_id, "handoff": wire})
@@ -173,6 +250,8 @@ class RoutedPDClient(PDClient):
                 p.send({"op": "send", "ticket": ticket})
                 if response(p, "sent").get("transfer_id") != request.transfer_id:
                     raise ValueError("incorrect send acknowledgment")
+                self.router.release(held_prefill)
+                held_prefill = None
                 d.send({"op": "commit", "transfer_id": request.transfer_id})
             if response(d, "installed").get("transfer_id") != request.transfer_id:
                 raise ValueError("incorrect installation acknowledgment")
@@ -194,7 +273,13 @@ class RoutedPDClient(PDClient):
                 if finished:
                     return
         finally:
-            if p is not None:
-                p.close()
-            if d is not None:
-                d.close()
+            try:
+                if p is not None:
+                    p.close()
+            finally:
+                try:
+                    if d is not None:
+                        d.close()
+                finally:
+                    self.router.release(held_prefill)
+                    self.router.release(held_decode)
