@@ -36,9 +36,14 @@ class MHAKVCache(BaseKVCachePool):
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._device = device
+        self._page_size = page_size
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
         # Installed only for the final prompt chunk by the split P scheduler.
         self.layer_ready = None
+
+    @property
+    def page_size(self) -> int:
+        return self._page_size
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[index]

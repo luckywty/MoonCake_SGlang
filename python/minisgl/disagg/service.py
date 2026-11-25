@@ -17,6 +17,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
+from uuid import uuid4
 
 import torch
 from minisgl.core import Req, SamplingParams
@@ -27,6 +28,8 @@ from .control import CancelledError, Channel, StartRequest
 from .layered_protocol import LayeredReceiveTicket
 from .layered_sender import BatchTransferEntry, BatchTransferPlan
 from .protocol import HANDOFF_VERSION, KVTransferMetadata, ReceiveTicket, RequestHandoff
+from .prefix_events import PrefixPublisher
+from .prefix_hash import PREFIX_INDEX_VERSION, PrefixHashSpec
 from .role import WorkerRole
 from .transfer import TransferBackendUnavailable, TransferCapacityError
 
@@ -97,6 +100,21 @@ class WorkerService:
         self.next_uid = 0
         self.layered = bool(getattr(backend, "layered_transfer", False))
         self.is_prefill = scheduler.role is WorkerRole.PREFILL
+        self.instance_id = str(uuid4())
+        self.cache_namespace = config.get("cache_namespace", "default")
+        self.prefix_publisher = None
+        cache = scheduler.cache_manager.prefix_cache
+        if self.is_prefill and hasattr(cache, "page_observer"):
+            spec = PrefixHashSpec.from_layout(asdict(scheduler.layout), self.cache_namespace)
+            if not (spec.page_size == scheduler.cache_manager.page_size
+                    == scheduler.engine.kv_cache.page_size):
+                raise ValueError("prefix hash and MHA KV page sizes differ")
+            self.prefix_publisher = PrefixPublisher(
+                spec, self.instance_id,
+                min(scheduler.engine.num_pages, config.get("prefix_max_pages", 65536)),
+                config.get("prefix_event_limit", 32768),
+            )
+            cache.page_observer = self.prefix_publisher
         self.decode_radix_cache = not self.is_prefill and bool(
             config.get("decode_radix_cache", False)
         )
@@ -146,6 +164,8 @@ class WorkerService:
         self.snapshot = {
             "status": "ready",
             "role": s.role.value,
+            "instance_id": self.instance_id,
+            "cache_namespace": self.cache_namespace,
             "layout": asdict(s.layout),
             "free_rows": s.table_manager.available_size,
             "free_pages": len(s.cache_manager.free_slots),
@@ -184,6 +204,7 @@ class WorkerService:
             "multiplex_version": 1,
             "handoff_version": HANDOFF_VERSION,
             "decode_prefix_reuse": True,
+            "prefix_index_version": PREFIX_INDEX_VERSION if self.prefix_publisher else None,
         }
 
     def health(self):
@@ -196,7 +217,13 @@ class WorkerService:
             "layered_transfer": self.layered,
             "multiplex_version": 1,
             "transfer": native,
+            "prefix_index": self.prefix_publisher.health() if self.prefix_publisher else None,
         }
+
+    def prefix_sync(self, message):
+        if self.prefix_publisher is None:
+            raise ValueError("page prefix synchronization requires a Radix Prefill Worker")
+        return self.prefix_publisher.sync(message)
 
     def _aligned(self, n):
         p = self.s.layout.page_size
@@ -848,6 +875,8 @@ class WorkerService:
         self._update_snapshot()
 
     def close(self):
+        if self.prefix_publisher is not None:
+            self.prefix_publisher.disable("Worker service is closing")
         for ctx in self.contexts.values():
             ctx.session.cancelled.set()
         deadline = time.monotonic() + 3 * self.timeout + 1
@@ -884,6 +913,9 @@ class WorkerService:
                         message = channel.receive()
                     if message == {"op": "health"}:
                         channel.send(self.health())
+                        return
+                    if message.get("op") == "prefix_sync":
+                        channel.send(self.prefix_sync(message))
                         return
                     self.submit(session, message)
                     while not stopping.is_set():

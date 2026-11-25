@@ -16,6 +16,7 @@ from .client import RemoteCapacityError
 from .control import endpoint_address
 from .multiplex import MUX_VERSION, WorkerConnection
 from .protocol import HANDOFF_VERSION
+from .prefix_index import PrefixIndex
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ class WorkerNode:
     reason: str | None = "not probed"
     connection: object = None
     connection_lock: threading.Lock = field(default_factory=threading.Lock)
+    probe_lock: threading.Lock = field(default_factory=threading.Lock)
+    prefix_sync_lock: threading.Lock = field(default_factory=threading.Lock)
+    instance_id: str | None = None
 
 
 class WorkerPool:
@@ -80,9 +84,69 @@ class WorkerPool:
         self.thread = None
         self.closed = False
         self.expected_identity = None
+        self.prefix_index = PrefixIndex()
+        self.prefix_enabled = False
+        self.prefix_sync_interval = 0.2
+        self.prefix_thread = None
+        self.prefix_probes = ThreadPoolExecutor(
+            max_workers=min(8, len(self.prefill_pool)), thread_name_prefix="pd-prefix"
+        )
         self.probes = ThreadPoolExecutor(
             max_workers=min(16, len(self.nodes)), thread_name_prefix="pd-health"
         )
+
+    def configure_prefix_index(self, config):
+        if self.thread is not None:
+            raise RuntimeError("prefix index must be configured before WorkerPool.start")
+        self.prefix_enabled = config.policy == "cache_aware" or any(
+            bucket.prefill.policy == "cache_aware" for bucket in config.buckets
+        )
+        self.prefix_sync_interval = config.prefix_sync_interval
+        self.prefix_index = PrefixIndex(
+            config.prefix_index_max_entries, config.prefix_index_max_worker_entries,
+            config.prefix_index_max_age,
+        )
+
+    def _sync_prefix(self, node):
+        with node.prefix_sync_lock:
+            # Bound each round so one large snapshot cannot monopolize the pool.
+            for _ in range(16):
+                if self.stop.is_set() or not node.healthy:
+                    return
+                task = self.prefix_index.request(node.worker_id)
+                if task is None:
+                    return
+                state, message = task
+                channel = None
+                try:
+                    connection = self.connect(node)
+                    channel = connection.open(str(uuid4()), self.stop)
+                    channel.send(message, timeout=self.health_timeout)
+                    reply = channel.receive(timeout=self.health_timeout)
+                    if not isinstance(reply, dict):
+                        raise ValueError("invalid prefix synchronization response")
+                    if not self.prefix_index.apply(node.worker_id, state, reply):
+                        return
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    # This optional directory does not retire an inference Worker.
+                    self.prefix_index.failed(node.worker_id, state)
+                    return
+                finally:
+                    if channel is not None:
+                        channel.close()
+
+    def _prefix_monitor(self):
+        while not self.stop.is_set():
+            try:
+                futures = [self.prefix_probes.submit(self._sync_prefix, node)
+                           for node in self.healthy("prefill")]
+                for future in futures:
+                    future.result()
+            except Exception:
+                if not self.stop.is_set():
+                    logger.exception("Prefix directory synchronization failed")
+            if self.stop.wait(self.prefix_sync_interval):
+                return
 
     def connect(self, node, *, for_probe=False):
         # Serialize initial connection establishment only for this destination.
@@ -128,6 +192,7 @@ class WorkerPool:
         with self.lock:
             node.healthy = False
             node.reason = str(reason)
+            self.prefix_index.forget(node.worker_id)
 
     def apply_health(self, node, health):
         transfer = health.get("transfer", {})
@@ -166,14 +231,27 @@ class WorkerPool:
             and native.get("quarantined_bytes", 0) <= self.max_quarantined_bytes
         )
         with self.lock:
+            instance = health.get("instance_id")
+            if instance != node.instance_id:
+                self.prefix_index.forget(node.worker_id)
+                node.instance_id = instance
             node.health = health
             node.load_updated_at = time.monotonic()
             node.healthy = bool(valid)
             node.reason = (
                 None if valid else "Worker health, protocol, or quarantine budget rejected"
             )
+            if valid and self.prefix_enabled:
+                self.prefix_index.observe(node.worker_id, health)
+            else:
+                self.prefix_index.forget(node.worker_id)
 
     def probe(self, node):
+        # A late probe cannot roll a newly discovered instance back to an old one.
+        with node.probe_lock:
+            self._probe(node)
+
+    def _probe(self, node):
         request = None
         try:
             connection = self.connect(node, for_probe=True)
@@ -204,6 +282,7 @@ class WorkerPool:
             )
             return (
                 health.get("layout"),
+                health.get("cache_namespace", "default"),
                 health.get("layered_transfer"),
                 health.get("handoff_version"),
                 group if health.get("layered_transfer") else None,
@@ -218,6 +297,7 @@ class WorkerPool:
                     if node.healthy and identity(node.health) != self.expected_identity:
                         node.healthy = False
                         node.reason = "P/D model layouts or transfer modes differ"
+                        self.prefix_index.forget(node.worker_id)
 
     def start(self, ready_timeout=30.0, *, require_all=False):
         if not math.isfinite(ready_timeout) or ready_timeout <= 0:
@@ -253,6 +333,11 @@ class WorkerPool:
                 target=self._monitor, name="pd-health-monitor", daemon=True
             )
             self.thread.start()
+            if self.prefix_enabled:
+                self.prefix_thread = threading.Thread(
+                    target=self._prefix_monitor, name="pd-prefix-monitor", daemon=True
+                )
+                self.prefix_thread.start()
 
     def _monitor(self):
         while not self.stop.wait(self.health_interval):
@@ -269,11 +354,15 @@ class WorkerPool:
         self.stop.set()
         if self.thread is not None and self.thread is not threading.current_thread():
             self.thread.join(timeout=self.timeout + self.health_timeout + 1)
+        if self.prefix_thread is not None and self.prefix_thread is not threading.current_thread():
+            self.prefix_thread.join(timeout=self.health_timeout + 1)
+        self.prefix_probes.shutdown(wait=True, cancel_futures=True)
         self.probes.shutdown(wait=True, cancel_futures=True)
         for node in self.nodes:
             with node.connection_lock:
                 if node.connection is not None:
                     node.connection.close()
+            self.prefix_index.forget(node.worker_id)
         self.closed = True
 
 

@@ -6,11 +6,13 @@
 以及可选的 D GPU Radix 前缀复用、按请求取消和资源回收。
 Python 包名和命令入口仍为 `minisgl`。
 
-新增 **D 本地 GPU Radix Cache 开关**，默认关闭；开启后匹配并锁定 D 前缀，
-TCP/Mooncake 只传缺失后缀，正常结束保留有效上下文及生成 KV。
-本次未新增或运行测试，实施细节和新协议说明见 [D Radix Cache](docs/pd/decode_radix_cache.md)。
+新增 **P 本地 HBM 页面哈希链索引**：`cache_aware` 通过后台同步的页元数据选路，
+替代逐请求向候选 P 查询 Radix 的 RPC；实际执行仍由 Worker Radix 匹配并锁定。
+页面身份使用带模型、布局与 namespace 的 SHA-256 链，分词及请求哈希移入独立 CPU 进程。
+使用方法与一致性边界见[页面哈希索引](docs/pd/prefix_index.md)。
 
-> **当前版本（2026-11-24）**：新增 D Radix 开关、前缀锁定、后缀传输与缓存去重，单端点及 Routed 客户端统一先向 D 预留资源。
+> **当前版本（2026-11-25）**：P 缓存亲和改用真实 HBM 页的哈希链元数据镜像，增加实例/序号同步、容量与过期处理。
+> D Radix 仍默认关闭；P→D 后缀始终取决于 D reserve 的真实前缀，单端点及 Routed 客户端继续先向 D 预留资源。
 > 本次仅完成代码审查、Python 编译与差异检查，未新增或运行测试。此前组批、逐层传输和路由的 CPU/TCP 记录不代表本次功能已验收。
 > 真实 GPU/RDMA 正确性、双服务器运行、实际重叠比例与性能收益尚未验收。下文部署命令是配置模板。
 
@@ -24,7 +26,7 @@ TCP/Mooncake 只传缺失后缀，正常结束保留有效上下文及生成 KV�
 |---|---|---|
 | 执行角色 | 同一推理实例完成 Prefill 和 Decode，可用 TP 跨卡协同。 | 保留默认 `unified`；新增独立 `prefill` / `decode` Worker，各自加载模型、管理 KV。P 生成首 token，D 续算。 |
 | 多请求与组批 | 已有 Prefill/Decode 管理器、连续组批和 Chunked Prefill。 | 复用到独立 P/D 服务，新增并发控制面、GPU 调度循环、异步 KV 安装和按请求退出；单 Worker 可 batch>1。 |
-| KV 缓存与页管理 | 已有 GPU KV 池、分页和 Radix 前缀复用。 | 增加私有导入页、整体/分层 gather/scatter、分配回滚、后台 reader 保护及只读前缀命中查询。D 默认关闭 Radix，可显式开启本地前缀共享、安装后去重及生成 KV 缓存。 |
+| KV 缓存与页管理 | 已有 GPU KV 池、分页和 Radix 前缀复用。 | 增加私有导入页、整体/分层 gather/scatter、分配回滚、后台 reader 保护及 P 已提交 HBM 页的哈希链选路索引。D 默认关闭 Radix，可显式开启本地前缀共享、安装后去重及生成 KV 缓存。 |
 | 跨 Worker KV 交接 | 没有本项目的 P/D 交接协议及传输后端。 | 新增票据、生命周期与完成确认；TCP 在完整 Prefill 后发送待传后缀的 CPU 字节并校验 SHA-256，Mooncake 按层组 GPU 直传；D 完整命中时省去 payload。 |
 | 计算重叠 | CPU 调度与 GPU 计算重叠，支持 CUDA Graph。 | Unified 保留；split 使用 eager、关闭原调度重叠和 CUDA Graph，独立实现 KV 传输与后续层 Prefill 计算重叠。 |
 | 多实例部署与选路 | TP rank 协同运行一个推理实例，没有本项目的独立 P/D 节点池。 | 新增 N 个 P、M 个 D 的启动器，隔离 GPU/端口/TE，支持 NUMA/HCA 映射、健康巡检、Bucket/准入、负载择优与 P 缓存亲和。 |
@@ -42,7 +44,7 @@ TCP/Mooncake 只传缺失后缀，正常结束保留有效上下文及生成 KV�
 当前 split 模式限制为 **TP=1、greedy、真实 safetensors 权重、未量化 MHA KV、eager 执行**。
 每个 Worker 支持多个请求，由单个 GPU 调度主循环组 batch；关闭 CUDA Graph 和原有 CPU/GPU 调度重叠。
 Mooncake 的逐层计算/通信重叠是独立机制；多节点使用显式地址池，尚未提供自动发现或请求故障迁移。
-当前接入的是 **Mooncake Transfer Engine**；缓存亲和查询 P 的本地 GPU 前缀，尚无全局 KV 目录或 DRAM/SSD 分层 KV 缓存。
+当前接入的是 **Mooncake Transfer Engine**；缓存亲和查询 Router 中的各 P 本地 HBM 页元数据镜像，尚无共享 Store 或 DRAM/SSD 分层 KV 缓存。
 TCP 路径的 CPU 接收区用于传输暂存，不是 Mooncake 论文中的 L2/L3 缓存池；session/SLO 选路和 Decode retract 尚未移植。
 P/D 缓存独立管理，尚无 D→P 的 KV 回传或拉取；后续 prompt 包含历史回答时，P 未命中的这部分 KV 需要重算。
 
@@ -295,7 +297,7 @@ GPU 仍由 `CUDA_VISIBLE_DEVICES` 选择。客户端自动协商传输能力，�
 
 ## HTTP 网关
 
-P/D Worker 控制端口不提供 HTTP。网关独立加载 tokenizer，不创建模型 Engine；
+P/D Worker 控制端口不提供 HTTP。网关主进程加载 tokenizer 用于解码，独立 CPU 进程完成分词和页面哈希，不创建模型 Engine；
 在能访问两端 Worker 的机器上启动：
 
 ```bash
@@ -351,7 +353,16 @@ PYTHONPATH=python python -m minisgl.disagg.gateway \
 
 网关每 Worker 维持一条复用连接；health、reserve、首 token、sent、commit、token 和 cancel 都携带 request_id。
 默认参考 SGLang `9f1a6dca98` 的重构路由：匹配长度 Bucket，筛选健康且可准入的节点，
-分别随机抽两个 P/D 候选比较负载；P 可用 `--routing-policy cache_aware` 优先选择本地 GPU 前缀命中节点。
+分别随机抽两个 P/D 候选比较负载；P 可用 `--routing-policy cache_aware` 查询页面哈希镜像，优先选择本地 HBM 前缀命中节点。
+只统计满页，遇到首个缺页即停止；重启、退役、过期或同步失败会清空或停用该 P 的 Hint，并回退负载选路。
+配置及参数见[页面哈希索引](docs/pd/prefix_index.md)；该 Hint 不替代 P 的真实 Radix 锁定，也不决定 D 的传输前缀。
+在上述地址列表网关命令中增加以下参数即可启用页面哈希亲和，默认策略仍为 `power_of_two`：
+
+```text
+--routing-policy cache_aware --decode-policy power_of_two --affinity-mode balanced
+```
+
+默认至少命中 1024 token 才参与缓存亲和；短 prompt 场景可调整 `--cache-affinity-min-matched-tokens`。
 所有 routed 请求在 P 计算前向 D reserve，同一 Bucket 内容量不足或退役时重选尚未尝试的 D；
 本 Bucket 无可用 P/D 对时尝试下一个匹配 Bucket，每个 D 对同一请求最多 reserve 一次。
 P 开始计算后保持绑定，不因容量不足重选或重放。
@@ -366,6 +377,10 @@ P 开始计算后保持绑定，不因容量不足重选或重放。
 |---|---|
 | `--worker-role` | 默认 `unified`；split 选择 `prefill` 或 `decode`。 |
 | `--disaggregation-decode-enable-radix-cache` | 默认关闭；仅 D 使用 GPU Radix 前缀复用，启动器只传给 D。 |
+| `--pd-cache-namespace` | 默认 `default`；Worker 页面哈希域，P/D 保持一致；不是请求级租户隔离。 |
+| `--pd-prefix-max-pages` / `--pd-prefix-event-limit` | 默认 65536 / 32768；P 源端页元数据与增删日志上限。 |
+| `--prefix-index-max-entries` / `--prefix-index-max-worker-entries` | 默认 262144 / 65536；Router 镜像总量与单 P 页条目上限。 |
+| `--prefix-index-max-age` / `--prefix-sync-interval` | 默认 6 / 0.2 秒；Router Hint 有效期与后台同步间隔。 |
 | `--max-running-requests` | 默认 256；Worker 的请求表行容量，实际并发还受页、准入和传输预算限制。 |
 | `--max-prefill-length` | 默认 8192；每个 Prefill batch 的 token 预算，可分块处理长 prompt。 |
 | `--pd-transfer-backend` | 默认 `tcp`；`mooncake` 启用逐层 GPU 路径。 |
@@ -420,14 +435,18 @@ D 拒绝 reserve 时，网关可重选其他健康 D；全部拒绝则不启动 
 `decode_radix_cache` 表示 D 开关；`decode_cache_hit_requests` / `decode_cache_hit_tokens` 累计成功 reserve 的命中情况，
 包括后续主动释放的预留；`received_kv_tokens` 累计成功安装的后缀 token，完整命中增加 0。
 结合 `free_pages`、`protected_tokens`、`evictable_tokens` 判断 KV 占用；开启缓存后空闲时允许保留可淘汰页，不要求所有页回到 free list。
+`instance_id` 区分同一地址的不同 Worker 启动实例；Radix P 的 `prefix_index` 提供 `enabled`、`domain_id`、
+`seq`、`pages`、`max_pages`、`event_count`、`oldest_seq` 和禁用原因，用于观察页元数据发布及同步窗口。
+这些 CPU 元数据不包含 KV 副本；页索引数量也不代表 Worker 全部 HBM 驻留页数。
 
 Worker 健康检查使用自定义 `Channel` 消息 `{"op":"health"}`，不能直接 `curl` 控制端口。
 后端完成未知、隔离超期或不可恢复错误可能触发非零退出，需要外部进程监管重启。
 
 ## 测试与验收
 
-本次 D Radix 和后缀协议改动按要求未新增或运行测试，仅通过 Python 编译和 `git diff --check`。
-下列命令与测试清单为已有工具入口，尚未据此验证新开关、v2/v3 协议或完整命中路径。
+后续 D Radix、后缀协议及本次页面哈希索引、后台同步和分词进程改动按要求未新增或运行测试，
+仅完成源码审查、Python 编译和 `git diff --check`。下列命令与测试清单为已有工具入口，
+尚未据此验证新索引、新开关、v2/v3 协议或完整命中路径。
 
 ### 标准库协议检查
 
@@ -473,7 +492,7 @@ FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
 不下载 Hugging Face 权重。逐层所有权测试使用内存控制通道，端到端用例另使用真实 socket；
 CUDA event 和原生 DMA 的 CPU 适配器不能证明真实 GPU/RDMA 并发。
 
-引入 D Radix Cache 前的 2026-11-24 历史无 socket 回归为 **190 passed、10 skipped、5 deselected、113 subtests passed**，包含路由策略测试；本次 D Radix 改动未运行测试。
+引入 D Radix Cache 前的 2026-11-24 历史无 socket 回归为 **190 passed、10 skipped、5 deselected、113 subtests passed**，包含旧路由策略测试；后续 D Radix 与本次页面哈希索引改动均未运行测试。
 测试使用确定性 CPU attention 验证多请求组批、独立参考 token 对照，以及内存通道中的完整并发 Worker/PDClient 控制循环。
 10 项 GPU 用例跳过，5 项逐层 socket 用例排除；独立 TCP 与 HTTP 回归未纳入此子集。
 当前验证环境不支持本机 socket；真实 TCP/HTTP 网络、多进程 GPU、跨服务器和 RDMA 尚待验收。
@@ -527,6 +546,8 @@ python/minisgl/
 │   ├── router.py       # 健康节点池与巡检
 │   ├── routing_policy.py     # Bucket、准入、负载与缓存感知选路
 │   ├── routed_client.py      # 按请求固定 P/D，reserve 重选
+│   ├── prefix_hash.py / prefix_events.py / prefix_index.py  # 页面身份、P 日志与 Router 镜像
+│   ├── prompt_prepare.py    # 有界独立 CPU 分词与哈希进程
 │   ├── multiplex.py / mux_server.py  # 长连接 request_id 分流
 │   ├── client.py       # 控制协调与 Token ID 流
 │   ├── gateway.py      # HTTP、分词、SSE
@@ -545,6 +566,7 @@ docs/pd/                # P/D 专项设计和阶段记录
 
 - [逐层 KV 传输](docs/pd/layered_transfer.md)：缓冲池、层组流水线、所有权、取消与验收入口。
 - [D Radix Cache](docs/pd/decode_radix_cache.md)：默认关闭、页级共享、后缀传输、完整命中及回收规则。
+- [P 页面哈希索引](docs/pd/prefix_index.md)：SHA-256 哈希域、真实 HBM 发布、后台增删同步、容量与 P/D 边界。
 - [多请求调度](docs/pd/batching.md)：异步控制面、批量传输、动态 Decode、显存与准入参数。
 - [P/D 选择算法](docs/pd/routing.md)：Bucket、准入阈值、两候选择优、缓存亲和与分配时机。
 - [多 Worker 与路由](docs/pd/multi_worker.md)：资源隔离、健康池、长连接、重选与跨机配置。

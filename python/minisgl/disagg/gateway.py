@@ -20,13 +20,14 @@ from minisgl.tokenizer.detokenize import DetokenizeManager
 from .admission import AdmissionError
 from .client import PDClient, RemoteWorkerError
 from .cluster_config import add_routing_args, remote_addresses
+from .prompt_prepare import PromptPreparer, prepare_with_tokenizer
 
 """提供 HTTP 接口，处理分词、文本输出和流式响应
 接收用户的 HTTP 请求、Tokenization、调用 P/D 推理客户端，
 以及将生成的 Token 转换成 OpenAI API 风格的响应。"""
 
 
-def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
+def create_app(client: PDClient, tokenizer, model: str, *, preparer=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
         try:
@@ -34,6 +35,8 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
                 await asyncio.to_thread(client.start)
             yield
         finally:
+            if preparer is not None:
+                await asyncio.to_thread(preparer.close)
             if hasattr(client, "close"):
                 await asyncio.to_thread(client.close)
 
@@ -62,17 +65,34 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
             or req.frequency_penalty != 0
         ):
             raise HTTPException(400, "Phase 2 supports greedy requests with max_tokens >= 1")
-        if req.messages:
-            ids = tokenizer.apply_chat_template(
-                [message.model_dump() for message in req.messages],
-                tokenize=True,
-                add_generation_prompt=True,
-            )
-        elif req.prompt is not None:
-            ids = tokenizer.encode(req.prompt)
-        else:
-            raise HTTPException(400, "messages or prompt is required")
         cancel = Event()
+        preparation_watcher = asyncio.create_task(disconnect(request, cancel))
+        try:
+            messages = [message.model_dump() for message in req.messages] if req.messages else None
+            spec = (
+                await asyncio.to_thread(client.prefix_spec)
+                if hasattr(client, "prefix_spec") else None
+            )
+            if preparer is not None:
+                prepared = await preparer.prepare(messages, req.prompt, spec, cancel)
+            else:
+                # Embedded create_app callers may supply their own tokenizer. Never
+                # tokenize/hash on the async loop; the CLI uses a spawned process.
+                prepared = await asyncio.to_thread(
+                    prepare_with_tokenizer, tokenizer, messages, req.prompt, spec
+                )
+            if cancel.is_set():
+                raise InterruptedError("request disconnected during prompt preparation")
+            ids = prepared.token_ids
+            prefix_metadata = {} if prepared.prefix is None else {"prepared_prefix": prepared.prefix}
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(503, str(exc)) from exc
+        finally:
+            preparation_watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await preparation_watcher
         routing_request_id = str(uuid4())
         request_id = "chatcmpl-" + routing_request_id
 
@@ -84,6 +104,7 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
                 ignore_eos=req.ignore_eos,
                 cancel=cancel,
                 request_id=routing_request_id,
+                **prefix_metadata,
             )
             tokens = []
             detokenizer = DetokenizeManager(tokenizer)
@@ -163,6 +184,7 @@ def create_app(client: PDClient, tokenizer, model: str) -> FastAPI:
                 ignore_eos=req.ignore_eos,
                 cancel=cancel,
                 request_id=routing_request_id,
+                **prefix_metadata,
             )
             detokenizer = DetokenizeManager(tokenizer)
             content = "".join(
@@ -255,6 +277,9 @@ def main() -> None:
         client,
         load_tokenizer(args.model),
         args.model,
+        preparer=PromptPreparer(
+            args.model, max_pending=args.max_inflight_requests, timeout=args.timeout
+        ),
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

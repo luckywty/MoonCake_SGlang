@@ -25,6 +25,8 @@ class RadixTreeNode:
         self.uuid = RadixTreeNode.counter
         RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
+        # CPU-only routing metadata. Splitting preserves the child's logical end.
+        self.prefix_end_digest: bytes | None = None
 
         # these fields should be updated later
         self._key: torch.Tensor
@@ -103,6 +105,7 @@ class RadixPrefixCache(BasePrefixCache):
         super().__init__()
         self.device = device
         self.page_size = get_global_ctx().page_size
+        self.page_observer = None
         self.key_fn = _get_key_fn(self.page_size)
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
@@ -133,6 +136,20 @@ class RadixPrefixCache(BasePrefixCache):
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         node, prefix_len = self._tree_walk(input_ids)
         return MatchResult(RadixCacheHandle(prefix_len, node))
+
+    def _prefix_event(self, method, *args):
+        observer = self.page_observer
+        if observer is None:
+            return
+        try:
+            getattr(observer, method)(*args)
+        except Exception as exc:
+            # A routing Hint must never change the inference/cache ownership path.
+            observer.disable(exc)
+            self.page_observer = None
+
+    def publish_handle(self, handle: BaseCacheHandle) -> None:
+        self._prefix_event("publish", handle)
 
     def peek_prefix_len(self, input_ids: torch.Tensor) -> int:
         # GPU scheduler owner only. Do not split nodes, touch LRU or borrow pages.
@@ -182,6 +199,7 @@ class RadixPrefixCache(BasePrefixCache):
             self.evictable_size -= node.length
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
+            self._prefix_event("remove_node", node.uuid)
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
@@ -235,7 +253,9 @@ class RadixPrefixCache(BasePrefixCache):
 
             # need to split the node if not fully matched
             if match_len != node.length:
+                child = node
                 node = node.split_at(match_len)
+                self._prefix_event("split", child, node, prefix_len // self.page_size)
                 node.timestamp = tic
                 return node, prefix_len
 

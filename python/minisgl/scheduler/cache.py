@@ -130,6 +130,8 @@ class CacheManager:
         else:  # keep the tail part, update the handle
             req.cache_handle = new_handle
             self.lock(new_handle)
+        # Publish only after insertion, page ownership and duplicate cleanup commit.
+        self.prefix_cache.publish_handle(new_handle)
 
     def check_integrity(self) -> None:
         self.prefix_cache.check_integrity()

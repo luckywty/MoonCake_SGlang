@@ -189,14 +189,17 @@ class PDClient:
         self.timeout = timeout
         self.admission = AdmissionBudget(max_inflight_requests, max_inflight_tokens)
 
-    def stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None):
+    def stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
+               prepared_prefix=None):
         # Validate before acquiring a shared budget. Each admitted stream owns
         # its own sockets; only accounting updates hold the condition lock.
         request_id = str(uuid4()) if request_id is None else request_id
         StartRequest(request_id, 0, tuple(prompt_ids), max_tokens, ignore_eos)
         with self.admission.reserve(len(prompt_ids) + max_tokens, self.timeout, cancel):
+            metadata = {} if prepared_prefix is None else {"prepared_prefix": prepared_prefix}
             yield from self._stream(
-                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id
+                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id,
+                **metadata,
             )
 
     def _stream(
@@ -207,6 +210,7 @@ class PDClient:
         ignore_eos: bool = False,
         cancel: Event | None = None,
         request_id=None,
+        prepared_prefix=None,
     ):
         # 构造一个请求
         request = StartRequest(
@@ -267,11 +271,14 @@ class PDClient:
 
     # 这个 generate() 是 stream() 的非流式封装：把逐个产生的 token 编号收集成列表，等生成结束后一次性返回。
     def generate(
-        self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None
+        self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
+        prepared_prefix=None,
     ) -> list[int]:
+        metadata = {} if prepared_prefix is None else {"prepared_prefix": prepared_prefix}
         return list(
             self.stream(
-                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id
+                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id,
+                **metadata,
             )
         )
 

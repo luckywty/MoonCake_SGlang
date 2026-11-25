@@ -139,8 +139,18 @@ class RoutingConfig:
     affinity_mode: str = "prefer"
     affinity_load_factor: float = 2.0
     affinity_load_gap: int = 1024
+    prefix_index_max_entries: int = 262144
+    prefix_index_max_worker_entries: int = 65536
+    prefix_index_max_age: float = 6.0
+    prefix_sync_interval: float = 0.2
 
     def __post_init__(self):
+        if any(type(value) is not int or value < 1 for value in (
+            self.prefix_index_max_entries, self.prefix_index_max_worker_entries
+        )) or any(not math.isfinite(value) or value <= 0 for value in (
+            self.prefix_index_max_age, self.prefix_sync_interval
+        )):
+            raise ValueError("prefix index bounds/intervals must be positive")
         if (
             self.policy not in POLICIES
             or self.decode_policy not in POLICIES
@@ -331,15 +341,21 @@ class PolicyRouter:
                 other = self._pick(alternatives, "power_of_two", "prefill", bucket, loads)
                 a, b = loads[best.worker_id], loads[other.worker_id]
                 if "pending_prefill_tokens" in a and "pending_prefill_tokens" in b:
+                    def reusable(node):
+                        # HBM may cover all prompt pages, but Prefill still samples logits.
+                        page = node.health.get("layout", {}).get("page_size", 1)
+                        limit = (len(request.prompt_ids) - 1) // page * page
+                        return min(hits.get(node.worker_id, 0), limit)
+
                     x = (
                         a["pending_prefill_tokens"]
                         + len(request.prompt_ids)
-                        - hits.get(best.worker_id, 0)
+                        - reusable(best)
                     )
                     y = (
                         b["pending_prefill_tokens"]
                         + len(request.prompt_ids)
-                        - hits.get(other.worker_id, 0)
+                        - reusable(other)
                     )
                     if (
                         x - y > self.config.affinity_load_gap
@@ -417,6 +433,10 @@ def add_policy_args(parser):
     parser.add_argument("--affinity-mode", choices=("prefer", "balanced"), default="prefer")
     parser.add_argument("--affinity-load-factor", type=float, default=2.0)
     parser.add_argument("--affinity-load-gap", type=int, default=1024)
+    parser.add_argument("--prefix-index-max-entries", type=int, default=262144)
+    parser.add_argument("--prefix-index-max-worker-entries", type=int, default=65536)
+    parser.add_argument("--prefix-index-max-age", type=float, default=6.0)
+    parser.add_argument("--prefix-sync-interval", type=float, default=0.2)
     for name in (
         "max-worker-inflight-requests",
         "max-waiting-requests",
@@ -445,6 +465,10 @@ def policy_config(args):
         affinity_mode=args.affinity_mode,
         affinity_load_factor=args.affinity_load_factor,
         affinity_load_gap=args.affinity_load_gap,
+        prefix_index_max_entries=args.prefix_index_max_entries,
+        prefix_index_max_worker_entries=args.prefix_index_max_worker_entries,
+        prefix_index_max_age=args.prefix_index_max_age,
+        prefix_sync_interval=args.prefix_sync_interval,
     )
 
 
@@ -459,6 +483,10 @@ def policy_cli_args(args):
         "affinity_mode",
         "affinity_load_factor",
         "affinity_load_gap",
+        "prefix_index_max_entries",
+        "prefix_index_max_worker_entries",
+        "prefix_index_max_age",
+        "prefix_sync_interval",
         "max_worker_inflight_requests",
         "max_waiting_requests",
         "max_pending_prefill_tokens",

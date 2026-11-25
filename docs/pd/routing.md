@@ -90,20 +90,24 @@ KV 压力不计可淘汰的 Radix 前缀；实际分配仍可能为新请求淘�
 
 使用 `--routing-policy cache_aware`：
 
-1. 在候选 P 的持久复用连接上并行发送只读 `prefix_match` 查询。
-   GPU 调度线程读取本地 Radix 前缀长度，不分配 KV 页、不锁定前缀、不改变 LRU 或拆分节点。
-   按页对齐查询 `prompt[:-1]`，至少保留一个待计算 token。
+1. 网关的独立 CPU 进程在分词时计算 SHA-256 页面哈希链，页面大小等于真实 KV `page_size`。
+   Router 在本地查询后台同步的各 P HBM 页索引，不再逐请求向候选 P 发送 `prefix_match` RPC。
+   对每个 P 从第 0 页顺序探测，首次缺失即停止；只计算满页，命中长度为 `matched_pages * page_size`。
 2. 筛选同时满足 `--cache-affinity-min-matched-tokens`（默认 1024）和
    `--cache-affinity-min-match-ratio`（默认 0）的命中节点，优先最长命中，长度相同时比较 P 负载。
 3. `--affinity-mode prefer` 默认保留该选择；无有效命中时回退两候选择优。
 4. `balanced` 模式再从其他可准入 P 中按负载选一个，比较
-   `排队未缓存 tokens + 本请求未命中 tokens`。仅当缓存节点压力差大于
+   `排队未缓存 tokens + prompt_len - reuse_hint`。`reuse_hint` 为 HBM 命中 token 数与
+   `floor((prompt_len - 1) / page_size) * page_size` 的较小值，对齐真实 P 至少重算一个 token 的边界。
+   仅当缓存节点压力差大于
    `--affinity-load-gap`（默认 1024），且压力倍数大于 `--affinity-load-factor`（默认 2）时换到其他 P。
 
-查询受 health timeout 约束；旧 Worker、不支持前缀复用的 cache、超时或查询失败按无命中处理，
-不会仅因缓存查询失败退役健康 Worker。查询后重新做最终准入；缓存提示不保证之后仍然命中。
-当前查询的是各 P 的本地 GPU 前缀，未实现全局 KV 索引、远端 DRAM/SSD 成本模型或跨 Worker 拉取前缀。
-也未新增 SGLang 的 session affinity、SLO 偏好、多模型版本分组和自动发现。
+索引绑定 Worker 每次启动的 `instance_id`，使用有序页增删日志和分页快照同步；真实缓存淘汰、
+重启、退役、同步中断、日志缺口和容量上限均有失效处理。旧 Worker、无 Radix 或过期索引按无命中处理，
+回退负载选路；仅索引同步失败不会退役推理 Worker。查询后仍做最终准入，P 执行时仍匹配并锁定真实 Radix。
+页面哈希只描述各 P 本地 HBM，不含 CPU KV 池、共享 Store 或跨 Worker KV 拉取。
+哈希域纳入模型指纹、布局版本、dtype、页大小和静态 namespace，但未新增多模型部署分组、session/SLO 或自动发现。
+参数及一致性边界见[页面哈希链索引](prefix_index.md)。P 的选路命中值不会作为 D 的 `reserve` 前缀。
 
 ## 5. D reserve 与实际页分配
 
@@ -135,6 +139,5 @@ P 排队时 D 的预留继续占用；实际 `busy` 仍可能发生，不能用�
 ```
 
 `pd_route` JSON 日志包含 request_id、prefill_id、decode_id、bucket、角色策略、attempt 和 event。
-CPU 回归入口为 `tests/integration/test_pd_policy.py`，并已加入 `tools/pd/test_phase2.sh`。
-测试覆盖负载、准入、Bucket 回退、缓存查询、两种数据路径的参考 token、batch>1 和取消归还。
-这些测试不能代替真实 GPU/RDMA 的重叠与性能验收。
+既有 CPU 回归入口为 `tests/integration/test_pd_policy.py`，已加入 `tools/pd/test_phase2.sh`。
+其历史结果不涵盖本次页面哈希索引与后台同步；本轮按要求未新增或运行测试，只做源码审查、Python 编译和差异检查。

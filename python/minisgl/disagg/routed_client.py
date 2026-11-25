@@ -13,6 +13,7 @@ from .client import (
     stream_reserved,
 )
 from .control import StartRequest
+from .prefix_hash import PreparedPrefix, prepare_prefix
 from .router import NoHealthyWorker, WorkerPool
 from .routing_policy import PolicyRouter
 
@@ -55,6 +56,8 @@ class RoutedPDClient(PDClient):
             max_requests=max_inflight_requests + 16,
         )
         self.router = PolicyRouter(self.pool, routing_seed, routing_config)
+        if hasattr(self.pool, "configure_prefix_index"):
+            self.pool.configure_prefix_index(self.router.config)
         self.ready_timeout = ready_timeout
         self.active_lock = threading.Lock()
         self.active_routes = {}
@@ -65,49 +68,29 @@ class RoutedPDClient(PDClient):
     def close(self):
         self.pool.close()
 
-    def _prefix_matches(self, request, bucket, cancel):
+    def prefix_spec(self):
+        if not getattr(self.pool, "prefix_enabled", False):
+            return None
+        return self.pool.prefix_index.spec_for(self.pool.healthy("prefill"))
+
+    def _prefix_matches(self, request, bucket, cancel, prepared_prefix=None):
         if (bucket.prefill.policy or self.router.config.policy) != "cache_aware":
             return {}
 
-        def query(node):
-            if node.health.get("routing_version") != 1:
-                return 0
-            channel = None
-            try:
-                channel = self.pool.connect(node).open(str(uuid4()), cancel)
-                channel.send(
-                    {"op": "prefix_match", "prompt_ids": list(request.prompt_ids)},
-                    timeout=self.pool.health_timeout,
-                )
-                reply = channel.receive(timeout=self.pool.health_timeout)
-                matched = reply.get("matched_tokens")
-                if (
-                    reply.get("status") != "prefix_match"
-                    or type(matched) is not int
-                    or not 0 <= matched < len(request.prompt_ids)
-                ):
-                    return 0
-                return matched
-            except InterruptedError:
-                raise
-            except (OSError, RuntimeError, ValueError):
-                # Hints are optional. A busy GPU owner must not retire a healthy Worker.
-                return 0
-            finally:
-                if channel is not None:
-                    channel.close()
-
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError("request cancelled")
+        if prepared_prefix is None or not hasattr(self.pool, "prefix_index"):
+            return {}  # Cold/incompatible directories use the ordinary load policy.
         nodes = self.router.candidates("prefill", request, bucket)
-        futures = [(n, self.pool.probes.submit(query, n)) for n in nodes]
-        return {node.worker_id: future.result() for node, future in futures}
+        return self.pool.prefix_index.hits(nodes, prepared_prefix)
 
-    def _route_and_reserve(self, request, cancel):
+    def _route_and_reserve(self, request, cancel, prepared_prefix=None):
         last_error = None
         attempted_decode = set()
         for bucket in self.router.buckets_for(request):
             prefill = None
             try:
-                hits = self._prefix_matches(request, bucket, cancel)
+                hits = self._prefix_matches(request, bucket, cancel, prepared_prefix)
                 prefill = self.router.acquire_prefill(
                     request=request, bucket=bucket, prefix_hits=hits
                 )
@@ -173,7 +156,8 @@ class RoutedPDClient(PDClient):
                 raise
         raise last_error or NoHealthyWorker("no decode reservation succeeded")
 
-    def _stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None):
+    def _stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
+                prepared_prefix=None):
         request_id = request_id or str(uuid4())
         with self.active_lock:
             if request_id in self.active_routes:
@@ -181,25 +165,40 @@ class RoutedPDClient(PDClient):
             self.active_routes[request_id] = None
         try:
             yield from self._stream_bound(
-                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id
+                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id,
+                prepared_prefix=prepared_prefix,
             )
         finally:
             with self.active_lock:
                 self.active_routes.pop(request_id, None)
 
     def _stream_bound(
-        self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None
+        self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
+        prepared_prefix=None,
     ):
         self.start()
         request = StartRequest(
             request_id or str(uuid4()), 0, tuple(prompt_ids), max_tokens, ignore_eos
         )
+        if prepared_prefix is not None and (
+            not isinstance(prepared_prefix, PreparedPrefix)
+            or prepared_prefix.token_ids != request.prompt_ids
+        ):
+            raise ValueError("prepared prefix does not belong to these tokens")
+        spec = self.prefix_spec()
+        if spec is not None and (
+            prepared_prefix is None or prepared_prefix.domain_id != spec.domain_id
+        ):
+            # CLI/Token-ID callers run here on their ordinary blocking client thread.
+            prepared_prefix = prepare_prefix(request.prompt_ids, spec)
         if cancel is not None and cancel.is_set():
             raise InterruptedError("request cancelled")
         p = d = None
         held_prefill = held_decode = None
         try:
-            prefill, decode, d, ready, bucket = self._route_and_reserve(request, cancel)
+            prefill, decode, d, ready, bucket = self._route_and_reserve(
+                request, cancel, prepared_prefix
+            )
             held_prefill, held_decode = prefill, decode
             with self.active_lock:
                 self.active_routes[request.transfer_id] = (prefill.worker_id, decode.worker_id)

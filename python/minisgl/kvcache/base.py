@@ -65,6 +65,9 @@ class MatchResult(NamedTuple):
 
 
 class BasePrefixCache(ABC):
+    def publish_handle(self, handle: BaseCacheHandle) -> None:
+        """Optional routing metadata after CacheManager commits a valid prefix."""
+
     def peek_prefix_len(self, input_ids: torch.Tensor) -> int:
         """Read-only routing hint. Caches without prefix reuse return zero."""
         return 0

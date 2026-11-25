@@ -86,6 +86,14 @@ def serve_multiplex(service, sock, channel, handshake, stopping):
                     channel.send(envelope(request_id, service.capabilities(), terminal=True))
                     retire(request_id)
                     continue
+                if message.get("op") == "prefix_sync":
+                    try:
+                        reply = service.prefix_sync(message)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        reply = {"status": "error", "code": "failed", "error": str(exc)}
+                    channel.send(envelope(request_id, reply, terminal=True))
+                    retire(request_id)
+                    continue
                 if message.get("op") == "cancel":
                     continue
                 if len(sessions) >= service.queue_limit:

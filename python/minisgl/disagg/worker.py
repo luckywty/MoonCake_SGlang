@@ -112,6 +112,9 @@ class PDWorkerScheduler(Scheduler):
         self._owned_req = None
         self._allocated_len = 0
         self.pd_service_config = {
+            "cache_namespace": getattr(config, "pd_cache_namespace", "default"),
+            "prefix_max_pages": getattr(config, "pd_prefix_max_pages", 65536),
+            "prefix_event_limit": getattr(config, "pd_prefix_event_limit", 32768),
             "decode_radix_cache": self.decode_radix_cache,
             "max_queued_requests": getattr(config, "pd_max_queued_requests", 128),
             "max_queued_tokens": getattr(config, "pd_max_queued_tokens", None),

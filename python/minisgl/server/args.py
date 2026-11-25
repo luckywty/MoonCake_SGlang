@@ -38,6 +38,9 @@ class ServerArgs(SchedulerConfig):
     worker_id: str = ""
     pd_mooncake_port: int | None = None
     disaggregation_decode_enable_radix_cache: bool = False
+    pd_cache_namespace: str = "default"
+    pd_prefix_max_pages: int = 65536
+    pd_prefix_event_limit: int = 32768
 
     @property
     def share_tokenizer(self) -> bool:
@@ -95,6 +98,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Worker role. Split roles expose the P/D control protocol on --host/--port.",
     )
     parser.add_argument("--pd-timeout", type=float, default=ServerArgs.pd_timeout)
+    parser.add_argument("--pd-cache-namespace", default=ServerArgs.pd_cache_namespace)
+    parser.add_argument("--pd-prefix-max-pages", type=int, default=ServerArgs.pd_prefix_max_pages)
+    parser.add_argument("--pd-prefix-event-limit", type=int, default=ServerArgs.pd_prefix_event_limit)
     parser.add_argument("--pd-data-port", type=int, default=None)
     parser.add_argument("--pd-advertise-host", default=None)
     parser.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
@@ -293,6 +299,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    if not 1 <= len(kwargs["pd_cache_namespace"].encode("utf-8")) <= 1024:
+        parser.error("--pd-cache-namespace must contain 1..1024 UTF-8 bytes")
+    if kwargs["pd_prefix_max_pages"] < 1 or kwargs["pd_prefix_event_limit"] < 1:
+        parser.error("prefix metadata limits must be positive")
     if (
         kwargs["disaggregation_decode_enable_radix_cache"]
         and kwargs["worker_role"] != WorkerRole.DECODE.value
