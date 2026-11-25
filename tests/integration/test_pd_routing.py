@@ -5,6 +5,7 @@ import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import asdict
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -25,7 +26,7 @@ from test_pd_control_loop import MemoryChannel, MemoryListener, readable
 
 
 @contextmanager
-def running_cluster(monkeypatch, mode="layered", seed=12, routing_config=None):
+def running_cluster(monkeypatch, mode="layered", seed=12, routing_config=None, dram_config=None):
     services, backends, threads, errors = [], [], [], []
     stop, fabric = threading.Event(), MockFabric()
     counts, frames = {}, []
@@ -35,6 +36,8 @@ def running_cluster(monkeypatch, mode="layered", seed=12, routing_config=None):
             scheduler = cpu_scheduler(role, max_running_req=8, prefill_budget=32)
             scheduler.worker_id = f"{role[0]}-{index % 2}"
             scheduler.pd_service_config = {"batch_wait_ms": 15}
+            if dram_config is not None:
+                scheduler.pd_service_config["dram"] = asdict(dram_config)
             scheduler.engine.delay = 0.005
             if mode == "layered":
                 backend = CpuLayeredBackend(

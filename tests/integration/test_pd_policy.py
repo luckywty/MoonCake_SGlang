@@ -42,6 +42,8 @@ def pool():
                 "status": "ready",
                 "role": node.role,
                 "multiplex_version": 1,
+                "handoff_version": 2,
+                "decode_prefix_reuse": True,
                 "layered_transfer": False,
                 "layout": {"page_size": 4},
                 "num_pages": 32,
@@ -291,35 +293,23 @@ def test_busy_decode_bucket_falls_back_before_prefill_and_refunds_reservations(m
             services[2].s.cache_manager._free(held)
 
 
-def test_prefix_query_runs_on_gpu_owner_without_reserving_a_model_row(monkeypatch):
+def test_cold_cache_directory_routes_without_live_prefix_queries(monkeypatch):
     config = RoutingConfig(policy="cache_aware", cache_min_tokens=1)
-    with running_cluster(monkeypatch, routing_config=config) as (client, services, _, _):
-        source = services[1]
+    with running_cluster(monkeypatch, routing_config=config) as (client, services, _, frames):
         seen = []
 
         def peek(ids):
             seen.append(threading.current_thread().ident)
-            assert not source.contexts  # Query occurs before D reserve and P start.
-            assert source.s.table_manager.available_size == 8
-            return len(ids)
+            return 0
 
-        monkeypatch.setattr(source.s.cache_manager.prefix_cache, "peek_prefix_len", peek)
-        # Start-time measurement may occur after context creation, so restore after the query.
-        original_start = source._start
-
-        def start(*args):
-            monkeypatch.setattr(
-                source.s.cache_manager.prefix_cache, "peek_prefix_len", lambda ids: 0
-            )
-            return original_start(*args)
-
-        monkeypatch.setattr(source, "_start", start)
+        for source in services[:2]:
+            monkeypatch.setattr(source.s.cache_manager.prefix_cache, "peek_prefix_len", peek)
         assert client.generate((1, 2, 3, 4), 5, ignore_eos=True) == reference_tokens(
             (1, 2, 3, 4), 5
         )
         assert seen and all(t != threading.current_thread().ident for t in seen)
-        assert services[0].stats["max_prefill_batch"] == 0
-        assert source.stats["max_prefill_batch"] > 0
+        assert not any("prefix_match" in json.dumps(frame) for frame in frames)
+        assert sum(s.stats["max_prefill_batch"] for s in services[:2]) == 1
         assert not client.router.inflight
 
 

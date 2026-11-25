@@ -62,6 +62,13 @@ def validate_split_config(config) -> None:
 class PDWorkerScheduler(Scheduler):
     def __init__(self, config):
         validate_split_config(config)
+        from .dram_protocol import DramConfig
+
+        dram = getattr(config, "pd_dram", DramConfig())
+        if dram.enabled:
+            config = replace(
+                config, pd_dram_staging_pages=2 * dram.staging_slots * dram.batch_pages
+            )
         self.decode_radix_cache = bool(
             getattr(config, "disaggregation_decode_enable_radix_cache", False)
         )
@@ -112,6 +119,7 @@ class PDWorkerScheduler(Scheduler):
         self._owned_req = None
         self._allocated_len = 0
         self.pd_service_config = {
+            "dram": asdict(dram),
             "cache_namespace": getattr(config, "pd_cache_namespace", "default"),
             "prefix_max_pages": getattr(config, "pd_prefix_max_pages", 65536),
             "prefix_event_limit": getattr(config, "pd_prefix_event_limit", 32768),

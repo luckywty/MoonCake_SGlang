@@ -1,5 +1,8 @@
 # P 本地 HBM 页面哈希链索引
 
+本文描述兼容保留的 v1 HBM 索引。启用本地 DRAM 后，还同步支持 P/D HBM/DRAM 的 v2 目录，
+并支持单源 D→P 拉取和介质成本折算，见 [DRAM KV 缓存](dram_cache.md)。
+
 `--routing-policy cache_aware` 使用 Router 的页面哈希镜像比较候选 P 的本地 HBM 前缀。
 Worker 内的 token IDs Radix 树继续管理实际 KV 页；页面哈希索引只提供选路 Hint。
 本次不引入 CPU KV 缓存、HiCache、Decode offload、Mooncake Store 或 D→P KV 拉取。

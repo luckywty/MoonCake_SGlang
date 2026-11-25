@@ -4,16 +4,20 @@
 保留 Unified 推理引擎，扩展 **Prefill/Decode（P/D）分离**，并接入 Mooncake Transfer Engine。
 当前支持多 P/D Worker 负载与缓存感知路由、多请求组批、逐层 KV 传输与后续 Prefill 计算重叠，
 以及可选的 D GPU Radix 前缀复用、按请求取消和资源回收。
+新增 P/D 本地 Pinned DRAM KV 缓存、单源 D→P 按需拉取和跨 P/D 的三级缓存感知选路。
 Python 包名和命令入口仍为 `minisgl`。
 
 新增 **P 本地 HBM 页面哈希链索引**：`cache_aware` 通过后台同步的页元数据选路，
 替代逐请求向候选 P 查询 Radix 的 RPC；实际执行仍由 Worker Radix 匹配并锁定。
 页面身份使用带模型、布局与 namespace 的 SHA-256 链，分词及请求哈希移入独立 CPU 进程。
 使用方法与一致性边界见[页面哈希索引](docs/pd/prefix_index.md)。
+启用 DRAM 后进一步使用 v2 HBM/DRAM 镜像，设计、配置与验收边界见 [DRAM KV 缓存](docs/pd/dram_cache.md)。
 
-> **当前版本（2026-11-25）**：P 缓存亲和改用真实 HBM 页的哈希链元数据镜像，增加实例/序号同步、容量与过期处理。
+> **当前版本（2026-11-26）**：新增默认关闭的本地 DRAM 缓存和 D→P 反向提升，支持 LRU/LFU、异步 D2H/H2D、短租约和失败重算。
 > D Radix 仍默认关闭；P→D 后缀始终取决于 D reserve 的真实前缀，单端点及 Routed 客户端继续先向 D 预留资源。
-> 本次仅完成代码审查、Python 编译与差异检查，未新增或运行测试。此前组批、逐层传输和路由的 CPU/TCP 记录不代表本次功能已验收。
+> 已新增并运行 CPU attention 续算、受控 RDMA、拷贝 reader、缓存提交和索引一致性测试；CUDA/RDMA 实机验证仍待完成。
+> 远端拉取需配套构建 `../Mooncake` 的 reader fence API；本机 CMake 配置受缺失开发依赖阻止。旧 binding 可继续使用本地 DRAM。
+> 配套原生改动随仓库保存在 [Mooncake 补丁](patches/mooncake/README.md)，含准确基线和应用步骤。
 > 真实 GPU/RDMA 正确性、双服务器运行、实际重叠比例与性能收益尚未验收。下文部署命令是配置模板。
 
 ## 相对官方 mini-sglang 的变化
@@ -44,9 +48,9 @@ Python 包名和命令入口仍为 `minisgl`。
 当前 split 模式限制为 **TP=1、greedy、真实 safetensors 权重、未量化 MHA KV、eager 执行**。
 每个 Worker 支持多个请求，由单个 GPU 调度主循环组 batch；关闭 CUDA Graph 和原有 CPU/GPU 调度重叠。
 Mooncake 的逐层计算/通信重叠是独立机制；多节点使用显式地址池，尚未提供自动发现或请求故障迁移。
-当前接入的是 **Mooncake Transfer Engine**；缓存亲和查询 Router 中的各 P 本地 HBM 页元数据镜像，尚无共享 Store 或 DRAM/SSD 分层 KV 缓存。
+当前接入的是 **Mooncake Transfer Engine**；可选 P/D 本地 DRAM 池，缓存亲和读取 Router 的 HBM/DRAM 元数据镜像，尚无共享 Store 或 SSD 层。
 TCP 路径的 CPU 接收区用于传输暂存，不是 Mooncake 论文中的 L2/L3 缓存池；session/SLO 选路和 Decode retract 尚未移植。
-P/D 缓存独立管理，尚无 D→P 的 KV 回传或拉取；后续 prompt 包含历史回答时，P 未命中的这部分 KV 需要重算。
+P/D 各自管理 DRAM 副本；后续请求优先复用 P 本地缓存，也可按门槛从单个健康 D 的 DRAM 拉取，缺失或失败部分由 P 重算。
 
 模型源码包含 Llama、Qwen2、Qwen3、Qwen3MoE 和 Mistral；这些模型尚未全部通过新的
 P/D/RDMA 验收。上游性能结果也不代表本项目逐层传输版本的性能。
@@ -149,8 +153,9 @@ Tensor 和 ticket 必须保留，无法安全回收时后端要求 Worker 退役
 安装完成后才发布 prompt；并发相同前缀在所选 D 内重绑到已有缓存页，归还重复私有页。
 取消/失败保留已发布的有效前缀，只回收请求私有部分并解除锁；未被引用的缓存可按容量淘汰。
 
-这些 KV 位于所选 D 的 GPU HBM，不涉及 HiCache、Decode offload 或共享存储；不自动迁移到其他 D 或回传 P。
-P 的 Prefill 起点仍由 P 自己的缓存决定，D 命中只减少本次传输和 D 页分配，不能消除 P 对历史回答的缺失 KV 重算。
+该开关只控制 D GPU HBM Radix；[DRAM 缓存](docs/pd/dram_cache.md)由独立参数启用。
+即使 D GPU Radix 关闭，D 仍可将新算 KV 所在的完整页异步保存到 DRAM，再在 reader 完成后归还所有请求 GPU 页。
+启用 D GPU Radix 时，reserve 也可恢复本地 DRAM 连续前缀；P 的计算起点仍以其实际锁定和恢复结果为准。
 handoff/metadata v2 中 `kv_tokens` 表示待传后缀，层组票据为 v3；客户端、P、D 须配套升级，健康池会拒绝不兼容的旧 Worker。
 参见 [D Radix Cache 实现说明](docs/pd/decode_radix_cache.md)。
 

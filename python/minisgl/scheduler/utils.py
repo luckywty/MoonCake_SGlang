@@ -17,6 +17,8 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    # A split P may already own a row and a private, restored KV prefix.
+    prepared_prefix: object | None = None
 
     @property
     def input_len(self) -> int:

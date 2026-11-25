@@ -37,6 +37,29 @@ def test_local_gpu_identity_and_all_ports_are_isolated():
     assert [env["CUDA_VISIBLE_DEVICES"] for _, env in commands] == [s.gpu for s in plan]
 
 
+def test_host_cache_uses_separate_fixed_native_ports():
+    args = arguments("--pd-transfer-backend", "mooncake", "--base-dram-port", "25000")
+    args.dram_remote_enabled = True
+    specs = local_plan(args, ["0", "1"])
+    occupied = set()
+    for spec in specs:
+        ports = {
+            spec.control_port,
+            spec.control_port + 1,
+            spec.mooncake_port,
+            spec.data_port,
+            spec.dram_port,
+        }
+        assert len(ports) == 5 and not occupied.intersection(ports)
+        occupied.update(ports)
+        command, env = launcher.worker_command(spec, args, ["--pd-dram-remote-pull"])
+        assert command[command.index("--pd-dram-port") + 1] == str(spec.dram_port)
+        assert env["MC_MIN_RPC_PORT"] == str(spec.mooncake_port)
+    args.base_dram_port = specs[0].control_port
+    with pytest.raises(ValueError, match="overlaps"):
+        local_plan(args, ["0", "1"])
+
+
 @pytest.mark.parametrize(
     "flags,visible",
     [
@@ -147,6 +170,8 @@ def test_seeded_router_draws_from_current_healthy_candidates_only():
                     "status": "ready",
                     "role": node.role,
                     "multiplex_version": 1,
+                    "handoff_version": 2,
+                    "decode_prefix_reuse": True,
                     "layered_transfer": False,
                     "layout": {},
                 },

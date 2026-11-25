@@ -156,9 +156,12 @@ class Engine:
             * config.model_config.num_layers
         )
         num_pages = config.num_page_override
-        reserve = config.pd_transfer_reserve_bytes
-        if type(reserve) is not int or reserve < 0:
-            raise ValueError("pd_transfer_reserve_bytes must be a nonnegative integer")
+        for name in ("pd_transfer_reserve_bytes", "pd_dram_staging_pages"):
+            if type(getattr(config, name)) is not int or getattr(config, name) < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        reserve = config.pd_transfer_reserve_bytes + config.pd_dram_staging_pages * (
+            cache_per_page + config.page_size * 8
+        )
         if reserve:
             # Reserve against the same post-model budget as the KV pool. Count
             # its dummy page too; the reserve is subtracted exactly once.
@@ -177,7 +180,7 @@ class Engine:
                 )
             if num_pages <= 1:
                 raise ValueError("not enough GPU memory for KV cache and P/D transfer reserve")
-            logger.info(f"Reserving {mem_GB(reserve)} for direct P/D GPU transfer buffers")
+            logger.info(f"Reserving {mem_GB(reserve)} for P/D transfer and DRAM staging buffers")
         elif num_pages is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory

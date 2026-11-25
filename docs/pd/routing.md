@@ -105,7 +105,9 @@ KV 压力不计可淘汰的 Radix 前缀；实际分配仍可能为新请求淘�
 索引绑定 Worker 每次启动的 `instance_id`，使用有序页增删日志和分页快照同步；真实缓存淘汰、
 重启、退役、同步中断、日志缺口和容量上限均有失效处理。旧 Worker、无 Radix 或过期索引按无命中处理，
 回退负载选路；仅索引同步失败不会退役推理 Worker。查询后仍做最终准入，P 执行时仍匹配并锁定真实 Radix。
-页面哈希只描述各 P 本地 HBM，不含 CPU KV 池、共享 Store 或跨 Worker KV 拉取。
+以上为 v1 HBM 索引行为。启用 [P/D DRAM 缓存](dram_cache.md)后，v2 目录进一步匹配 P HBM → P DRAM → 单个 D DRAM，
+balanced 在上述公式中加上介质恢复成本折算的等效 prefill tokens；同长度优先成本更低的候选。
+远端受最少 token、最大字节量与收益门槛限制，仍无共享 Store。
 哈希域纳入模型指纹、布局版本、dtype、页大小和静态 namespace，但未新增多模型部署分组、session/SLO 或自动发现。
 参数及一致性边界见[页面哈希链索引](prefix_index.md)。P 的选路命中值不会作为 D 的 `reserve` 前缀。
 

@@ -68,8 +68,13 @@ class MHAKVCache(BaseKVCachePool):
 
     @torch.inference_mode()
     def export_layers_into(
-        self, destination: torch.Tensor, slots: torch.Tensor, start: int, end: int,
-        *, num_pool_pages: int,
+        self,
+        destination: torch.Tensor,
+        slots: torch.Tensor,
+        start: int,
+        end: int,
+        *,
+        num_pool_pages: int,
     ) -> None:
         """Gather into a preallocated layer-major staging slot, without a KV temporary.
 
@@ -83,9 +88,13 @@ class MHAKVCache(BaseKVCachePool):
         heads, dim = self._storage_shape[1:]
         shape = (end - start, 2, len(slots), heads, dim)
         nbytes = (end - start) * 2 * len(slots) * heads * dim * self.dtype.itemsize
-        if (destination.device != self.device or destination.dtype != torch.uint8
-                or destination.ndim != 1 or not destination.is_contiguous()
-                or destination.numel() != nbytes):
+        if (
+            destination.device != self.device
+            or destination.dtype != torch.uint8
+            or destination.ndim != 1
+            or not destination.is_contiguous()
+            or destination.numel() != nbytes
+        ):
             raise ValueError("incorrect layer staging region")
         typed = destination.view(self.dtype).view(shape)
         for i, layer in enumerate(range(start, end)):
@@ -101,16 +110,21 @@ class MHAKVCache(BaseKVCachePool):
         heads, dim = self._storage_shape[1:]
         shape = (self.num_layers, 2, len(slots), heads, dim)
         expected = 2 * self.num_layers * len(slots) * heads * dim * self.dtype.itemsize
-        if (packed.device != self.device or packed.dtype != torch.uint8
-                or packed.ndim != 1 or not packed.is_contiguous() or packed.numel() != expected):
+        if (
+            packed.device != self.device
+            or packed.dtype != torch.uint8
+            or packed.ndim != 1
+            or not packed.is_contiguous()
+            or packed.numel() != expected
+        ):
             raise ValueError("incorrect layered receive region")
         typed = packed.view(self.dtype).view(shape)
         for layer in range(self.num_layers):
             self._kv_buffer[:, layer].flatten(1, 2).index_copy_(1, indices, typed[layer])
 
     def _transfer_indices(self, slots: torch.Tensor, num_pool_pages: int) -> torch.Tensor:
-        ''' 验证传入的 KV Cache Slot 索引是否合法，避免访问非法显存位置、重复 Slot 或不支持的数据格式。
-            将 Slot 索引转换为 GPU 上的 torch.int64 Tensor，供后续 KV Cache 数据读取或写入使用。'''
+        """验证传入的 KV Cache Slot 索引是否合法，避免访问非法显存位置、重复 Slot 或不支持的数据格式。
+        将 Slot 索引转换为 GPU 上的 torch.int64 Tensor，供后续 KV Cache 数据读取或写入使用。"""
         if sys.byteorder != "little" or self.dtype not in (
             torch.float16,
             torch.bfloat16,
@@ -134,6 +148,44 @@ class MHAKVCache(BaseKVCachePool):
         ):
             raise ValueError("duplicate or out-of-pool KV slot")
         return slots.to(device=self.device, dtype=torch.int64)
+
+    @torch.inference_mode()
+    def export_page_into(self, destination: torch.Tensor, indices: torch.Tensor) -> None:
+        """Trusted scheduler-owned slots -> preallocated [layer,K/V,token,head,dim]."""
+        heads, dim = self._storage_shape[1:]
+        shape = (self.num_layers, 2, len(indices), heads, dim)
+        if (
+            destination.device != self.device
+            or destination.dtype != torch.uint8
+            or destination.numel()
+            != self.num_layers * 2 * len(indices) * heads * dim * self.dtype.itemsize
+            or indices.dtype != torch.int64
+            or indices.device != self.device
+        ):
+            raise ValueError("invalid preallocated host-cache export")
+        typed = destination.view(self.dtype).view(shape)
+        for layer in range(self.num_layers):
+            torch.index_select(
+                self._kv_buffer[:, layer].flatten(1, 2), 1, indices, out=typed[layer]
+            )
+
+    @torch.inference_mode()
+    def import_page_from(self, source: torch.Tensor, indices: torch.Tensor) -> None:
+        """Preallocated layer-major page -> private, scheduler-owned GPU slots."""
+        heads, dim = self._storage_shape[1:]
+        shape = (self.num_layers, 2, len(indices), heads, dim)
+        if (
+            source.device != self.device
+            or source.dtype != torch.uint8
+            or source.numel()
+            != self.num_layers * 2 * len(indices) * heads * dim * self.dtype.itemsize
+            or indices.dtype != torch.int64
+            or indices.device != self.device
+        ):
+            raise ValueError("invalid preallocated host-cache import")
+        typed = source.view(self.dtype).view(shape)
+        for layer in range(self.num_layers):
+            self._kv_buffer[:, layer].flatten(1, 2).index_copy_(1, indices, typed[layer])
 
     @torch.inference_mode()
     def export_tensor(self, slots: torch.Tensor, *, num_pool_pages: int) -> torch.Tensor:
@@ -179,7 +231,7 @@ class MHAKVCache(BaseKVCachePool):
 
     @torch.inference_mode()
     def export_tokens(self, slots: torch.Tensor, *, num_pool_pages: int) -> bytes:
-        '''它只提取 slots 指定的有效 token，不导出整个 KV 池。 返回字节串之前，GPU→CPU 复制已经完成。'''
+        """它只提取 slots 指定的有效 token，不导出整个 KV 池。 返回字节串之前，GPU→CPU 复制已经完成。"""
         """Pack valid tokens as [K/V, layer, logical token, local head, head dim]. Blocks for D2H."""
         packed = self.export_tensor(slots, num_pool_pages=num_pool_pages).cpu()
         return packed.view(torch.uint8).numpy().tobytes()
@@ -188,7 +240,7 @@ class MHAKVCache(BaseKVCachePool):
     def import_tokens(
         self, payload: bytes | bytearray, slots: torch.Tensor, *, num_pool_pages: int
     ) -> None:
-        '''将 Decode Worker CPU 内存中的 KV Cache 数据复制到 GPU 显存，并写入 GPU KV Cache 中指定的物理 Slot。'''
+        """将 Decode Worker CPU 内存中的 KV Cache 数据复制到 GPU 显存，并写入 GPU KV Cache 中指定的物理 Slot。"""
         "实现 D 端 KV 安装"
         """Scatter packed bytes to receiver-owned slots on the current stream."""
         indices = self._transfer_indices(slots, num_pool_pages)

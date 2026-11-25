@@ -1,0 +1,2 @@
+# Blank context lines in a unified diff contain a significant leading space.
+patches/mooncake/*.patch -whitespace

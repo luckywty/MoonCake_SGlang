@@ -66,6 +66,7 @@ class WorkerSpec:
     data_port: int
     numa_node: int | None = None
     rdma_device: str = ""
+    dram_port: int | None = None
 
     @property
     def endpoint(self):
@@ -110,8 +111,15 @@ def local_plan(args, visible_gpus):
             if args.pd_transfer_backend == "mooncake":
                 validate_mooncake_port(te)
             occupied = {control, control + 1, te, te + 1}
+            dram_port = None
+            if getattr(args, "dram_remote_enabled", False):
+                dram_port = getattr(args, "base_dram_port", 25000) + index
+                validate_mooncake_port(dram_port)
+                if dram_port in occupied:
+                    raise ValueError("DRAM TE port overlaps another Worker port")
+                occupied.add(dram_port)
             if (
-                len(occupied) != 4
+                len(occupied) != (5 if dram_port is not None else 4)
                 or ports.intersection(occupied)
                 or any(not 0 < p < 65536 for p in occupied)
             ):
@@ -126,6 +134,8 @@ def local_plan(args, visible_gpus):
             if any(not token or "/" in token for token in hca.split(",")) and hca:
                 raise ValueError("invalid HCA mapping")
             specs.append(
-                WorkerSpec(f"{role[0]}-{i}", role, gpu, host, control, te, te + 1, node, hca)
+                WorkerSpec(
+                    f"{role[0]}-{i}", role, gpu, host, control, te, te + 1, node, hca, dram_port
+                )
             )
     return specs

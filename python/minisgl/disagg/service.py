@@ -25,11 +25,12 @@ from minisgl.scheduler.prefill import ChunkedReq
 from minisgl.scheduler.utils import PendingReq
 
 from .control import CancelledError, Channel, StartRequest
+from .dram_service import DramServiceMixin
 from .layered_protocol import LayeredReceiveTicket
 from .layered_sender import BatchTransferEntry, BatchTransferPlan
-from .protocol import HANDOFF_VERSION, KVTransferMetadata, ReceiveTicket, RequestHandoff
 from .prefix_events import PrefixPublisher
 from .prefix_hash import PREFIX_INDEX_VERSION, PrefixHashSpec
+from .protocol import HANDOFF_VERSION, KVTransferMetadata, ReceiveTicket, RequestHandoff
 from .role import WorkerRole
 from .transfer import TransferBackendUnavailable, TransferCapacityError
 
@@ -76,6 +77,14 @@ class RequestContext:
     index: int = 1
     success: bool = False
     release_requested: bool = False
+    dram: object = None
+    remote_plan: object = None
+    restore_task: object = None
+    restore_kind: str | None = None
+    restore_ready_len: int = 0
+    pull_future: object = None
+    pull_job: object = None
+    drain_complete: bool = True
     enqueued_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -83,7 +92,7 @@ class RequestContext:
         return len(self.request.prompt_ids) - self.decode_prefix_len
 
 
-class WorkerService:
+class WorkerService(DramServiceMixin):
     def __init__(self, scheduler, backend, timeout):
         self.s, self.backend, self.timeout = scheduler, backend, timeout
         config = getattr(scheduler, "pd_service_config", {})
@@ -106,11 +115,15 @@ class WorkerService:
         cache = scheduler.cache_manager.prefix_cache
         if self.is_prefill and hasattr(cache, "page_observer"):
             spec = PrefixHashSpec.from_layout(asdict(scheduler.layout), self.cache_namespace)
-            if not (spec.page_size == scheduler.cache_manager.page_size
-                    == scheduler.engine.kv_cache.page_size):
+            if not (
+                spec.page_size
+                == scheduler.cache_manager.page_size
+                == scheduler.engine.kv_cache.page_size
+            ):
                 raise ValueError("prefix hash and MHA KV page sizes differ")
             self.prefix_publisher = PrefixPublisher(
-                spec, self.instance_id,
+                spec,
+                self.instance_id,
                 min(scheduler.engine.num_pages, config.get("prefix_max_pages", 65536)),
                 config.get("prefix_event_limit", 32768),
             )
@@ -133,6 +146,7 @@ class WorkerService:
         }
         self.prefill_ms_per_token = None
         self.snapshot = {}
+        self._init_dram(config)
         self._update_snapshot()
 
     def submit(self, session, message):
@@ -205,6 +219,7 @@ class WorkerService:
             "handoff_version": HANDOFF_VERSION,
             "decode_prefix_reuse": True,
             "prefix_index_version": PREFIX_INDEX_VERSION if self.prefix_publisher else None,
+            "dram_cache_version": 1 if self.dram_pool is not None else None,
         }
 
     def health(self):
@@ -218,6 +233,8 @@ class WorkerService:
             "multiplex_version": 1,
             "transfer": native,
             "prefix_index": self.prefix_publisher.health() if self.prefix_publisher else None,
+            "tier_index": self.tier_publisher.health() if self.tier_publisher else None,
+            "dram_cache": self._dram_health(),
         }
 
     def prefix_sync(self, message):
@@ -296,6 +313,8 @@ class WorkerService:
             "prompt_tokens": len(ctx.request.prompt_ids),
             "handoff_version": HANDOFF_VERSION,
         }
+        if self.dram_pool is not None:
+            reply["dram_cache_version"] = 1
         if status == "ready":
             reply["ticket"] = json.loads(ctx.ticket.to_wire()) if ctx.ticket is not None else None
         return reply
@@ -306,10 +325,16 @@ class WorkerService:
             allowed = {"op", "request", "ticket"} if self.layered else {"op", "request"}
             if "decode_prefix_len" in message:
                 allowed.add("decode_prefix_len")
+            allowed.update(k for k in ("cache_transaction", "remote_pull_plan") if k in message)
             if set(message) != allowed:
                 raise ValueError("prefill requires the worker's transfer protocol")
             request = StartRequest.from_object(message["request"])
-        elif op == "reserve" and not self.is_prefill and set(message) == {"op", "request"}:
+        elif (
+            op == "reserve"
+            and not self.is_prefill
+            and set(message) <= {"op", "request", "cache_transaction"}
+            and "request" in message
+        ):
             request = StartRequest.from_object(message["request"])
         elif (
             op == "decode"
@@ -374,6 +399,8 @@ class WorkerService:
                 )
             elif self.layered and message["ticket"] is not None:
                 raise ValueError("a full decode cache hit must not expose a receive ticket")
+            if self._begin_dram_request(ctx, message):
+                return
             self.s.prefill_manager.pending_list.append(
                 PendingReq(
                     ctx.uid,
@@ -382,32 +409,40 @@ class WorkerService:
                 )
             )
         else:
+            self._begin_dram_request(ctx, message)
             # Legacy post-prefill TCP handoffs already contain a full payload;
             # only the reserve-first protocol may promise a reusable prefix.
             self._reserve_pages(ctx, reuse_prefix=op != "decode")
-            self._check_transfer_size(ctx)
-            if self.layered and ctx.transfer_tokens:
-                ctx.ticket = self.backend.reserve_layers(
-                    request, self.s.eos_token_id, prefix_len=ctx.decode_prefix_len
-                )
-            elif not self.layered:
-                # Host payloads are admission-bounded too, independently of KV pages.
-                size = ctx.transfer_tokens * self.s.layout.bytes_per_token
-                if size:
-                    self._check_host_budget(size)
-                    ctx.staging = bytearray(size)
-                if op == "reserve":
-                    if ctx.decode_prefix_len:
-                        self.stats["decode_cache_hit_requests"] += 1
-                        self.stats["decode_cache_hit_tokens"] += ctx.decode_prefix_len
-                    session.emit(self._reservation_reply(ctx, "reserved"))
-                    return
-                ctx.handoff = handoff
-                ctx.ticket = self.backend.prepare_receive(handoff.kv, self.s.layout, ctx.staging)
-            if ctx.decode_prefix_len:
-                self.stats["decode_cache_hit_requests"] += 1
-                self.stats["decode_cache_hit_tokens"] += ctx.decode_prefix_len
-            session.emit(self._reservation_reply(ctx, "ready"))
+            if op == "reserve" and self._dram_decode_restore(ctx):
+                return
+            self._complete_reserve(ctx, legacy_handoff=handoff if op == "decode" else None)
+
+    def _complete_reserve(self, ctx, *, legacy_handoff=None):
+        request, session = ctx.request, ctx.session
+        ctx.phase = "reserved"
+        self._check_transfer_size(ctx)
+        if self.layered and ctx.transfer_tokens:
+            ctx.ticket = self.backend.reserve_layers(
+                request, self.s.eos_token_id, prefix_len=ctx.decode_prefix_len
+            )
+        elif not self.layered:
+            # Host payloads are admission-bounded too, independently of KV pages.
+            size = ctx.transfer_tokens * self.s.layout.bytes_per_token
+            if size:
+                self._check_host_budget(size)
+                ctx.staging = bytearray(size)
+            if legacy_handoff is None:
+                if ctx.decode_prefix_len:
+                    self.stats["decode_cache_hit_requests"] += 1
+                    self.stats["decode_cache_hit_tokens"] += ctx.decode_prefix_len
+                session.emit(self._reservation_reply(ctx, "reserved"))
+                return
+            ctx.handoff = legacy_handoff
+            ctx.ticket = self.backend.prepare_receive(legacy_handoff.kv, self.s.layout, ctx.staging)
+        if ctx.decode_prefix_len:
+            self.stats["decode_cache_hit_requests"] += 1
+            self.stats["decode_cache_hit_tokens"] += ctx.decode_prefix_len
+        session.emit(self._reservation_reply(ctx, "ready"))
 
     def _check_transfer_size(self, ctx):
         limit = getattr(self.backend, "max_transfer_bytes", 1024**3)
@@ -440,6 +475,15 @@ class WorkerService:
             raise ValueError("incompatible model, layout, or decode handoff")
 
     def _command(self, session, message):
+        if message.get("op") in (
+            "tier_sync",
+            "cache_commit",
+            "cache_abort",
+            "dram_pin",
+            "dram_unpin",
+        ):
+            session.emit(self._dram_rpc(message), final=True)
+            return
         ctx = self.contexts.get(session)
         if ctx is None:
             if session.done.is_set() or session.cancelled.is_set():
@@ -465,13 +509,17 @@ class WorkerService:
             ctx.handoff = RequestHandoff.from_wire(json.dumps(message["handoff"]).encode())
             self._validate_handoff(ctx.request, ctx.handoff, prefix_len=ctx.decode_prefix_len)
             if ctx.transfer_tokens:
-                ctx.ticket = self.backend.prepare_receive(ctx.handoff.kv, self.s.layout, ctx.staging)
+                ctx.ticket = self.backend.prepare_receive(
+                    ctx.handoff.kv, self.s.layout, ctx.staging
+                )
             session.emit(self._reservation_reply(ctx, "ready"))
             return
         if op in ("cancel", "release") and message == {
             "op": op,
             "transfer_id": ctx.request.transfer_id,
         }:
+            if ctx.session.done.is_set() and ctx.success:
+                return
             session.cancelled.set()
             if op == "release":
                 ctx.release_requested = True
@@ -507,7 +555,9 @@ class WorkerService:
 
     def _free_pages(self, ctx):
         if ctx.req is None:
-            return
+            return True
+        if not self._dram_can_free(ctx):
+            return False
         try:
             self.s.decode_manager.remove_req(ctx.req)
             if ctx.success and (self.is_prefill or self.decode_radix_cache):
@@ -520,19 +570,28 @@ class WorkerService:
                 "split worker could not release its request resources"
             ) from exc
         ctx.req = None
+        return True
 
     def _remove(self, ctx, *, complete=True):
-        self._free_pages(ctx)
+        if not self._free_pages(ctx):
+            ctx.phase = "draining"
+            ctx.drain_complete = complete
+            return False
         ctx.staging = None
+        if self.dram_pool is not None:
+            self.dram_pool.end(ctx.request.transfer_id)
         if complete:
             ctx.session.done.set()
         self.contexts.pop(ctx.session, None)
         self.by_uid.pop(ctx.uid, None)
+        return True
 
     def _cancel(self, ctx):
         self.s.prefill_manager.abort_req(ctx.uid)
         if ctx.req is not None:
             self.s.decode_manager.remove_req(ctx.req)
+        if not self._dram_can_free(ctx):
+            return
         if ctx.job is not None:
             ctx.job.seal(cancel=True)
             if not ctx.job.sources_done.is_set():
@@ -581,6 +640,9 @@ class WorkerService:
             ctx = self.by_uid[req.uid]
             ctx.req = req
             ctx.allocated = max(ctx.allocated, req.cache_handle.cached_len)
+            if self.is_prefill and ctx.dram is not None and not ctx.dram.started:
+                ctx.dram.cursor = req.cached_len
+                ctx.dram.started = True
         s.engine.graph_runner.pad_batch(batch)
         s.cache_manager.allocate_paged(batch.reqs)
         for req in batch.reqs:
@@ -621,7 +683,9 @@ class WorkerService:
                     if self.by_uid[r.uid].job is not None
                 ]
                 if entries:
-                    s.engine.kv_cache.layer_ready = BatchTransferPlan(self.backend, entries).layer_ready
+                    s.engine.kv_cache.layer_ready = BatchTransferPlan(
+                        self.backend, entries
+                    ).layer_ready
             try:
                 output = s._forward(prepared)
             finally:
@@ -649,6 +713,7 @@ class WorkerService:
         for i, req in enumerate(batch.reqs):
             s.decode_manager.remove_req(req)
             if isinstance(req, ChunkedReq):
+                self._stage_dram_live(self.by_uid[req.uid])
                 continue
             ctx = self.by_uid[req.uid]
             try:
@@ -681,6 +746,7 @@ class WorkerService:
             meta,
         )
         ctx.success = True
+        self._stage_dram_live(ctx)
         ctx.phase = "handoff"
         ctx.session.emit({"status": "handoff", "handoff": json.loads(ctx.handoff.to_wire())})
         if not ctx.transfer_tokens:
@@ -768,8 +834,11 @@ class WorkerService:
             ) from exc
 
     def _progress(self):
+        self._dram_progress()
         for ctx in list(self.contexts.values()):
             try:
+                if ctx.phase == "draining":
+                    continue
                 if ctx.session.cancelled.is_set():
                     self._cancel(ctx)
                     continue
@@ -830,6 +899,7 @@ class WorkerService:
             for i, req in enumerate(batch.reqs):
                 ctx = self.by_uid[req.uid]
                 req.append_host(output.next_tokens_cpu[i : i + 1])
+                self._stage_dram_live(ctx)
                 token = int(output.next_tokens_cpu[i])
                 finished = not req.can_decode or (
                     not ctx.request.ignore_eos and token == self.s.eos_token_id
@@ -844,6 +914,7 @@ class WorkerService:
                 ctx.index += 1
                 if finished:
                     ctx.success = True
+                    self.s.decode_manager.remove_req(req)
                     self._remove(ctx, complete=False)
                 ctx.session.emit(message, final=finished)
         except TransferBackendUnavailable:
@@ -886,6 +957,10 @@ class WorkerService:
         self.io.shutdown(wait=False, cancel_futures=True)
         if self.contexts:
             raise TransferBackendUnavailable("request consumers did not stop before shutdown")
+        if self.dram_transfer is not None:
+            self.dram_transfer.close()
+        if self.dram_controller is not None:
+            self.dram_controller.close()
 
     def run(self, listener, stop=None):
         stopping = threading.Event()
@@ -914,8 +989,19 @@ class WorkerService:
                     if message == {"op": "health"}:
                         channel.send(self.health())
                         return
-                    if message.get("op") == "prefix_sync":
-                        channel.send(self.prefix_sync(message))
+                    if message.get("op") in (
+                        "prefix_sync",
+                        "tier_sync",
+                        "cache_commit",
+                        "cache_abort",
+                        "dram_pin",
+                        "dram_unpin",
+                    ):
+                        channel.send(
+                            self.prefix_sync(message)
+                            if message["op"] == "prefix_sync"
+                            else self._dram_rpc(message)
+                        )
                         return
                     self.submit(session, message)
                     while not stopping.is_set():
@@ -937,7 +1023,8 @@ class WorkerService:
             except (OSError, RuntimeError, ValueError):
                 pass
             finally:
-                session.cancelled.set()
+                if not session.done.is_set():
+                    session.cancelled.set()
                 with lock:
                     sockets.discard(sock)
                 slots.release()

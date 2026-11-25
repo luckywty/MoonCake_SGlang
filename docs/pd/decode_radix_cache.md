@@ -1,7 +1,8 @@
 # D 本地 GPU Radix Cache
 
 本功能控制 Decode Worker 是否跨请求保留、匹配和共享 GPU KV 前缀。
-默认关闭；不包含 HiCache、Decode offload、D→P 回传或跨 D 缓存迁移。
+默认关闭；该开关仅控制 GPU Radix。独立的 [P/D DRAM 缓存](dram_cache.md)支持异步卸载和 D→P 按需拉取，
+即使 GPU Radix 关闭也可启用；结束时须等 D2H reader 完成才归还 GPU 页。
 P 和 Unified 沿用原有缓存配置。
 
 ## 配置

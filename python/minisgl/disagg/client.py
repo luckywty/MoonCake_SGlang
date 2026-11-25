@@ -6,8 +6,9 @@ import argparse
 import json
 import math
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from threading import Event
+from threading import BoundedSemaphore, Event
 from uuid import uuid4
 
 from .admission import AdmissionBudget, AdmissionError
@@ -75,7 +76,17 @@ def reservation_prefix(message, request, *, layered):
     return prefix
 
 
-def stream_reserved(request, p, d, ready, *, layered, on_prefill_done=None):
+def stream_reserved(
+    request,
+    p,
+    d,
+    ready,
+    *,
+    layered,
+    on_prefill_done=None,
+    cache_transaction=False,
+    remote_pull_plan=None,
+):
     """Common reserve-first handshake for direct sockets and routed channels."""
     prefix = reservation_prefix(ready, request, layered=layered)
     transfer_tokens = len(request.prompt_ids) - prefix
@@ -90,6 +101,10 @@ def stream_reserved(request, p, d, ready, *, layered, on_prefill_done=None):
     }
     if layered:
         start["ticket"] = ready["ticket"]
+    if cache_transaction:
+        start["cache_transaction"] = True
+        if remote_pull_plan is not None:
+            start["remote_pull_plan"] = remote_pull_plan.to_object()
     try:
         p.send(start)
         wire = response(p, "handoff")["handoff"]
@@ -188,9 +203,55 @@ class PDClient:
         self.decode = decode
         self.timeout = timeout
         self.admission = AdmissionBudget(max_inflight_requests, max_inflight_tokens)
+        self.cache_finalizers = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="pd-cache-finalize"
+        )
+        self.cache_finalize_slots = BoundedSemaphore(2 * max_inflight_requests)
 
-    def stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
-               prepared_prefix=None):
+    def close(self):
+        self.cache_finalizers.shutdown(wait=True, cancel_futures=False)
+
+    def _cache_rpc(self, endpoint, message):
+        with socket.create_connection(endpoint_address(endpoint), timeout=0.2) as sock:
+            channel = Channel(sock, 0.2)
+            channel.send(message)
+            return channel.receive()
+
+    def _cache_finalize(self, endpoints, transfer_id, success):
+        if not endpoints or not self.cache_finalize_slots.acquire(blocking=False):
+            return
+
+        def finish():
+            try:
+                for endpoint in endpoints:
+                    try:
+                        self._cache_rpc(
+                            endpoint,
+                            {
+                                "op": "cache_commit" if success else "cache_abort",
+                                "transfer_id": transfer_id,
+                            },
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        pass  # Pending transactions expire; inference already has its result.
+            finally:
+                self.cache_finalize_slots.release()
+
+        try:
+            self.cache_finalizers.submit(finish)
+        except RuntimeError:
+            self.cache_finalize_slots.release()
+
+    def stream(
+        self,
+        prompt_ids,
+        max_tokens,
+        *,
+        ignore_eos=False,
+        cancel=None,
+        request_id=None,
+        prepared_prefix=None,
+    ):
         # Validate before acquiring a shared budget. Each admitted stream owns
         # its own sockets; only accounting updates hold the condition lock.
         request_id = str(uuid4()) if request_id is None else request_id
@@ -198,7 +259,11 @@ class PDClient:
         with self.admission.reserve(len(prompt_ids) + max_tokens, self.timeout, cancel):
             metadata = {} if prepared_prefix is None else {"prepared_prefix": prepared_prefix}
             yield from self._stream(
-                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id,
+                prompt_ids,
+                max_tokens,
+                ignore_eos=ignore_eos,
+                cancel=cancel,
+                request_id=request_id,
                 **metadata,
             )
 
@@ -218,6 +283,8 @@ class PDClient:
         )
         with ExitStack() as connections:
             channels = []
+            cache_endpoints = []
+            completed = False
 
             # 连接的起点是运行 PDClient 的进程所在机器，分别连接到 P、D Worker
             def connect(endpoint):
@@ -237,6 +304,9 @@ class PDClient:
                 p = connect(self.prefill)  # 与prefillWorker建立连接
                 p.send({"op": "capabilities"})
                 capabilities = response(p, "capabilities")
+                cache_prefill = capabilities.get("dram_cache_version") == 1
+                if cache_prefill:
+                    cache_endpoints.append(self.prefill)
                 layered = capabilities.get("layered_transfer")
                 if (
                     type(layered) is not bool
@@ -249,16 +319,30 @@ class PDClient:
                 d = connect(self.decode)
                 d.send({"op": "capabilities"})
                 decode_caps = response(d, "capabilities")
+                cache_decode = decode_caps.get("dram_cache_version") == 1
+                if cache_decode:
+                    cache_endpoints.append(self.decode)
                 if (
                     decode_caps.get("layered_transfer") is not layered
                     or decode_caps.get("handoff_version") != HANDOFF_VERSION
                     or decode_caps.get("decode_prefix_reuse") is not True
                 ):
                     raise ValueError("incompatible Decode protocol or transfer mode")
-                d.send({"op": "reserve", "request": request.to_object()})
+                reserve = {"op": "reserve", "request": request.to_object()}
+                if cache_decode:
+                    reserve["cache_transaction"] = True
+                d.send(reserve)
                 ready = response(d, "ready" if layered else "reserved")
-                yield from stream_reserved(request, p, d, ready, layered=layered)
+                yield from stream_reserved(
+                    request, p, d, ready, layered=layered, cache_transaction=cache_prefill
+                )
+                completed = True
             finally:
+                self._cache_finalize(
+                    cache_endpoints,
+                    request.transfer_id,
+                    completed and (cancel is None or not cancel.is_set()),
+                )
                 # Explicit cancellation also covers closing a generator directly
                 # after its first token. Socket closure remains the fallback.
                 for channel in channels:
@@ -271,13 +355,23 @@ class PDClient:
 
     # 这个 generate() 是 stream() 的非流式封装：把逐个产生的 token 编号收集成列表，等生成结束后一次性返回。
     def generate(
-        self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
+        self,
+        prompt_ids,
+        max_tokens,
+        *,
+        ignore_eos=False,
+        cancel=None,
+        request_id=None,
         prepared_prefix=None,
     ) -> list[int]:
         metadata = {} if prepared_prefix is None else {"prepared_prefix": prepared_prefix}
         return list(
             self.stream(
-                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id,
+                prompt_ids,
+                max_tokens,
+                ignore_eos=ignore_eos,
+                cancel=cancel,
+                request_id=request_id,
                 **metadata,
             )
         )

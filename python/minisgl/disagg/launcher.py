@@ -24,6 +24,7 @@ CLUSTER_FLAGS = {
     "--decode-gpus",
     "--base-control-port",
     "--base-mooncake-port",
+    "--base-dram-port",
     "--prefill-addrs",
     "--decode-addrs",
     "--routing-seed",
@@ -50,6 +51,7 @@ def parser():
     p.add_argument("--decode-rdma-devices", nargs="+")
     p.add_argument("--base-control-port", type=int, default=1919)
     p.add_argument("--base-mooncake-port", type=int, default=19500)
+    p.add_argument("--base-dram-port", type=int, default=25000)
     p.add_argument("--worker-host", default="127.0.0.1")
     p.add_argument("--worker-advertise-host", default=None)
     p.add_argument("--pd-mooncake-host", default=None)
@@ -108,6 +110,10 @@ def worker_command(spec, args, worker_args):
     ]
     if spec.role == "decode" and getattr(args, "disaggregation_decode_enable_radix_cache", False):
         command.append("--disaggregation-decode-enable-radix-cache")
+    if spec.dram_port is not None:
+        command += ["--pd-dram-port", str(spec.dram_port)]
+        if spec.rdma_device:
+            command += ["--pd-dram-rdma-device", spec.rdma_device]
     if args.pd_transfer_backend == "mooncake":
         command += [
             "--pd-mooncake-host",
@@ -261,6 +267,7 @@ class ClusterSupervisor:
 def main(argv=None):
     p = parser()
     args, worker_args = p.parse_known_args(argv)
+    args.dram_remote_enabled = "--pd-dram-remote-pull" in worker_args
     try:
         routing = policy_config(args)
         for value in (
@@ -307,6 +314,7 @@ def main(argv=None):
                 "--worker-id",
                 "--pd-data-port",
                 "--pd-mooncake-port",
+                "--pd-dram-port",
                 "--pd-advertise-host",
             }
             if any(arg.split("=", 1)[0] in blocked for arg in worker_args):

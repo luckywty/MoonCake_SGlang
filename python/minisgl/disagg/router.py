@@ -15,8 +15,9 @@ from uuid import uuid4
 from .client import RemoteCapacityError
 from .control import endpoint_address
 from .multiplex import MUX_VERSION, WorkerConnection
-from .protocol import HANDOFF_VERSION
 from .prefix_index import PrefixIndex
+from .protocol import HANDOFF_VERSION
+from .tier_index import TierIndex
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class WorkerPool:
         self.closed = False
         self.expected_identity = None
         self.prefix_index = PrefixIndex()
+        self.tier_index = TierIndex()
         self.prefix_enabled = False
         self.prefix_sync_interval = 0.2
         self.prefix_thread = None
@@ -103,9 +105,37 @@ class WorkerPool:
         )
         self.prefix_sync_interval = config.prefix_sync_interval
         self.prefix_index = PrefixIndex(
-            config.prefix_index_max_entries, config.prefix_index_max_worker_entries,
+            config.prefix_index_max_entries,
+            config.prefix_index_max_worker_entries,
             config.prefix_index_max_age,
         )
+        self.tier_index = TierIndex(
+            config.prefix_index_max_entries,
+            config.prefix_index_max_worker_entries,
+            config.prefix_index_max_age,
+        )
+
+    def _sync_tier(self, node):
+        for _ in range(16):
+            if self.stop.is_set() or not node.healthy:
+                return
+            task = self.tier_index.request(node.worker_id)
+            if task is None:
+                return
+            state, message = task
+            channel = None
+            try:
+                channel = self.connect(node).open(str(uuid4()), self.stop)
+                channel.send(message, timeout=self.health_timeout)
+                reply = channel.receive(timeout=self.health_timeout)
+                if not self.tier_index.apply(node.worker_id, state, reply):
+                    return
+            except (OSError, RuntimeError, TypeError, ValueError):
+                self.tier_index.failed(node.worker_id, state)
+                return
+            finally:
+                if channel is not None:
+                    channel.close()
 
     def _sync_prefix(self, node):
         with node.prefix_sync_lock:
@@ -138,8 +168,15 @@ class WorkerPool:
     def _prefix_monitor(self):
         while not self.stop.is_set():
             try:
-                futures = [self.prefix_probes.submit(self._sync_prefix, node)
-                           for node in self.healthy("prefill")]
+                futures = [
+                    self.prefix_probes.submit(self._sync_prefix, node)
+                    for node in self.healthy("prefill")
+                ]
+                futures.extend(
+                    self.prefix_probes.submit(self._sync_tier, node)
+                    for role in ("prefill", "decode")
+                    for node in self.healthy(role)
+                )
                 for future in futures:
                     future.result()
             except Exception:
@@ -193,6 +230,7 @@ class WorkerPool:
             node.healthy = False
             node.reason = str(reason)
             self.prefix_index.forget(node.worker_id)
+            self.tier_index.forget(node.worker_id)
 
     def apply_health(self, node, health):
         transfer = health.get("transfer", {})
@@ -234,6 +272,7 @@ class WorkerPool:
             instance = health.get("instance_id")
             if instance != node.instance_id:
                 self.prefix_index.forget(node.worker_id)
+                self.tier_index.forget(node.worker_id)
                 node.instance_id = instance
             node.health = health
             node.load_updated_at = time.monotonic()
@@ -243,8 +282,10 @@ class WorkerPool:
             )
             if valid and self.prefix_enabled:
                 self.prefix_index.observe(node.worker_id, health)
+                self.tier_index.observe(node.worker_id, health)
             else:
                 self.prefix_index.forget(node.worker_id)
+                self.tier_index.forget(node.worker_id)
 
     def probe(self, node):
         # A late probe cannot roll a newly discovered instance back to an old one.
@@ -298,6 +339,7 @@ class WorkerPool:
                         node.healthy = False
                         node.reason = "P/D model layouts or transfer modes differ"
                         self.prefix_index.forget(node.worker_id)
+                        self.tier_index.forget(node.worker_id)
 
     def start(self, ready_timeout=30.0, *, require_all=False):
         if not math.isfinite(ready_timeout) or ready_timeout <= 0:
@@ -363,6 +405,7 @@ class WorkerPool:
                 if node.connection is not None:
                     node.connection.close()
             self.prefix_index.forget(node.worker_id)
+            self.tier_index.forget(node.worker_id)
         self.closed = True
 
 

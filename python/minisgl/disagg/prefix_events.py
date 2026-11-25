@@ -40,6 +40,7 @@ class PrefixPublisher:
         self.events = deque(maxlen=event_limit)
         self.snapshots = OrderedDict()
         self.seq = 0
+        self.event_sink = None
         self.enabled = True
         self.error = None
         self.lock = threading.RLock()
@@ -47,10 +48,15 @@ class PrefixPublisher:
     def health(self):
         with self.lock:
             return {
-                "version": PREFIX_INDEX_VERSION, "enabled": self.enabled,
-                "instance_id": self.instance_id, "domain_id": self.spec.domain_id,
-                "manifest": self.spec.manifest, "seq": self.seq,
-                "pages": len(self.records), "max_pages": self.max_pages, "reason": self.error,
+                "version": PREFIX_INDEX_VERSION,
+                "enabled": self.enabled,
+                "instance_id": self.instance_id,
+                "domain_id": self.spec.domain_id,
+                "manifest": self.spec.manifest,
+                "seq": self.seq,
+                "pages": len(self.records),
+                "max_pages": self.max_pages,
+                "reason": self.error,
                 "event_count": len(self.events),
                 "oldest_seq": self.events[0]["seq"] if self.events else self.seq + 1,
             }
@@ -58,6 +64,11 @@ class PrefixPublisher:
     def _emit(self, op, record=None):
         self.seq += 1
         self.events.append({"seq": self.seq, "op": op, "page": record.wire() if record else None})
+        if self.event_sink is not None:
+            try:
+                self.event_sink(op, record)
+            except Exception:
+                self.event_sink = None
 
     def disable(self, reason):
         with self.lock:
@@ -118,15 +129,17 @@ class PrefixPublisher:
                 return
             for node in reversed(nodes):
                 count = node.length // page
-                if (node.prefix_end_digest is not None
-                        and len(self.by_node.get(node.uuid, ())) == count):
+                if (
+                    node.prefix_end_digest is not None
+                    and len(self.by_node.get(node.uuid, ())) == count
+                ):
                     parent = node.prefix_end_digest
                     depth += count
                     continue
                 # Tokens are CPU metadata; do not copy KV or physical indices from HBM.
                 tokens = node._key.tolist()
                 for offset in range(0, count * page, page):
-                    digest = hash_page(parent, tokens[offset:offset + page], page)
+                    digest = hash_page(parent, tokens[offset : offset + page], page)
                     depth += 1
                     self._add(PageRecord(digest, parent, depth, node.uuid))
                     parent = digest
@@ -143,7 +156,9 @@ class PrefixPublisher:
                 if record.depth <= boundary_depth:
                     self.by_node[child.uuid].remove(key)
                     self.by_node.setdefault(new_parent.uuid, set()).add(key)
-                    self.records[key] = PageRecord(key, record.parent, record.depth, new_parent.uuid)
+                    self.records[key] = PageRecord(
+                        key, record.parent, record.depth, new_parent.uuid
+                    )
             if child.uuid in self.by_node and not self.by_node[child.uuid]:
                 del self.by_node[child.uuid]
             if child.prefix_end_digest is not None:
@@ -154,13 +169,15 @@ class PrefixPublisher:
                 tokens = new_parent._key.tolist()
                 page = self.spec.page_size
                 for offset in range(0, len(tokens), page):
-                    parent = hash_page(parent, tokens[offset:offset + page], page)
+                    parent = hash_page(parent, tokens[offset : offset + page], page)
                 new_parent.prefix_end_digest = parent
 
     def remove_node(self, node_id):
         with self.lock:
             # Eviction removes a real radix leaf; remove its pages tail first.
-            keys = sorted(self.by_node.get(node_id, ()), key=lambda k: self.records[k].depth, reverse=True)
+            keys = sorted(
+                self.by_node.get(node_id, ()), key=lambda k: self.records[k].depth, reverse=True
+            )
             for key in keys:
                 if self.children.get(key):
                     raise RuntimeError("evicted radix leaf still has exported descendants")
@@ -190,8 +207,14 @@ class PrefixPublisher:
                     if offset:
                         raise ValueError("initial snapshot offset must be zero")
                     oldest = self.events[0]["seq"] if self.events else self.seq + 1
-                    snapshot_id = next((key for key, (seq, _, _) in reversed(self.snapshots.items())
-                                        if seq >= oldest - 1), None)
+                    snapshot_id = next(
+                        (
+                            key
+                            for key, (seq, _, _) in reversed(self.snapshots.items())
+                            if seq >= oldest - 1
+                        ),
+                        None,
+                    )
                     if snapshot_id is None:
                         snapshot_id = str(uuid4())
                         # Frozen CPU records can be shared by independent Routers.
@@ -206,16 +229,29 @@ class PrefixPublisher:
                 seq, _, records = snapshot
                 if offset > len(records):
                     raise ValueError("snapshot offset exceeds record count")
-                chunk = records[offset:offset + SYNC_PAGES]
+                chunk = records[offset : offset + SYNC_PAGES]
                 end = offset + len(chunk)
                 complete = end == len(records)
-                return {**base, "status": "prefix_snapshot", "seq": seq,
-                        "snapshot_id": snapshot_id, "offset": offset, "next_offset": end,
-                        "complete": complete, "pages": [r.wire() for r in chunk]}
+                return {
+                    **base,
+                    "status": "prefix_snapshot",
+                    "seq": seq,
+                    "snapshot_id": snapshot_id,
+                    "offset": offset,
+                    "next_offset": end,
+                    "complete": complete,
+                    "pages": [r.wire() for r in chunk],
+                }
             if after > self.seq or (self.events and after < self.events[0]["seq"] - 1):
                 return {**base, "status": "prefix_reset"}
             start = max(0, after + 1 - self.events[0]["seq"]) if self.events else 0
             events = list(islice(self.events, start, start + SYNC_EVENTS))
             end = events[-1]["seq"] if events else after
-            return {**base, "status": "prefix_events", "seq": end,
-                    "head_seq": self.seq, "events": events, "more": end < self.seq}
+            return {
+                **base,
+                "status": "prefix_events",
+                "seq": end,
+                "head_seq": self.seq,
+                "events": events,
+                "more": end < self.seq,
+            }

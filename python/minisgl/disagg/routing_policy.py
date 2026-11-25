@@ -143,13 +143,31 @@ class RoutingConfig:
     prefix_index_max_worker_entries: int = 65536
     prefix_index_max_age: float = 6.0
     prefix_sync_interval: float = 0.2
+    min_remote_pull_tokens: int = 1024
+    dram_h2d_gbps: float = 12.0
+    dram_rdma_gbps: float = 10.0
+    dram_prefill_ms_per_token: float = 0.01
+    dram_max_pull_bytes: int = 64 * 1024**2
 
     def __post_init__(self):
-        if any(type(value) is not int or value < 1 for value in (
-            self.prefix_index_max_entries, self.prefix_index_max_worker_entries
-        )) or any(not math.isfinite(value) or value <= 0 for value in (
-            self.prefix_index_max_age, self.prefix_sync_interval
-        )):
+        if (
+            type(self.min_remote_pull_tokens) is not int
+            or self.min_remote_pull_tokens < 1
+            or type(self.dram_max_pull_bytes) is not int
+            or self.dram_max_pull_bytes < 1
+            or any(
+                not math.isfinite(v) or v <= 0
+                for v in (self.dram_h2d_gbps, self.dram_rdma_gbps, self.dram_prefill_ms_per_token)
+            )
+        ):
+            raise ValueError("invalid tier-aware routing costs")
+        if any(
+            type(value) is not int or value < 1
+            for value in (self.prefix_index_max_entries, self.prefix_index_max_worker_entries)
+        ) or any(
+            not math.isfinite(value) or value <= 0
+            for value in (self.prefix_index_max_age, self.prefix_sync_interval)
+        ):
             raise ValueError("prefix index bounds/intervals must be positive")
         if (
             self.policy not in POLICIES
@@ -320,7 +338,11 @@ class PolicyRouter:
             policy = bucket.prefill.policy or self.config.policy
             if policy != "cache_aware":
                 return self._pick(nodes, policy, "prefill", bucket, loads)
-            hits = prefix_hits or {}
+            detailed = prefix_hits or {}
+            hits = {key: getattr(value, "total", value) for key, value in detailed.items()}
+            restore_cost = {
+                key: getattr(value, "restore_cost_ms", 0) for key, value in detailed.items()
+            }
             owners = [
                 n
                 for n in nodes
@@ -333,7 +355,14 @@ class PolicyRouter:
             for node in owners[1:]:
                 if hits[node.worker_id] > hits[best.worker_id] or (
                     hits[node.worker_id] == hits[best.worker_id]
-                    and self._better(best, node, "prefill", loads) is node
+                    and (
+                        restore_cost.get(node.worker_id, 0) < restore_cost.get(best.worker_id, 0)
+                        or (
+                            restore_cost.get(node.worker_id, 0)
+                            == restore_cost.get(best.worker_id, 0)
+                            and self._better(best, node, "prefill", loads) is node
+                        )
+                    )
                 ):
                     best = node
             alternatives = [n for n in nodes if n is not best]
@@ -341,6 +370,7 @@ class PolicyRouter:
                 other = self._pick(alternatives, "power_of_two", "prefill", bucket, loads)
                 a, b = loads[best.worker_id], loads[other.worker_id]
                 if "pending_prefill_tokens" in a and "pending_prefill_tokens" in b:
+
                     def reusable(node):
                         # HBM may cover all prompt pages, but Prefill still samples logits.
                         page = node.health.get("layout", {}).get("page_size", 1)
@@ -351,11 +381,15 @@ class PolicyRouter:
                         a["pending_prefill_tokens"]
                         + len(request.prompt_ids)
                         - reusable(best)
+                        + restore_cost.get(best.worker_id, 0)
+                        / self.config.dram_prefill_ms_per_token
                     )
                     y = (
                         b["pending_prefill_tokens"]
                         + len(request.prompt_ids)
                         - reusable(other)
+                        + restore_cost.get(other.worker_id, 0)
+                        / self.config.dram_prefill_ms_per_token
                     )
                     if (
                         x - y > self.config.affinity_load_gap
@@ -437,6 +471,11 @@ def add_policy_args(parser):
     parser.add_argument("--prefix-index-max-worker-entries", type=int, default=65536)
     parser.add_argument("--prefix-index-max-age", type=float, default=6.0)
     parser.add_argument("--prefix-sync-interval", type=float, default=0.2)
+    parser.add_argument("--min-remote-pull-tokens", type=int, default=1024)
+    parser.add_argument("--dram-h2d-gbps", type=float, default=12.0)
+    parser.add_argument("--dram-rdma-gbps", type=float, default=10.0)
+    parser.add_argument("--dram-prefill-ms-per-token", type=float, default=0.01)
+    parser.add_argument("--dram-max-pull-bytes", type=int, default=64 * 1024**2)
     for name in (
         "max-worker-inflight-requests",
         "max-waiting-requests",
@@ -469,6 +508,11 @@ def policy_config(args):
         prefix_index_max_worker_entries=args.prefix_index_max_worker_entries,
         prefix_index_max_age=args.prefix_index_max_age,
         prefix_sync_interval=args.prefix_sync_interval,
+        min_remote_pull_tokens=args.min_remote_pull_tokens,
+        dram_h2d_gbps=args.dram_h2d_gbps,
+        dram_rdma_gbps=args.dram_rdma_gbps,
+        dram_prefill_ms_per_token=args.dram_prefill_ms_per_token,
+        dram_max_pull_bytes=args.dram_max_pull_bytes,
     )
 
 
@@ -487,6 +531,11 @@ def policy_cli_args(args):
         "prefix_index_max_worker_entries",
         "prefix_index_max_age",
         "prefix_sync_interval",
+        "min_remote_pull_tokens",
+        "dram_h2d_gbps",
+        "dram_rdma_gbps",
+        "dram_prefill_ms_per_token",
+        "dram_max_pull_bytes",
         "max_worker_inflight_requests",
         "max_waiting_requests",
         "max_pending_prefill_tokens",

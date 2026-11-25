@@ -86,9 +86,20 @@ def serve_multiplex(service, sock, channel, handshake, stopping):
                     channel.send(envelope(request_id, service.capabilities(), terminal=True))
                     retire(request_id)
                     continue
-                if message.get("op") == "prefix_sync":
+                if message.get("op") in (
+                    "prefix_sync",
+                    "tier_sync",
+                    "cache_commit",
+                    "cache_abort",
+                    "dram_pin",
+                    "dram_unpin",
+                ):
                     try:
-                        reply = service.prefix_sync(message)
+                        reply = (
+                            service.prefix_sync(message)
+                            if message["op"] == "prefix_sync"
+                            else service._dram_rpc(message)
+                        )
                     except (KeyError, TypeError, ValueError) as exc:
                         reply = {"status": "error", "code": "failed", "error": str(exc)}
                     channel.send(envelope(request_id, reply, terminal=True))

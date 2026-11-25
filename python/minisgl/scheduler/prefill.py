@@ -100,6 +100,17 @@ class PrefillAdder:
         if self.token_budget <= 0:
             return None
 
+        if pending_req.prepared_prefix is not None:
+            prepared = pending_req.prepared_prefix
+            needed = self._estimate(pending_req, prepared.cached_len)
+            if needed + self.reserved_size > self.cache_manager.available_size:
+                return None
+            req = self._add_one_req(
+                pending_req, prepared.cache_handle, prepared.table_idx, prepared.cached_len
+            )
+            pending_req.prepared_prefix = None
+            return req
+
         if chunked_req := pending_req.chunked_req:
             return self._add_one_req(
                 pending_req=pending_req,

@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
+from minisgl.disagg.dram_protocol import DramConfig, add_dram_args, pop_dram_config
 from minisgl.disagg.role import WorkerRole
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
@@ -41,6 +42,7 @@ class ServerArgs(SchedulerConfig):
     pd_cache_namespace: str = "default"
     pd_prefix_max_pages: int = 65536
     pd_prefix_event_limit: int = 32768
+    pd_dram: DramConfig = field(default_factory=DramConfig)
 
     @property
     def share_tokenizer(self) -> bool:
@@ -90,6 +92,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     from minisgl.moe import SUPPORTED_MOE_BACKENDS
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
+    add_dram_args(parser)
 
     parser.add_argument(
         "--worker-role",
@@ -100,7 +103,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument("--pd-timeout", type=float, default=ServerArgs.pd_timeout)
     parser.add_argument("--pd-cache-namespace", default=ServerArgs.pd_cache_namespace)
     parser.add_argument("--pd-prefix-max-pages", type=int, default=ServerArgs.pd_prefix_max_pages)
-    parser.add_argument("--pd-prefix-event-limit", type=int, default=ServerArgs.pd_prefix_event_limit)
+    parser.add_argument(
+        "--pd-prefix-event-limit", type=int, default=ServerArgs.pd_prefix_event_limit
+    )
     parser.add_argument("--pd-data-port", type=int, default=None)
     parser.add_argument("--pd-advertise-host", default=None)
     parser.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
@@ -299,6 +304,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    try:
+        kwargs["pd_dram"] = pop_dram_config(kwargs)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not 1 <= len(kwargs["pd_cache_namespace"].encode("utf-8")) <= 1024:
         parser.error("--pd-cache-namespace must contain 1..1024 UTF-8 bytes")
     if kwargs["pd_prefix_max_pages"] < 1 or kwargs["pd_prefix_event_limit"] < 1:

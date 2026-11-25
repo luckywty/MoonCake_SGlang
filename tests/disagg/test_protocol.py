@@ -75,7 +75,7 @@ class TestProtocol(unittest.TestCase):
         for change in (
             {"transfer_id": "attempt-0"},
             {"version": True},
-            {"version": 2},
+            {"version": 3},
             {"kv_tokens": 0},
             {"kv_tokens": 4.0},
             {"source_pages": (1,)},
@@ -123,11 +123,11 @@ class TestProtocol(unittest.TestCase):
                 RequestHandoff.from_wire(payload)
         for change in (
             {"extra_field": 0},
-            {"version": 2},
+            {"version": 3},
             {"prompt_ids": "12345"},
             {"ignore_eos": 1},
             {"kv": {**original["kv"], "source_pages": "73"}},
-            {"kv": {**original["kv"], "version": 2}},
+            {"kv": {**original["kv"], "version": 3}},
             {"kv": {**original["kv"], "layout": {}}},
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):

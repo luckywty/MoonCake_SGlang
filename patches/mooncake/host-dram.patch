@@ -1,0 +1,420 @@
+diff --git a/mooncake-integration/transfer_engine/transfer_engine_py.cpp b/mooncake-integration/transfer_engine/transfer_engine_py.cpp
+index 4350a30a5f98f5999f27020b72fd7ae9d82f8787..5c3cdfc130e48e9fc4f76adc6a3e23ee0fd28679 100644
+--- a/mooncake-integration/transfer_engine/transfer_engine_py.cpp
++++ b/mooncake-integration/transfer_engine/transfer_engine_py.cpp
+@@ -323,6 +323,18 @@ TransferEnginePy::TransferEnginePy() {
+     }
+ }
+ 
++int TransferEnginePy::fenceRemoteReaders() {
++    pybind11::gil_scoped_release release;
++    return engine_ ? engine_->fenceRemoteReaders() : -1;
++}
++
++bool TransferEnginePy::hasRemoteReaderFence() {
++    return engine_ && !engine_->isUsingTent() &&
++           engine_->getTransport("rdma") != nullptr &&
++           engine_->getTransport("tcp") == nullptr &&
++           engine_->getTransport("shm") == nullptr;
++}
++
+ TransferEnginePy::~TransferEnginePy() {
+     for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
+     handle_map_.clear();
+@@ -391,6 +403,24 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
+                                     const char* protocol,
+                                     const char* device_name,
+                                     const char* metadata_type) {
++    return initializeExtWithPort(
++        local_hostname, metadata_server, protocol, device_name, metadata_type, 0);
++}
++
++int TransferEnginePy::initializeWithRpcPort(
++    const char* local_hostname, const char* metadata_server,
++    const char* protocol, const char* device_name, uint16_t rpc_port) {
++    if (rpc_port == 0) return -1;
++    auto conn_string = parseConnectionString(metadata_server);
++    return initializeExtWithPort(
++        local_hostname, conn_string.second.c_str(), protocol, device_name,
++        conn_string.first.c_str(), rpc_port);
++}
++
++int TransferEnginePy::initializeExtWithPort(
++    const char* local_hostname, const char* metadata_server,
++    const char* protocol, const char* device_name, const char* metadata_type,
++    uint16_t rpc_port) {
+     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
+         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
+                    << "Use 'hip' instead.";
+@@ -433,6 +463,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
+     engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+ #endif
+ 
++    if (rpc_port && engine_->setFixedRpcPort(rpc_port) != 0) return -1;
+     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
+         auto hostname_port = parseHostNameWithPort(local_hostname);
+         int ret = engine_->init(conn_string, local_hostname,
+@@ -1912,7 +1943,14 @@ PYBIND11_MODULE(engine, m) {
+             .def(py::init<>())
+             .def("initialize", &TransferEnginePy::initialize)
+             .def("initialize_ext", &TransferEnginePy::initializeExt)
++            .def("initialize_with_rpc_port",
++                 &TransferEnginePy::initializeWithRpcPort)
+             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
++            .def("fence_remote_readers", &TransferEnginePy::fenceRemoteReaders,
++                 "Permanently fence passive readers on a dedicated "
++                 "receive-only RDMA engine")
++            .def("has_remote_reader_fence",
++                 &TransferEnginePy::hasRemoteReaderFence)
+             .def("allocate_managed_buffer",
+                  &TransferEnginePy::allocateManagedBuffer)
+             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
+diff --git a/mooncake-integration/transfer_engine/transfer_engine_py.h b/mooncake-integration/transfer_engine/transfer_engine_py.h
+index 49bccf5aba4c3c78cfc42917e1ff6bf6e0c3ee2d..150526b4dde8097c40dc24055c0f10e340fe90e3 100644
+--- a/mooncake-integration/transfer_engine/transfer_engine_py.h
++++ b/mooncake-integration/transfer_engine/transfer_engine_py.h
+@@ -73,8 +73,18 @@ class TransferEnginePy {
+     int initializeExt(const char *local_hostname, const char *metadata_server,
+                       const char *protocol, const char *device_name,
+                       const char *metadata_type);
++    int initializeWithRpcPort(const char *local_hostname,
++                              const char *metadata_server,
++                              const char *protocol, const char *device_name,
++                              uint16_t rpc_port);
++    int initializeExtWithPort(const char *local_hostname,
++                              const char *metadata_server,
++                              const char *protocol, const char *device_name,
++                              const char *metadata_type, uint16_t rpc_port);
+ 
+     int getRpcPort();
++    int fenceRemoteReaders();
++    bool hasRemoteReaderFence();
+ 
+     uintptr_t allocateManagedBuffer(size_t length);
+ 
+diff --git a/mooncake-transfer-engine/include/transfer_engine.h b/mooncake-transfer-engine/include/transfer_engine.h
+index d0a814b09437ca51185a7a0a722161695c2e2f6f..2284418ba4c232aeb6e2f0a42fc60a99aa19d635 100644
+--- a/mooncake-transfer-engine/include/transfer_engine.h
++++ b/mooncake-transfer-engine/include/transfer_engine.h
+@@ -134,6 +134,10 @@ class TransferEngine {
+     Transport* installTransport(const std::string& proto, void** args);
+ 
+     int uninstallTransport(const std::string& proto);
++    // Receive-only, dedicated RDMA engine; revocation is permanent until restart.
++    int fenceRemoteReaders();
++    // Before init(), without mutating the process-global RPC port range.
++    int setFixedRpcPort(uint16_t port);
+ 
+     std::string getLocalIpAndPort();
+ 
+diff --git a/mooncake-transfer-engine/include/transfer_engine_impl.h b/mooncake-transfer-engine/include/transfer_engine_impl.h
+index 926eaf3abd36cfcbae4bde2456f6bf0534d656bf..5cc66521f8e93bb75be69bdfc18e28c72ed6770d 100644
+--- a/mooncake-transfer-engine/include/transfer_engine_impl.h
++++ b/mooncake-transfer-engine/include/transfer_engine_impl.h
+@@ -120,6 +120,8 @@ class TransferEngineImpl {
+     Transport* installTransport(const std::string& proto, void** args);
+ 
+     int uninstallTransport(const std::string& proto);
++    int fenceRemoteReaders();
++    int setFixedRpcPort(uint16_t port);
+ 
+     std::string getLocalIpAndPort();
+ 
+@@ -502,6 +504,7 @@ class TransferEngineImpl {
+ 
+     std::shared_ptr<TransferMetadata> metadata_;
+     std::string local_server_name_;
++    uint16_t fixed_rpc_port_ = 0;
+     std::shared_ptr<MultiTransport> multi_transports_;
+     std::shared_mutex mutex_;
+     MemoryRegionMap local_memory_regions_;
+diff --git a/mooncake-transfer-engine/include/transfer_metadata_plugin.h b/mooncake-transfer-engine/include/transfer_metadata_plugin.h
+index dd87af766e6571f05981a0392fb81dd1e7350e44..aed9b2a8fa6073a4b8a7b38f788496bd7facde19 100644
+--- a/mooncake-transfer-engine/include/transfer_metadata_plugin.h
++++ b/mooncake-transfer-engine/include/transfer_metadata_plugin.h
+@@ -88,7 +88,8 @@ struct HandShakePlugin {
+ std::vector<std::string> findLocalIpAddresses();
+ 
+ uint16_t findAvailableTcpPort(int &sockfd, bool set_range = false);
++uint16_t findAvailableTcpPort(int &sockfd, bool set_range, uint16_t fixed_port);
+ 
+ }  // namespace mooncake
+ 
+-#endif  // TRANSFER_METADATA_PLUGIN
+\ No newline at end of file
++#endif  // TRANSFER_METADATA_PLUGIN
+diff --git a/mooncake-transfer-engine/include/transport/rdma_transport/rdma_context.h b/mooncake-transfer-engine/include/transport/rdma_transport/rdma_context.h
+index f5dc3c322aca566e7b33198c4b7fae04d74760eb..c9831cc1f04bb51218c75818b4bc4911b74880f0 100644
+--- a/mooncake-transfer-engine/include/transport/rdma_transport/rdma_context.h
++++ b/mooncake-transfer-engine/include/transport/rdma_transport/rdma_context.h
+@@ -147,6 +147,7 @@ class RdmaContext {
+     RdmaContext(RdmaTransport &engine, const std::string &device_name);
+ 
+     ~RdmaContext();
++    int fenceRemoteReaders();
+ 
+     int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
+                   uint8_t port = 1, int gid_index = -1, size_t max_cqe = 4096,
+diff --git a/mooncake-transfer-engine/include/transport/rdma_transport/rdma_transport.h b/mooncake-transfer-engine/include/transport/rdma_transport/rdma_transport.h
+index b8087864e9b479772168be845e610efaa2228ef6..26bdebe3458c411e3ad5481f0484b8a73e13476b 100644
+--- a/mooncake-transfer-engine/include/transport/rdma_transport/rdma_transport.h
++++ b/mooncake-transfer-engine/include/transport/rdma_transport/rdma_transport.h
+@@ -68,6 +68,7 @@ class RdmaTransport : public Transport {
+     const char *getName() const override { return "rdma"; }
+ 
+     bool supportsBatchCompletionCounter() const override { return true; }
++    int fenceRemoteReaders() override;
+ 
+     // Ordinary RDMA's native notification channel. Success means the SEND
+     // was posted locally, not that the remote application consumed it.
+@@ -229,6 +230,8 @@ class RdmaTransport : public Transport {
+ 
+    private:
+     std::vector<std::shared_ptr<RdmaContext>> context_list_;
++    std::mutex reader_fence_mutex_;
++    std::atomic<bool> readers_fenced_{false};
+     std::atomic<bool> notify_running_{false};
+     std::thread notify_worker_;
+ #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+diff --git a/mooncake-transfer-engine/include/transport/transport.h b/mooncake-transfer-engine/include/transport/transport.h
+index b170a956f224bfe997e795d1d705b90fdf0b3f6d..3f93e0d695542b03c497ab460af35af89be5a19f 100644
+--- a/mooncake-transfer-engine/include/transport/transport.h
++++ b/mooncake-transfer-engine/include/transport/transport.h
+@@ -775,6 +775,12 @@ class Transport {
+     // finished constructing its slices.
+     virtual bool supportsBatchCompletionCounter() const { return false; }
+ 
++    // Permanently revoke passive readers of a dedicated receive-only engine.
++    // The caller must not submit local transfers on that engine concurrently.
++    // Success proves every existing data QP is destroyed and no new passive
++    // connection can be established. Memory registration remains unchanged.
++    virtual int fenceRemoteReaders() { return -1; }
++
+     /// @brief Get the status of a submitted transfer. This function shall not
+     /// be called again after completion.
+     /// @return Return 1 on completed (either success or failure); 0 if still in
+diff --git a/mooncake-transfer-engine/src/transfer_engine.cpp b/mooncake-transfer-engine/src/transfer_engine.cpp
+index b5215757d9a88c322e0974736f1536e04a36f3d7..395fe12c747ec46ee83009e013d0b59798b1e278 100644
+--- a/mooncake-transfer-engine/src/transfer_engine.cpp
++++ b/mooncake-transfer-engine/src/transfer_engine.cpp
+@@ -169,6 +169,14 @@ Transport* TransferEngine::installTransport(const std::string& proto,
+     return impl_->installTransport(proto, args);
+ }
+ 
++int TransferEngine::fenceRemoteReaders() {
++    return impl_ ? impl_->fenceRemoteReaders() : ERR_NOT_IMPLEMENTED;
++}
++
++int TransferEngine::setFixedRpcPort(uint16_t port) {
++    return impl_ ? impl_->setFixedRpcPort(port) : ERR_NOT_IMPLEMENTED;
++}
++
+ int TransferEngine::uninstallTransport(const std::string& proto) {
+     return impl_->uninstallTransport(proto);
+ }
+@@ -812,6 +820,16 @@ Transport* TransferEngine::installTransport(const std::string& proto,
+     }
+ }
+ 
++int TransferEngine::fenceRemoteReaders() {
++    if (use_tent_ || !impl_) return ERR_NOT_IMPLEMENTED;
++    return impl_->fenceRemoteReaders();
++}
++
++int TransferEngine::setFixedRpcPort(uint16_t port) {
++    if (use_tent_ || !impl_) return ERR_NOT_IMPLEMENTED;
++    return impl_->setFixedRpcPort(port);
++}
++
+ int TransferEngine::uninstallTransport(const std::string& proto) {
+     if (use_tent_)
+         return 0;
+diff --git a/mooncake-transfer-engine/src/transfer_engine_impl.cpp b/mooncake-transfer-engine/src/transfer_engine_impl.cpp
+index 8a42aa57f72235af4e8188df799e5aca3242e084..63bbfea2e3de8d17aa9b0ef1b895ef517218c148 100644
+--- a/mooncake-transfer-engine/src/transfer_engine_impl.cpp
++++ b/mooncake-transfer-engine/src/transfer_engine_impl.cpp
+@@ -155,7 +155,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
+         metadata_conn_string == P2PHANDSHAKE) {
+         rpc_binding_method = "legacy/P2P";
+         desc.ip_or_host_name = host_name;
+-        desc.rpc_port = port;
++        desc.rpc_port = fixed_rpc_port_ ? fixed_rpc_port_ : port;
+         desc.sockfd = -1;
+ #ifdef USE_BAREX
+         if (use_barex_) {
+@@ -172,7 +172,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
+ #endif
+         if (metadata_conn_string == P2PHANDSHAKE) {
+             rpc_binding_method = "P2P handshake";
+-            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
++            desc.rpc_port =
++                findAvailableTcpPort(desc.sockfd, false, fixed_rpc_port_);
+             if (desc.rpc_port == 0) {
+                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
+                 return -1;
+@@ -199,7 +200,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
+         // In the new rpc port mapping, it is randomly selected to prevent
+         // port conflict
+         (void)(rpc_port);
+-        desc.rpc_port = findAvailableTcpPort(desc.sockfd);
++        desc.rpc_port =
++            findAvailableTcpPort(desc.sockfd, false, fixed_rpc_port_);
+         if (desc.rpc_port == 0) {
+             LOG(ERROR) << "not valid port for serving local TCP service";
+             return -1;
+@@ -609,6 +611,18 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
+     return 0;
+ }
+ 
++int TransferEngineImpl::fenceRemoteReaders() {
++    auto* transport = multi_transports_->getTransport("rdma");
++    return transport ? transport->fenceRemoteReaders() : ERR_NOT_IMPLEMENTED;
++}
++
++int TransferEngineImpl::setFixedRpcPort(uint16_t port) {
++    if (metadata_ || ValidatePortRange(port, port, 0, 0).first == 0)
++        return ERR_INVALID_ARGUMENT;
++    fixed_rpc_port_ = port;
++    return 0;
++}
++
+ void* TransferEngineImpl::allocateSharedMemory(size_t length) {
+     return allocateSharedMemory(length, SharedMemoryOptions{});
+ }
+diff --git a/mooncake-transfer-engine/src/transfer_metadata_plugin.cpp b/mooncake-transfer-engine/src/transfer_metadata_plugin.cpp
+index 711588ea2650fde3b55ebdad837926ad7acf6629..1073e2c341c403f28455d6b5b5beb9f788eb6830 100644
+--- a/mooncake-transfer-engine/src/transfer_metadata_plugin.cpp
++++ b/mooncake-transfer-engine/src/transfer_metadata_plugin.cpp
+@@ -1568,6 +1568,10 @@ std::vector<std::string> findLocalIpAddresses() {
+ }
+ 
+ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
++    return findAvailableTcpPort(sockfd, set_range, 0);
++}
++
++uint16_t findAvailableTcpPort(int &sockfd, bool set_range, uint16_t fixed_port) {
+     static std::random_device rand_gen;
+     std::uniform_int_distribution rand_dist;
+     int min_port = globalConfig().rpc_min_port;
+@@ -1592,7 +1596,12 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
+         }
+     }
+ #endif
+-    const int max_attempts = 500;
++    if (fixed_port) {
++        auto range = ValidatePortRange(fixed_port, fixed_port, 0, 0);
++        if (range.first == 0) return 0;
++        min_port = max_port = fixed_port;
++    }
++    const int max_attempts = fixed_port ? 1 : 500;
+     bool use_ipv6 = globalConfig().use_ipv6;
+ 
+     for (int attempt = 0; attempt < max_attempts; ++attempt) {
+diff --git a/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp b/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp
+index 71e2c39da3c6bd4e7991480948e634165a4a50b5..d5ab2dddc9f0e62be1889e1963dbba26900c60b2 100644
+--- a/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp
++++ b/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp
+@@ -463,6 +463,15 @@ int RdmaContext::socketId() {
+     }
+ }
+ 
++int RdmaContext::fenceRemoteReaders() {
++    // Called with the transport's passive-handshake lock held. This context
++    // is never reactivated: old rkeys cannot regain a usable RC connection.
++    active_.store(false, std::memory_order_release);
++    if (!endpoint_store_) return 0;
++    endpoint_store_->disconnectQPs();
++    return endpoint_store_->destroyQPs();
++}
++
+ int RdmaContext::deconstruct() {
+     worker_pool_.reset();
+ 
+diff --git a/mooncake-transfer-engine/src/transport/rdma_transport/rdma_transport.cpp b/mooncake-transfer-engine/src/transport/rdma_transport/rdma_transport.cpp
+index 9d70c390ec72cfbf50af14b6f68ed82ccda4dcb5..e6c9992121a49e24c240994163a40eae4c7ce2c8 100644
+--- a/mooncake-transfer-engine/src/transport/rdma_transport/rdma_transport.cpp
++++ b/mooncake-transfer-engine/src/transport/rdma_transport/rdma_transport.cpp
+@@ -2275,8 +2275,25 @@ int RdmaTransport::sendNativeNotify(
+     return ret;
+ }
+ 
++int RdmaTransport::fenceRemoteReaders() {
++    std::lock_guard<std::mutex> guard(reader_fence_mutex_);
++    readers_fenced_.store(true, std::memory_order_release);
++    int result = 0;
++    for (const auto &context : context_list_) {
++        if (context->fenceRemoteReaders() != 0) result = ERR_ENDPOINT;
++    }
++    // Do not tear down MRs here. The application retains its host allocations
++    // and may recycle individual pages only if every QP destruction succeeded.
++    return result;
++}
++
+ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
+                                           HandShakeDesc &local_desc) {
++    std::lock_guard<std::mutex> fence_guard(reader_fence_mutex_);
++    if (readers_fenced_.load(std::memory_order_acquire)) {
++        local_desc.reply_msg = "Passive RDMA access has been permanently fenced";
++        return ERR_ENDPOINT;
++    }
+     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
+     if (local_nic_name.empty()) {
+         local_desc.reply_msg =
+diff --git a/mooncake-transfer-engine/tests/config_test.cpp b/mooncake-transfer-engine/tests/config_test.cpp
+index da42d5132de08dd7af8632ebaa8d0e38d1c9c906..2ca8d57f25313ca431080c5cbd86cb32f126aa01 100644
+--- a/mooncake-transfer-engine/tests/config_test.cpp
++++ b/mooncake-transfer-engine/tests/config_test.cpp
+@@ -21,12 +21,27 @@
+ #include <thread>
+ 
+ #include "config.h"
++#include "transfer_engine_impl.h"
+ #include "transport/batch_registration.h"
+ #include "transport/rdma_transport/rdma_context.h"
+ 
+ namespace mooncake {
+ namespace {
+ 
++TEST(FixedRpcPortTest, ValidatesWithoutChangingTheGlobalPortRange) {
++    const int original_min = globalConfig().rpc_min_port;
++    const int original_max = globalConfig().rpc_max_port;
++    TransferEngineImpl first(false);
++    TransferEngineImpl second(false);
++    EXPECT_NE(first.setFixedRpcPort(0), 0);
++    EXPECT_NE(first.setFixedRpcPort(80), 0);
++    EXPECT_NE(first.setFixedRpcPort(40000), 0);
++    EXPECT_EQ(first.setFixedRpcPort(25000), 0);
++    EXPECT_EQ(second.setFixedRpcPort(25001), 0);
++    EXPECT_EQ(globalConfig().rpc_min_port, original_min);
++    EXPECT_EQ(globalConfig().rpc_max_port, original_max);
++}
++
+ TEST(AscendSingleSegmentConfigTest, DefaultsOffAndParsesExplicitBoolean) {
+     unsetenv("MC_ASCEND_STANDALONE_SINGLE_SEGMENT");
+     unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
+diff --git a/mooncake-transfer-engine/tests/rdma_transport_submit_task_test.cpp b/mooncake-transfer-engine/tests/rdma_transport_submit_task_test.cpp
+index 01b4b0b9efb8dacaa4d42d3c24804390ad8802cf..0867daf1038d5713df5a71076be490dabfa254c0 100644
+--- a/mooncake-transfer-engine/tests/rdma_transport_submit_task_test.cpp
++++ b/mooncake-transfer-engine/tests/rdma_transport_submit_task_test.cpp
+@@ -234,6 +234,21 @@ class SubmitTransferTaskTest : public ::testing::Test {
+     }
+ };
+ 
++TEST_F(SubmitTransferTaskTest, ReaderFenceRejectsNewPassiveHandshakes) {
++    const auto before = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
++    ASSERT_NE(before, nullptr);
++    const size_t buffers = before->buffers.size();
++    ASSERT_EQ(transport_->fenceRemoteReaders(), 0);
++    RdmaTransport::HandShakeDesc peer;
++    RdmaTransport::HandShakeDesc reply;
++    EXPECT_NE(transport_->onSetupRdmaConnections(peer, reply), 0);
++    EXPECT_NE(reply.reply_msg.find("fenced"), std::string::npos);
++    EXPECT_EQ(transport_->fenceRemoteReaders(), 0);
++    // A fence destroys connections, not the application's registered memory.
++    EXPECT_EQ(metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.size(),
++              buffers);
++}
++
+ TEST_F(SubmitTransferTaskTest, NicHintUsesExistingTailPadding) {
+     // Mirror the current request layout without nic_hint. The upstream
+     // intent_type field grew the baseline from 64 to 72 bytes, and the TENT

@@ -61,17 +61,32 @@ class RoutedPDClient(PDClient):
         self.ready_timeout = ready_timeout
         self.active_lock = threading.Lock()
         self.active_routes = {}
+        self.pull_plans = {}
 
     def start(self):
         self.pool.start(self.ready_timeout)
 
     def close(self):
+        super().close()
         self.pool.close()
+
+    def _cache_rpc(self, endpoint, message):
+        node = next(n for n in self.pool.nodes if n.endpoint == endpoint)
+        channel = self.pool.connect(node).open(str(uuid4()))
+        try:
+            channel.send(message, timeout=0.2)
+            return channel.receive(timeout=0.2)
+        finally:
+            channel.close()
 
     def prefix_spec(self):
         if not getattr(self.pool, "prefix_enabled", False):
             return None
-        return self.pool.prefix_index.spec_for(self.pool.healthy("prefill"))
+        nodes = self.pool.healthy("prefill")
+        tier_index = getattr(self.pool, "tier_index", None)
+        return self.pool.prefix_index.spec_for(nodes) or (
+            tier_index.spec_for(nodes) if tier_index is not None else None
+        )
 
     def _prefix_matches(self, request, bucket, cancel, prepared_prefix=None):
         if (bucket.prefill.policy or self.router.config.policy) != "cache_aware":
@@ -82,7 +97,24 @@ class RoutedPDClient(PDClient):
         if prepared_prefix is None or not hasattr(self.pool, "prefix_index"):
             return {}  # Cold/incompatible directories use the ordinary load policy.
         nodes = self.router.candidates("prefill", request, bucket)
-        return self.pool.prefix_index.hits(nodes, prepared_prefix)
+        result = self.pool.prefix_index.hits(nodes, prepared_prefix)
+        if hasattr(self.pool, "tier_index"):
+            config = self.router.config
+            try:
+                tier_hits = self.pool.tier_index.hits(
+                    nodes,
+                    self.pool.healthy("decode"),
+                    prepared_prefix,
+                    min_remote_tokens=config.min_remote_pull_tokens,
+                    h2d_gbps=config.dram_h2d_gbps,
+                    rdma_gbps=config.dram_rdma_gbps,
+                    prefill_ms_per_token=config.dram_prefill_ms_per_token,
+                    max_remote_bytes=config.dram_max_pull_bytes,
+                )
+                result.update(tier_hits)
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                pass  # An optional directory cannot fail an inference request.
+        return result
 
     def _route_and_reserve(self, request, cancel, prepared_prefix=None):
         last_error = None
@@ -97,6 +129,10 @@ class RoutedPDClient(PDClient):
                 decode, channel, ready = self._reserve(
                     request, prefill, cancel, bucket=bucket, excluded=attempted_decode
                 )
+                with self.active_lock:
+                    self.pull_plans[request.transfer_id] = getattr(
+                        hits.get(prefill.worker_id), "remote_plan", None
+                    )
                 return prefill, decode, channel, ready, bucket
             except InterruptedError:
                 if prefill is not None:
@@ -129,7 +165,10 @@ class RoutedPDClient(PDClient):
                 if node.health["layered_transfer"] != layered:
                     raise RemoteUnavailableError("P/D transfer modes differ")
                 channel = self.pool.connect(node).open(request.transfer_id, cancel)
-                channel.send({"op": "reserve", "request": request.to_object()})
+                message = {"op": "reserve", "request": request.to_object()}
+                if node.health.get("dram_cache", {}).get("enabled", False):
+                    message["cache_transaction"] = True
+                channel.send(message)
                 ready = response(channel, "ready" if layered else "reserved")
                 reservation_prefix(ready, request, layered=layered)
                 self.router.record(request.transfer_id, prefill, node, attempt, bucket=bucket)
@@ -156,8 +195,16 @@ class RoutedPDClient(PDClient):
                 raise
         raise last_error or NoHealthyWorker("no decode reservation succeeded")
 
-    def _stream(self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
-                prepared_prefix=None):
+    def _stream(
+        self,
+        prompt_ids,
+        max_tokens,
+        *,
+        ignore_eos=False,
+        cancel=None,
+        request_id=None,
+        prepared_prefix=None,
+    ):
         request_id = request_id or str(uuid4())
         with self.active_lock:
             if request_id in self.active_routes:
@@ -165,15 +212,26 @@ class RoutedPDClient(PDClient):
             self.active_routes[request_id] = None
         try:
             yield from self._stream_bound(
-                prompt_ids, max_tokens, ignore_eos=ignore_eos, cancel=cancel, request_id=request_id,
+                prompt_ids,
+                max_tokens,
+                ignore_eos=ignore_eos,
+                cancel=cancel,
+                request_id=request_id,
                 prepared_prefix=prepared_prefix,
             )
         finally:
             with self.active_lock:
                 self.active_routes.pop(request_id, None)
+                self.pull_plans.pop(request_id, None)
 
     def _stream_bound(
-        self, prompt_ids, max_tokens, *, ignore_eos=False, cancel=None, request_id=None,
+        self,
+        prompt_ids,
+        max_tokens,
+        *,
+        ignore_eos=False,
+        cancel=None,
+        request_id=None,
         prepared_prefix=None,
     ):
         self.start()
@@ -195,11 +253,18 @@ class RoutedPDClient(PDClient):
             raise InterruptedError("request cancelled")
         p = d = None
         held_prefill = held_decode = None
+        cache_endpoints = []
+        completed = False
         try:
             prefill, decode, d, ready, bucket = self._route_and_reserve(
                 request, cancel, prepared_prefix
             )
             held_prefill, held_decode = prefill, decode
+            cache_prefill = prefill.health.get("dram_cache", {}).get("enabled", False)
+            if cache_prefill:
+                cache_endpoints.append(prefill.endpoint)
+            if decode.health.get("dram_cache", {}).get("enabled", False):
+                cache_endpoints.append(decode.endpoint)
             with self.active_lock:
                 self.active_routes[request.transfer_id] = (prefill.worker_id, decode.worker_id)
             p = self.pool.connect(prefill).open(request.transfer_id, cancel)
@@ -211,9 +276,22 @@ class RoutedPDClient(PDClient):
                 held_prefill = None
 
             yield from stream_reserved(
-                request, p, d, ready, layered=layered, on_prefill_done=release_prefill
+                request,
+                p,
+                d,
+                ready,
+                layered=layered,
+                on_prefill_done=release_prefill,
+                cache_transaction=cache_prefill,
+                remote_pull_plan=self.pull_plans.get(request.transfer_id),
             )
+            completed = True
         finally:
+            self._cache_finalize(
+                cache_endpoints,
+                request.transfer_id,
+                completed and (cancel is None or not cancel.is_set()),
+            )
             try:
                 if p is not None:
                     p.close()
