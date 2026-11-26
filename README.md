@@ -16,6 +16,8 @@ Python 包名和命令入口仍为 `minisgl`。
 > **当前版本（2026-11-26）**：新增默认关闭的本地 DRAM 缓存和 D→P 反向提升，支持 LRU/LFU、异步 D2H/H2D、短租约和失败重算。
 > D Radix 仍默认关闭；P→D 后缀始终取决于 D reserve 的真实前缀，单端点及 Routed 客户端继续先向 D 预留资源。
 > 已新增并运行 CPU attention 续算、受控 RDMA、拷贝 reader、缓存提交和索引一致性测试；CUDA/RDMA 实机验证仍待完成。
+> 三个缓存功能提交已补独立 CPU 回归，两个旧凭证测试修绿；扩大集合 **356 passed、16 skipped、0 failed**，见 [CPU 回归记录](docs/pd/cpu_regression.md)。
+> 启动期检查模型 KV 门槛与字节上限，health 比对 Router/Worker 配置并约束计划；统一检查本机 Worker/Gateway 的端口冲突。
 > 远端拉取需配套构建 `../Mooncake` 的 reader fence API；本机 CMake 配置受缺失开发依赖阻止。旧 binding 可继续使用本地 DRAM。
 > 配套原生改动随仓库保存在 [Mooncake 补丁](patches/mooncake/README.md)，含准确基线和应用步骤。
 > 真实 GPU/RDMA 正确性、双服务器运行、实际重叠比例与性能收益尚未验收。下文部署命令是配置模板。
@@ -449,9 +451,9 @@ Worker 健康检查使用自定义 `Channel` 消息 `{"op":"health"}`，不能�
 
 ## 测试与验收
 
-后续 D Radix、后缀协议及本次页面哈希索引、后台同步和分词进程改动按要求未新增或运行测试，
-仅完成源码审查、Python 编译和 `git diff --check`。下列命令与测试清单为已有工具入口，
-尚未据此验证新索引、新开关、v2/v3 协议或完整命中路径。
+2026-11-26 已补齐 D Radix 后缀传输、P 页面哈希索引及 DRAM 的独立 CPU 回归，修复两个旧版完成凭证测试，
+并检查完整命中、索引失效回退、并发去重和 reader/租约回收。覆盖映射、失败原因和复现命令见
+[CPU 回归记录](docs/pd/cpu_regression.md)。
 
 ### 标准库协议检查
 
@@ -469,20 +471,25 @@ PYTHONPATH=python python3 -S -m minisgl.disagg
 在已安装 CPU 测试依赖或完整开发依赖的环境中：
 
 ```bash
-PYTHONPATH=python python -m pytest -o addopts= -q tests/disagg tests/integration
+TVM_FFI_DISABLE_TORCH_C_DLPACK=1 PYTHONPATH=python python -m pytest -o addopts= -q \
+  tests/disagg tests/integration tests/core tests/misc
 
-# 阶段集合还包括缓存分配与消息序列化
-FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
+# 同一集合的统一脚本入口
+TVM_FFI_DISABLE_TORCH_C_DLPACK=1 FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
 ```
 
 本机已有 CPU `.venv` 时，可改用 `.venv/bin/python`；环境与测试报告不随 Git 分发。
-`-o addopts=` 关闭默认覆盖率输出，环境说明和无 socket 子集命令见[项目交接文档](交接文档/项目交接文档.md)。
+`-o addopts=` 关闭默认覆盖率输出；网络集合需允许本机 socket 和子进程。
 
 | 测试 | 覆盖范围 |
 |---|---|
 | `tests/disagg/` | 整体/逐层票据、生命周期、角色、Mock/TCP、帧限制与撤销。 |
 | `test_pd_entrypoints.py` | CLI、角色分派及加载模型前的配置检查。 |
 | `test_pd_tensor_cache.py` | dtype、稀疏 slots、dummy 页、页分配回滚与 Radix 借用保护。 |
+| `test_pd_decode_radix.py` | D Radix 开/关、多轮生成 KV、后缀实际字节数、完整命中、并发去重、取消与安装失败重试。 |
+| `test_pd_prefix_index.py`、`test_pd_prompt_prepare.py` | 哈希域、真实整页发布/淘汰、镜像快照/日志/失效、过期 Hint 重算；准备任务取消/超时的容量保护。 |
+| `test_pd_dram.py`、`test_pd_dram_cuda.py` | DRAM 接缝、提交、LRU/LFU、反向拉取、超时与 reader/租约 fence；后者需真实 CUDA。 |
+| `test_pd_startup_validation.py` | 模型相关容量门槛、health 参数告警与三方限额、端口碰撞和启动子进程前拒绝。 |
 | `test_pd_pipeline.py` | 两进程 CPU attention 模型经实际 TCP 续算并对照 token。 |
 | `test_pd_failures.py`、`test_pd_gateway.py` | 失败清理、HTTP/SSE、结束原因与断连；网关主要使用桩客户端。 |
 | `test_pd_layered.py` | 受控 DMA/event 下的实际发送队列/runtime、背压、槽位与租约、终态、取消和逐层握手续算。 |
@@ -497,11 +504,9 @@ FLUXINFER_TEST_PYTHON=python bash tools/pd/test_phase2.sh
 不下载 Hugging Face 权重。逐层所有权测试使用内存控制通道，端到端用例另使用真实 socket；
 CUDA event 和原生 DMA 的 CPU 适配器不能证明真实 GPU/RDMA 并发。
 
-引入 D Radix Cache 前的 2026-11-24 历史无 socket 回归为 **190 passed、10 skipped、5 deselected、113 subtests passed**，包含旧路由策略测试；后续 D Radix 与本次页面哈希索引改动均未运行测试。
-测试使用确定性 CPU attention 验证多请求组批、独立参考 token 对照，以及内存通道中的完整并发 Worker/PDClient 控制循环。
-10 项 GPU 用例跳过，5 项逐层 socket 用例排除；独立 TCP 与 HTTP 回归未纳入此子集。
-当前验证环境不支持本机 socket；真实 TCP/HTTP 网络、多进程 GPU、跨服务器和 RDMA 尚待验收。
-完整子集命令见[项目交接文档](交接文档/项目交接文档.md)；路由配置见[选择算法](docs/pd/routing.md)。
+当前扩大集合结果为 **356 passed、16 skipped、113 subtests passed、0 failed**，包括真实本机 TCP、
+HTTP/SSE 与两进程续算，无 deselected。16 项需要 CUDA/GPU 的用例跳过；完整记录见
+[CPU 回归](docs/pd/cpu_regression.md)。真实模型、跨服务器、CUDA/RDMA 和性能仍需实机验收。
 
 ### GPU 模型对照
 
@@ -572,6 +577,7 @@ docs/pd/                # P/D 专项设计和阶段记录
 - [逐层 KV 传输](docs/pd/layered_transfer.md)：缓冲池、层组流水线、所有权、取消与验收入口。
 - [D Radix Cache](docs/pd/decode_radix_cache.md)：默认关闭、页级共享、后缀传输、完整命中及回收规则。
 - [P 页面哈希索引](docs/pd/prefix_index.md)：SHA-256 哈希域、真实 HBM 发布、后台增删同步、容量与 P/D 边界。
+- [CPU 回归记录](docs/pd/cpu_regression.md)：三个缓存功能提交的独立覆盖、基线失败修复、完整 CPU 集合命令与验证边界。
 - [多请求调度](docs/pd/batching.md)：异步控制面、批量传输、动态 Decode、显存与准入参数。
 - [P/D 选择算法](docs/pd/routing.md)：Bucket、准入阈值、两候选择优、缓存亲和与分配时机。
 - [多 Worker 与路由](docs/pd/multi_worker.md)：资源隔离、健康池、长连接、重选与跨机配置。

@@ -28,12 +28,36 @@ def fake_cuda(monkeypatch):
 
 
 @contextmanager
-def cluster(group=1, budget=32, rows=8, decoders=1, inference_pools=False, staging_slots=4):
+def cluster(
+    group=1,
+    budget=32,
+    rows=8,
+    decoders=1,
+    inference_pools=False,
+    staging_slots=4,
+    page_size=4,
+    prefill_cache_type="naive",
+    decode_radix_cache=False,
+):
     backends, services = [], []
     try:
         for i, role in enumerate(["prefill"] + ["decode"] * decoders):
-            scheduler = cpu_scheduler(role, max_running_req=rows, prefill_budget=budget)
-            scheduler.pd_service_config = {"batch_wait_ms": 0}
+            cache_type = (
+                prefill_cache_type
+                if role == "prefill"
+                else ("radix" if decode_radix_cache else "naive")
+            )
+            scheduler = cpu_scheduler(
+                role,
+                page_size=page_size,
+                max_running_req=rows,
+                prefill_budget=budget,
+                cache_type=cache_type,
+            )
+            scheduler.pd_service_config = {
+                "batch_wait_ms": 0,
+                "decode_radix_cache": decode_radix_cache,
+            }
             backend = CpuLayeredBackend(
                 None,
                 timeout=2,

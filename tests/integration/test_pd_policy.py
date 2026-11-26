@@ -23,6 +23,7 @@ from minisgl.disagg.routing_policy import (
     policy_cli_args,
     policy_config,
 )
+from minisgl.disagg.tier_index import TierHit
 from pd_reference import reference_tokens
 from test_pd_batching import fake_cuda  # noqa: F401
 from test_pd_routing import running_cluster
@@ -170,6 +171,25 @@ def test_cache_affinity_and_balancing_count_this_requests_uncached_tokens(pool):
         router.select_prefill(request=request(), bucket=RoutingBucket(), prefix_hits={"p-1": 4})
         is p0
     )
+
+
+def test_balanced_routing_charges_remote_restore_cost_instead_of_counting_it_as_hbm(pool):
+    config = RoutingConfig(policy="cache_aware", cache_min_tokens=1)
+    router = PolicyRouter(pool, config=config)
+    p0, p1 = pool.prefill_pool
+    hits = {
+        p0.worker_id: TierHit(remote_tokens=16, restore_cost_ms=0.2),
+        p1.worker_id: TierHit(hbm_tokens=8),
+    }
+    args = {"request": request(24), "bucket": RoutingBucket(), "prefix_hits": hits}
+    assert router.select_prefill(**args) is p0
+    router.config = replace(
+        config, affinity_mode="balanced", affinity_load_gap=0, affinity_load_factor=1
+    )
+    # At 0.01 ms/token, remote restore costs another 20 equivalent tokens.
+    assert router.select_prefill(**args) is p1
+    hits[p0.worker_id] = TierHit(remote_tokens=16, restore_cost_ms=0.01)
+    assert router.select_prefill(**args) is p0
 
 
 def test_config_round_trip_and_invalid_values_fail_before_gpu_start(tmp_path):

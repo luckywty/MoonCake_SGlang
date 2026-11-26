@@ -26,16 +26,34 @@ from test_pd_control_loop import MemoryChannel, MemoryListener, readable
 
 
 @contextmanager
-def running_cluster(monkeypatch, mode="layered", seed=12, routing_config=None, dram_config=None):
+def running_cluster(
+    monkeypatch,
+    mode="layered",
+    seed=12,
+    routing_config=None,
+    dram_config=None,
+    prefill_cache_type="naive",
+    decode_radix_cache=False,
+):
     services, backends, threads, errors = [], [], [], []
     stop, fabric = threading.Event(), MockFabric()
     counts, frames = {}, []
     listeners, targets = {}, {}
     try:
         for index, role in enumerate(["prefill", "prefill", "decode", "decode"]):
-            scheduler = cpu_scheduler(role, max_running_req=8, prefill_budget=32)
+            cache_type = (
+                prefill_cache_type
+                if role == "prefill"
+                else ("radix" if decode_radix_cache else "naive")
+            )
+            scheduler = cpu_scheduler(
+                role, max_running_req=8, prefill_budget=32, cache_type=cache_type
+            )
             scheduler.worker_id = f"{role[0]}-{index % 2}"
-            scheduler.pd_service_config = {"batch_wait_ms": 15}
+            scheduler.pd_service_config = {
+                "batch_wait_ms": 15,
+                "decode_radix_cache": decode_radix_cache,
+            }
             if dram_config is not None:
                 scheduler.pd_service_config["dram"] = asdict(dram_config)
             scheduler.engine.delay = 0.005

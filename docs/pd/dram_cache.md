@@ -1,6 +1,6 @@
 # P/D 本地 DRAM KV 缓存与 D→P 按需拉取
 
-更新日期：2026-11-26（Asia/Shanghai）；下述测试记录执行于 2026-11-25。
+更新日期：2026-11-26（Asia/Shanghai）；CPU 回归记录更新于同日。
 
 本次在 `4d15539` 页面哈希索引、`5e1e21e` D Radix 后缀交接基础上实现。
 功能默认关闭；`--pd-dram-cache-bytes` 大于零时启用本地缓存，
@@ -114,16 +114,52 @@ host MR 只注册到独立 TE，通过 `initialize_with_rpc_port` 显式绑定�
 | `--pd-dram-max-leases` | 32 | 页池租约预算；传输层同时最多导出 2 个租约、发起 2 次拉取 |
 | `--pd-dram-lease-ttl` | 30 秒 | export 租约期限，须大于读 timeout |
 | `--pd-dram-transaction-ttl` | 300 秒 | 成功结果确认丢失时清理 STAGED 页的期限 |
-| `--min-remote-pull-tokens` | 1024 | Router 规划门槛，建议与 Worker 一致 |
-| `--dram-max-pull-bytes` | 64 MiB | Router 规划上限，建议与 Worker 一致 |
+| `--min-remote-pull-tokens` | 1024 | Router 规划门槛；health 比对 Worker 参数，规划取三方门槛的最大值 |
+| `--dram-max-pull-bytes` | 64 MiB | Router 规划上限；规划取 Router、P、源 D 上限的最小值 |
 | `--dram-h2d-gbps` / `--dram-rdma-gbps` | 12 / 10 | 选路成本模型的有效带宽，需实测校准 |
 | `--dram-prefill-ms-per-token` | 0.01 | 选路重算成本标定，需实测校准 |
 
 成本按 KV 字节量估算，`balanced` 将 H2D、RDMA+H2D 分别转换成等效 prefill 开销；
 不把远端命中与 HBM 命中等权。带宽限制是 host 引擎的并发与准入速率控制，并非 NIC 硬 QoS。
-`max-pull-bytes` 必须足以容纳门槛 token 对应的 KV；例如 128 KiB/token、1024 token 至少需要 128 MiB。
-否则该配置始终选择重算，属于正常降级。
+`max-pull-bytes` 必须足以容纳门槛 token 对应的整页 KV；例如 128 KiB/token、1024 token 至少需要 128 MiB。
+开启远端模式时不满足该条件会在启动阶段报错，不能再把无法触发的配置静默当成正常重算。
 另限制单次最多 16384 页，确保 pin 描述符不超过控制帧上限；超过部分由 P 计算。
+
+## 启动校验与双边限额
+
+启用 `--pd-dram-remote-pull` 后，P/D Worker 在读取模型配置后、加载权重和构造 CUDA 池前验证：
+
+```text
+bytes_per_token = 2 * layers * kv_heads * head_dim * dtype_bytes  # 当前 split 为 TP=1
+aligned_min_tokens = ceil(pd_dram_min_remote_tokens / page_size) * page_size
+required_bytes = aligned_min_tokens * bytes_per_token
+required_bytes <= pd_dram_max_pull_bytes
+```
+
+等号允许；满页数量还须不超过 16384。报错包含模型 bytes/token、页大小、对齐后的 token/字节数以及冲突的 CLI 参数。
+WorkerService 在分配 pinned 池和注册 MR 前用实际 KVLayout 再校验一次，覆盖直接构造服务的入口。
+只启用本地 DRAM 时不受远端限额约束。
+
+默认 64 MiB 上限只支持至多 64 KiB/token 的 1024-token 门槛。对于 128 KiB/token 的模型，可同时调整：
+
+```text
+--pd-dram-max-pull-bytes 134217728 --dram-max-pull-bytes 134217728
+```
+
+Worker 在 `health.dram_cache` 发布 `remote_enabled`、`min_remote_tokens`、`remote_max_bytes`。
+`cache_aware` 健康检查对不一致参数打印 Router/Worker 两边的值，相同实例和配置不重复刷日志；
+交集按满页计算后仍不能满足门槛时打印明确告警。正常推理 Worker 不因此被标记为 unhealthy。
+
+每个候选 P 与单个源 D 的计划使用：
+
+```text
+effective_min_tokens = max(Router.min, P.min, D.min)
+effective_max_bytes = min(Router.max, P.max, D.max)
+```
+
+计划先受字节上限截断，再验证 token 门槛和收益；不足时只复用本地 HBM/DRAM。
+旧 Worker 没有这些限额字段，或字段不合法时，会告警并停用其远端 Hint，保留本地缓存与常规推理；升级 Worker 后恢复。
+配置开启但 host TE 不可用时，health 检查也会打印错误原因。Worker 仍会在执行时重新校验并允许失败重算。
 
 ## 原生依赖与观测
 
@@ -151,38 +187,37 @@ v1 P HBM 索引继续兼容；重启、失联、retired 和 seq 缺口清空相�
 CPU 核心用例：
 
 ```bash
-PYTHONPATH=python python -m pytest -q -o addopts= \
+TVM_FFI_DISABLE_TORCH_C_DLPACK=1 PYTHONPATH=python python -m pytest -q -o addopts= \
   tests/integration/test_pd_dram.py tests/integration/test_pd_batching.py \
   tests/integration/test_pd_tensor_cache.py tests/integration/test_pd_control_loop.py \
-  tests/integration/test_pd_policy.py tests/integration/test_pd_cluster_config.py
+  tests/integration/test_pd_policy.py tests/integration/test_pd_cluster_config.py \
+  tests/integration/test_pd_decode_radix.py tests/integration/test_pd_prefix_index.py \
+  tests/integration/test_pd_prompt_prepare.py tests/integration/test_pd_startup_validation.py
 ```
 
 `test_pd_dram.py` 使用真实 CPU attention 续算和真实缓存/调度/租约代码，只替换 CUDA/RDMA 原语，
-覆盖接缝、取消提交、延迟 D2H、单源选路、D reserve 恢复、反向提升、超时隔离、租约 fence 失败和实例重启。
+覆盖接缝、取消提交、延迟 D2H、单源选路、D reserve 恢复、反向提升、超时隔离、租约 fence 失败和实例重启，
+并补充 LRU/LFU 实际淘汰选择、拉取门槛/收益、第二页超时后复用第一满页并重算其余 token。
 `test_pd_dram_cuda.py` 提供真实 pinned/CUDA 双流页往返用例，没有 GPU 时明确 skip。
-本轮定向回归为 **116 passed、6 skipped（CUDA）、69 subtests passed**，结果保存在执行环境
-`/tmp/minisgl-dram-validation.xml`。同时通过 Ruff、Black、Python 编译和两仓库差异空白检查。
 原生层提供 `FixedRpcPortTest` 和 `ReaderFenceRejectsNewPassiveHandshakes` 用例，因下述依赖限制尚未运行。
 
-扩大到 `tests/disagg`、`tests/integration`、`tests/core` 与 `tests/misc` 后，结果为
-**211 passed、16 skipped、2 failed、5 deselected、113 subtests passed**，报告为
-`/tmp/minisgl-dram-cpu-final.xml`，日志为 `/tmp/minisgl-dram-cpu-final.log`。
-两个失败均已在修改前的 `4d15539` 副本复现，未将其算为本次回归通过。
-该轮排除了不能在当前环境执行的 TCP/HTTP 用例和 5 个需要绑定端口的 layered 用例，具体命令为：
+2026-11-25 的历史子集曾报告 **211 passed、16 skipped、2 failed、5 deselected**。
+两个基线失败现已修复：测试完成凭证仍写死层组 v2，实际协议已是 v3，因而提前失败；
+修复后仍严格验证错误凭证不得释放租约，并断言安装失败注入确实执行。
+具体原因、三个功能提交的独立回归和测试适配边界见 [CPU 回归记录](cpu_regression.md)。
+
+2026-11-26 扩大到四个目录并补跑本机 TCP、HTTP 与两进程测试，结果为
+**356 passed、16 skipped（CUDA/GPU）、113 subtests passed、0 failed**，无 deselected：
 
 ```bash
 TVM_FFI_DISABLE_TORCH_C_DLPACK=1 PYTHONPATH=python python -m pytest -q -o addopts= \
   tests/disagg tests/integration tests/core tests/misc \
-  --ignore=tests/disagg/test_tcp.py \
-  --ignore=tests/integration/test_pd_gateway.py \
-  --ignore=tests/integration/test_pd_pipeline.py \
-  -k 'not early_handshake_real_scheduler_continuation_and_eos and not client_disconnect_after_first_token_reclaims_layer_reservation and not reservation_disconnect_before_prefill_reclaims_private_pages'
+  --tb=short --junitxml=/tmp/minisgl-startup-cpu.xml
 ```
 
 当前执行环境为 CPU PyTorch，没有运行真实 CUDA、RDMA 或 TPOT/TTFT 基准。
 本地 Mooncake CMake 配置因缺少 `yaml-cpp` 等开发依赖未完成，native fence 修改尚未编译验收。
-本机 socket 测试受沙箱限制；HTTP TestClient 在当前环境启动超时，未作为已通过项。
-另已在修改前的 `4d15539` 源码副本复现两个既有 layered 用例失败：旧 quiescence 消息断言、旧 adapter install 失败时 lease 断言。
+socket 测试在沙箱内仍受限制；本轮在获准的沙箱外执行环境完成上述本机网络集合。
 
 实机验收必须补齐：配套 Mooncake 编译；两轮同 P 请求和更换 P 的输出对照；
 D GPU Radix 开/关；D0→P0→D0 的实际后缀字节数；P/D 取消与进程退出；MR 注册次数固定；

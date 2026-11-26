@@ -325,13 +325,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             not 0 < te_port < 65536 or kwargs["pd_transfer_backend"] != "mooncake"
         ):
             parser.error("--pd-mooncake-port requires Mooncake and a valid TCP port")
-        if te_port is not None:
-            from minisgl.disagg.cluster_config import validate_mooncake_port
-
-            try:
-                validate_mooncake_port(te_port)
-            except ValueError as exc:
-                parser.error(str(exc))
         if kwargs["tensor_parallel_size"] != 1 or kwargs["use_dummy_weight"]:
             parser.error("Phase 2 split workers require TP=1 and real model weights")
         if kwargs["shell_mode"] or run_shell:
@@ -387,19 +380,28 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             kwargs["server_port"] + 2 if kwargs["pd_data_port"] is None else kwargs["pd_data_port"]
         )
         if kwargs["worker_role"] == WorkerRole.DECODE.value:
-            if not 0 < data_port < 65536 or data_port in (
-                kwargs["server_port"],
-                kwargs["server_port"] + 1,
-            ):
-                parser.error("KV data port must differ from the worker and distributed ports")
             if kwargs["server_host"] in ("0.0.0.0", "::") and not kwargs["pd_advertise_host"]:
                 parser.error("wildcard decode bind requires --pd-advertise-host")
-        if te_port is not None and te_port in (
-            kwargs["server_port"],
-            kwargs["server_port"] + 1,
-            data_port,
-        ):
-            parser.error("TE port must differ from control, distributed and backend data ports")
+        from minisgl.disagg.cluster_config import validate_port_bindings, worker_port_bindings
+
+        # Include P's data slot when explicitly reserved or used to separate a fixed GPU TE.
+        has_data_slot = (
+            kwargs["worker_role"] == WorkerRole.DECODE.value
+            or kwargs["pd_data_port"] is not None
+            or te_port is not None
+        )
+        try:
+            validate_port_bindings(
+                worker_port_bindings(
+                    kwargs["worker_id"] or kwargs["worker_role"],
+                    kwargs["server_port"],
+                    data_port if has_data_slot else None,
+                    te_port,
+                    kwargs["pd_dram"].port if kwargs["pd_dram"].remote_enabled else None,
+                )
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

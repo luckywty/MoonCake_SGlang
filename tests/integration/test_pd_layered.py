@@ -3,7 +3,7 @@ import socket
 import threading
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import minisgl.core as core
@@ -26,6 +26,7 @@ from minisgl.disagg.control import (
     endpoint_address,
     endpoint_name,
 )
+from minisgl.disagg.layered_protocol import LAYERED_TICKET_VERSION
 from minisgl.disagg.protocol import KVLayout, KVTransferMetadata, RequestHandoff
 from minisgl.disagg.role import WorkerRole
 from minisgl.disagg.transfer import TransferError
@@ -206,6 +207,32 @@ def test_lost_receipt_replays_identical_terminal_proof():
         d.release_layers(target)
 
 
+@pytest.mark.parametrize(
+    "backend", ["mooncake-layered-gpu-v2", "mooncake-layered-gpu-v4", None, True]
+)
+def test_invalid_completion_protocol_cannot_release_an_exposed_receive_buffer(backend):
+    with pair() as (p, d, _):
+        target = d.reserve_layers(StartRequest(str(uuid4()), 0, (1, 2), 3, True), 31)
+        d.open_layers(target, p.runtime.session)
+        proof = {
+            "op": "layer_terminal",
+            "backend": backend,
+            "locator": target.locator,
+            "transfer_id": target.transfer_id,
+            "receiver": target.session,
+            "source": p.runtime.session,
+            "submitted": [],
+            "completed": [],
+            "result": "cancelled",
+        }
+        with pytest.raises(TransferError, match="incorrect layer completion message"):
+            d._settle_layers(proof)
+        assert d._lease.ticket == target and not d._receive_buffer.safe_to_release
+        d._settle_layers({**proof, "backend": f"mooncake-layered-gpu-v{LAYERED_TICKET_VERSION}"})
+        d.release_layers(target)
+        assert d._lease is None and d._receive_buffer.safe_to_release
+
+
 def test_stale_or_incomplete_certificate_never_releases_another_lease():
     with pair() as (p, d, layout):
         request = StartRequest(str(uuid4()), 0, (1, 2), 3, True)
@@ -213,7 +240,7 @@ def test_stale_or_incomplete_certificate_never_releases_another_lease():
         d.open_layers(target, p.runtime.session)
         proof = {
             "op": "layer_terminal",
-            "backend": "mooncake-layered-gpu-v2",
+            "backend": f"mooncake-layered-gpu-v{LAYERED_TICKET_VERSION}",
             "locator": target.locator,
             "transfer_id": target.transfer_id,
             "receiver": target.session,
@@ -256,7 +283,7 @@ def test_layered_decode_failure_rolls_back_private_pages(failure, monkeypatch):
                 d._settle_layers(
                     {
                         "op": "layer_terminal",
-                        "backend": "mooncake-layered-gpu-v2",
+                        "backend": f"mooncake-layered-gpu-v{LAYERED_TICKET_VERSION}",
                         "locator": target.locator,
                         "transfer_id": target.transfer_id,
                         "receiver": target.session,
@@ -282,12 +309,13 @@ def test_layered_decode_failure_rolls_back_private_pages(failure, monkeypatch):
 
         if failure == "install":
 
-            def fail_install(*args, **kwargs):
-                raise ValueError("injected install failure")
-
+            fail_install = Mock(side_effect=ValueError("injected install failure"))
             monkeypatch.setattr(scheduler.engine.kv_cache, "import_layered_tensor", fail_install)
-        with pytest.raises((ValueError, RuntimeError, CancelledError)):
+        with pytest.raises((ValueError, RuntimeError, CancelledError)) as raised:
             scheduler.decode_layered(request, Control(), d)
+        if failure == "install":
+            fail_install.assert_called_once()
+            assert str(raised.value) == "injected install failure"
         assert scheduler._owned_req is None
         assert scheduler.table_manager.available_size == 2
         assert len(scheduler.cache_manager.free_slots) == 32

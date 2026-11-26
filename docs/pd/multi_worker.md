@@ -54,6 +54,16 @@ NIC、NUMA 与模型示例都需按实际拓扑调整。
 本地 classic TE 排除 32768～60999 的临时端口区间，因此显式 TE 端口需为 1024～32767 或 61000～65535。
 若安装扩展忽略该范围，Worker 明确报错，不把自动分配端口伪装成固定端口。
 
+启动器先汇总所有本机 Worker 的控制、distributed、GPU TE、后端 data、Host TE 端口，连同网关 HTTP
+统一检查，创建第一个子进程前即拒绝重复或越界配置；直接构造 `ClusterSupervisor` 也执行同一检查。
+例如 `--base-dram-port 1921` 会报告 `p-0 Host TE` 与 `p-1 control`（1P/1D 时为 `d-0 control`）重叠，
+同时指出冲突端口值。单 Worker CLI 复用该校验器检查本进程的实际/显式预留端口。
+
+GPU/Host 固定 TE 落入 32768～60999 直接报错；普通控制、distributed、data 或网关端口落入该区间会打印告警，
+列出具体端口及其用途。校验依据 classic TE 的固定排除区间，不自动修改系统的临时端口设置。
+手工分别启动多个 Worker 时没有共享的启动计划，仍须显式规划 `--port`、`--pd-data-port`、
+`--pd-mooncake-port`、`--pd-dram-port`，不能仅把相邻控制端口加 2/3 后当作隔离方案；同机多实例建议使用启动器。
+
 启动器用独立进程组和独立 `CUDA_VISIBLE_DEVICES` 启动各 Worker；本地节点全部就绪后再启动网关。
 主进程收到 SIGINT/SIGTERM 或启动失败时，回收它创建的全部子进程；超出关闭时限则终止残留进程组。
 运行中个别 Worker 退出会记录日志，健康池停止选择它；若某个角色全部退出或网关退出，启动器结束并清理本地子进程。

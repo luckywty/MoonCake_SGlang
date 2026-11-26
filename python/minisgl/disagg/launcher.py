@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import asdict
 
-from .cluster_config import add_routing_args, local_plan, remote_addresses
+from .cluster_config import add_routing_args, local_plan, remote_addresses, validate_cluster_ports
 from .routing_policy import policy_cli_args, policy_config
 
 CLUSTER_FLAGS = {
@@ -147,6 +147,11 @@ class ClusterSupervisor:
         self.stop = threading.Event()
 
     def start(self):
+        validate_cluster_ports(
+            self.specs,
+            gateway_port=None if self.args.no_gateway else self.args.port,
+            backend=self.args.pd_transfer_backend,
+        )
         # Build every command before starting any child, including affinity validation.
         commands = [worker_command(spec, self.args, self.worker_args) for spec in self.specs]
         for spec, (command, env) in zip(self.specs, commands):

@@ -90,5 +90,8 @@ health 增加：
 原有 `free_pages`、`protected_tokens`、`evictable_tokens` 仍可观察页占用和引用保护。
 开启时空闲状态不要求全部页回到 free list，未被锁定的 Radix 页可以继续保留。
 
-本次按用户要求未新增或运行测试，仅进行代码审查、Python 编译和差异检查。
-既有历史 CPU/GPU 测试记录不代表本功能或新协议已验收。
+2026-11-26 新增独立 CPU 回归 `test_pd_decode_radix.py`，覆盖页大小 1/4、开关开/关、多轮生成 KV、
+完整命中零 payload、实际后缀字节数、并发规范页去重、取消、安装失败及重试。
+补跑真实 TCP 的首 token EOS 用例，验证 reserve-first 后释放预留且不提交传输或 Decode。
+扩大集合为 **356 passed、16 skipped、0 failed**，命令和适配器边界见 [CPU 回归记录](cpu_regression.md)。
+CPU 结果不替代真实 CUDA/RDMA 模型验收。

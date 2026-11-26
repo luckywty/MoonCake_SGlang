@@ -142,4 +142,7 @@ P 排队时 D 的预留继续占用；实际 `busy` 仍可能发生，不能用�
 
 `pd_route` JSON 日志包含 request_id、prefill_id、decode_id、bucket、角色策略、attempt 和 event。
 既有 CPU 回归入口为 `tests/integration/test_pd_policy.py`，已加入 `tools/pd/test_phase2.sh`。
-其历史结果不涵盖本次页面哈希索引与后台同步；本轮按要求未新增或运行测试，只做源码审查、Python 编译和差异检查。
+2026-11-26 补齐页面哈希索引、后台同步、真实 HBM 命中与过期 Hint 重算的独立 CPU 回归，
+并检查 `balanced` 将远端 RDMA+H2D 成本折算进负载；覆盖映射与命令见 [CPU 回归记录](cpu_regression.md)。
+远端 DRAM 规划还读取 P/D health 的实际 token 门槛与字节上限，与 Router 配置取交集；
+配置不一致会去重告警，不能满足交集时保留本地命中并重算远端部分，见 [启动校验](dram_cache.md#启动校验与双边限额)。

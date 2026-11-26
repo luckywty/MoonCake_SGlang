@@ -14,9 +14,10 @@ from uuid import uuid4
 
 from .client import RemoteCapacityError
 from .control import endpoint_address
+from .dram_protocol import minimum_pull_bytes, remote_pull_limits
 from .multiplex import MUX_VERSION, WorkerConnection
 from .prefix_index import PrefixIndex
-from .protocol import HANDOFF_VERSION
+from .protocol import HANDOFF_VERSION, KVLayout
 from .tier_index import TierIndex
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class WorkerNode:
     probe_lock: threading.Lock = field(default_factory=threading.Lock)
     prefix_sync_lock: threading.Lock = field(default_factory=threading.Lock)
     instance_id: str | None = None
+    dram_warning: tuple | None = None
 
 
 class WorkerPool:
@@ -88,6 +90,7 @@ class WorkerPool:
         self.prefix_index = PrefixIndex()
         self.tier_index = TierIndex()
         self.prefix_enabled = False
+        self.routing_config = None
         self.prefix_sync_interval = 0.2
         self.prefix_thread = None
         self.prefix_probes = ThreadPoolExecutor(
@@ -100,6 +103,7 @@ class WorkerPool:
     def configure_prefix_index(self, config):
         if self.thread is not None:
             raise RuntimeError("prefix index must be configured before WorkerPool.start")
+        self.routing_config = config
         self.prefix_enabled = config.policy == "cache_aware" or any(
             bucket.prefill.policy == "cache_aware" for bucket in config.buckets
         )
@@ -232,6 +236,47 @@ class WorkerPool:
             self.prefix_index.forget(node.worker_id)
             self.tier_index.forget(node.worker_id)
 
+    def _dram_config_warnings(self, health):
+        if not self.prefix_enabled or self.routing_config is None:
+            return ()
+        dram = health.get("dram_cache", {})
+        if not isinstance(dram, dict) or not (
+            dram.get("remote_enabled") is True or dram.get("remote_ready") is True
+        ):
+            return ()
+        if dram.get("remote_ready") is not True:
+            return (f"remote DRAM requested but unavailable: {dram.get('error') or 'not ready'}",)
+        limits = remote_pull_limits(dram)
+        if limits is None:
+            return (
+                "missing or invalid DRAM pull limits in health; remote hints disabled; upgrade Worker",
+            )
+        minimum, maximum = limits
+        config = self.routing_config
+        warnings = []
+        if minimum != config.min_remote_pull_tokens or maximum != config.dram_max_pull_bytes:
+            warnings.append(
+                "DRAM pull limits differ: "
+                f"Router --min-remote-pull-tokens={config.min_remote_pull_tokens}, "
+                f"--dram-max-pull-bytes={config.dram_max_pull_bytes}; "
+                f"Worker --pd-dram-min-remote-tokens={minimum}, "
+                f"--pd-dram-max-pull-bytes={maximum}; plans use the P/D/Router intersection"
+            )
+        try:
+            layout = KVLayout(**health["layout"])
+            tokens = max(minimum, config.min_remote_pull_tokens)
+            budget = min(maximum, config.dram_max_pull_bytes)
+            required = minimum_pull_bytes(layout.bytes_per_token, layout.page_size, tokens)
+            if required > budget:
+                warnings.append(
+                    f"remote DRAM has no feasible pull: {tokens} tokens require {required} "
+                    f"page-aligned bytes, exceeding the effective {budget}-byte limit; "
+                    "increase the byte limits or lower the token thresholds"
+                )
+        except (KeyError, TypeError, ValueError):
+            warnings.append("cannot validate remote DRAM byte budget: invalid Worker KV layout")
+        return tuple(warnings)
+
     def apply_health(self, node, health):
         transfer = health.get("transfer", {})
         if not isinstance(transfer, dict):
@@ -268,6 +313,7 @@ class WorkerPool:
             and not native.get("reason")
             and native.get("quarantined_bytes", 0) <= self.max_quarantined_bytes
         )
+        warnings = self._dram_config_warnings(health) if valid else ()
         with self.lock:
             instance = health.get("instance_id")
             if instance != node.instance_id:
@@ -280,12 +326,18 @@ class WorkerPool:
             node.reason = (
                 None if valid else "Worker health, protocol, or quarantine budget rejected"
             )
+            signature = (instance, warnings)
+            changed = signature != node.dram_warning
+            node.dram_warning = signature
             if valid and self.prefix_enabled:
                 self.prefix_index.observe(node.worker_id, health)
                 self.tier_index.observe(node.worker_id, health)
             else:
                 self.prefix_index.forget(node.worker_id)
                 self.tier_index.forget(node.worker_id)
+        if changed:
+            for message in warnings:
+                logger.warning("Worker %s (%s): %s", node.worker_id, node.endpoint, message)
 
     def probe(self, node):
         # A late probe cannot roll a newly discovered instance back to an old one.

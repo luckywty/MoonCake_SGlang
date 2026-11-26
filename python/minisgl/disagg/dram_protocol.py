@@ -13,6 +13,24 @@ TIER_INDEX_VERSION = 2
 MAX_DRAM_PULL_PAGES = 16384  # Keep pin plans/descriptors below the control-frame limit.
 
 
+def minimum_pull_bytes(bytes_per_token, page_size, min_tokens):
+    if any(
+        type(value) is not int or value < 1 for value in (bytes_per_token, page_size, min_tokens)
+    ):
+        raise ValueError(
+            "remote DRAM requires positive KV bytes/token, page size and token threshold"
+        )
+    return (min_tokens + page_size - 1) // page_size * page_size * bytes_per_token
+
+
+def remote_pull_limits(health):
+    """Unknown/malformed limits disable optional remote hints, never inference."""
+    if not isinstance(health, dict):
+        return None
+    limits = health.get("min_remote_tokens"), health.get("remote_max_bytes")
+    return limits if all(type(value) is int and value > 0 for value in limits) else None
+
+
 def digest_bytes(value):
     if not isinstance(value, str) or len(value) != 64:
         raise ValueError("invalid page digest")
@@ -130,6 +148,26 @@ class DramConfig:
     def gpu_staging_bytes(self, page_bytes):
         return 2 * self.staging_slots * self.batch_pages * page_bytes if self.enabled else 0
 
+    def validate_layout(self, bytes_per_token, page_size):
+        if not self.remote_enabled:
+            return
+        required = minimum_pull_bytes(bytes_per_token, page_size, self.min_remote_tokens)
+        pages = (self.min_remote_tokens + page_size - 1) // page_size
+        if pages > MAX_DRAM_PULL_PAGES:
+            raise ValueError(
+                f"--pd-dram-min-remote-tokens={self.min_remote_tokens} requires {pages} pages; "
+                f"remote DRAM supports at most {MAX_DRAM_PULL_PAGES} pages per pull"
+            )
+        if required > self.remote_max_bytes:
+            raise ValueError(
+                "remote DRAM pull can never reach its token threshold: "
+                f"model_bytes_per_token={bytes_per_token}, page_size={page_size}, "
+                f"--pd-dram-min-remote-tokens={self.min_remote_tokens} requires "
+                f"{pages * page_size} aligned tokens / {required} bytes, exceeding "
+                f"--pd-dram-max-pull-bytes={self.remote_max_bytes}; "
+                "increase --pd-dram-max-pull-bytes or lower --pd-dram-min-remote-tokens"
+            )
+
 
 _DRAM_FLAGS = (
     ("cache-bytes", "capacity_bytes", int),
@@ -179,16 +217,4 @@ def pop_dram_config(kwargs):
     if result.remote_enabled:
         if result.host in ("0.0.0.0", "::"):
             raise ValueError("remote DRAM needs --pd-dram-host or an advertised host")
-        if result.port is not None:
-            from .cluster_config import validate_mooncake_port
-
-            validate_mooncake_port(result.port)
-            ports = {
-                kwargs["server_port"],
-                kwargs["server_port"] + 1,
-                kwargs.get("pd_data_port") or kwargs["server_port"] + 2,
-                kwargs.get("pd_mooncake_port"),
-            }
-            if result.port in ports:
-                raise ValueError("DRAM TE port conflicts with a Worker/GPU transfer port")
     return result

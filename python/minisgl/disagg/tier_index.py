@@ -8,7 +8,13 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from uuid import uuid4
 
-from .dram_protocol import MAX_DRAM_PULL_PAGES, TIER_INDEX_VERSION, RemotePullPlan, digest_bytes
+from .dram_protocol import (
+    MAX_DRAM_PULL_PAGES,
+    TIER_INDEX_VERSION,
+    RemotePullPlan,
+    digest_bytes,
+    remote_pull_limits,
+)
 from .prefix_hash import PrefixHashSpec
 
 
@@ -391,21 +397,25 @@ class TierIndex:
                     * layout["head_dim"]
                     * {"float16": 2, "bfloat16": 2, "float32": 4}[layout["dtype"]]
                 )
+                p_dram = p.health.get("dram_cache", {})
+                p_limits = remote_pull_limits(p_dram)
                 for d in (
                     decode_nodes
-                    if p.health.get("dram_cache", {}).get("remote_ready", False)
+                    if isinstance(p_dram, dict) and p_dram.get("remote_ready") is True and p_limits
                     else ()
                 ):
                     source = valid(d)
-                    if source is None or not d.health.get("dram_cache", {}).get(
-                        "remote_ready", False
-                    ):
+                    d_dram = d.health.get("dram_cache", {})
+                    d_limits = remote_pull_limits(d_dram)
+                    if source is None or not d_limits or d_dram.get("remote_ready") is not True:
                         continue
                     end, _ = advance(source, "DRAM", c, parent)
-                    end = min(end, c + max_remote_bytes // (page * bpt), c + MAX_DRAM_PULL_PAGES)
+                    minimum = max(min_remote_tokens, p_limits[0], d_limits[0])
+                    maximum = min(max_remote_bytes, p_limits[1], d_limits[1])
+                    end = min(end, c + maximum // (page * bpt), c + MAX_DRAM_PULL_PAGES)
                     tokens = (end - c) * page
                     cost = tokens * bpt / 1e6 * (1 / h2d_gbps + 1 / rdma_gbps)
-                    if tokens < min_remote_tokens or cost >= tokens * prefill_ms_per_token:
+                    if tokens < minimum or cost >= tokens * prefill_ms_per_token:
                         continue
                     benefit = tokens * prefill_ms_per_token - cost
                     if benefit > best:

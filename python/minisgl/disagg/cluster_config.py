@@ -1,8 +1,11 @@
 """Pure configuration validation for local P/D clusters and remote pools."""
 
+import logging
 from dataclasses import dataclass
 
 from .control import endpoint_address, endpoint_name
+
+logger = logging.getLogger(__name__)
 
 
 def values(items):
@@ -20,7 +23,69 @@ def validate_mooncake_port(port):
     # Match classic TE's ValidatePortRange; otherwise it silently falls back to
     # its default range, which would defeat per-process fixed-port isolation.
     if type(port) is not int or not 1024 <= port <= 65535 or 32768 <= port <= 60999:
-        raise ValueError("Mooncake RPC port must be 1024..32767 or 61000..65535")
+        raise ValueError(
+            "Mooncake RPC port must be 1024..32767 or 61000..65535; "
+            "32768..60999 is the excluded ephemeral port range"
+        )
+
+
+def worker_port_bindings(
+    worker_id, control, data=None, gpu_te=None, host_te=None, *, native_gpu=True
+):
+    if type(control) is not int:
+        raise ValueError(f"{worker_id} control port must be an integer")
+    result = [
+        (f"{worker_id} control", control, False),
+        (f"{worker_id} distributed", control + 1, False),
+    ]
+    for label, port, native in (
+        ("data", data, False),
+        ("GPU TE", gpu_te, native_gpu),
+        ("Host TE", host_te, True),
+    ):
+        if port is not None:
+            result.append((f"{worker_id} {label}", port, native))
+    return result
+
+
+def validate_port_bindings(bindings):
+    """Validate the whole known plan before any child/listener/native engine starts."""
+    occupied, ephemeral = {}, []
+    for label, port, native in bindings:
+        if type(port) is not int or not 0 < port < 65536:
+            raise ValueError(f"invalid {label} port {port!r}; expected 1..65535")
+        if port in occupied:
+            raise ValueError(f"port {port} overlaps: {occupied[port]} and {label} must be distinct")
+        occupied[port] = label
+        if native:
+            try:
+                validate_mooncake_port(port)
+            except ValueError as exc:
+                raise ValueError(f"{label}: {exc}") from exc
+        elif 32768 <= port <= 60999:
+            ephemeral.append(f"{label}={port}")
+    if ephemeral:
+        logger.warning(
+            "Ports in ephemeral range 32768..60999 may collide with outgoing connections: %s; "
+            "prefer ports outside that range (fixed TE ports reject it)",
+            ", ".join(ephemeral),
+        )
+
+
+def validate_cluster_ports(specs, *, gateway_port=None, backend="tcp"):
+    bindings = [] if gateway_port is None else [("gateway HTTP", gateway_port, False)]
+    for spec in specs:
+        bindings.extend(
+            worker_port_bindings(
+                spec.worker_id,
+                spec.control_port,
+                spec.data_port,
+                spec.mooncake_port,
+                spec.dram_port,
+                native_gpu=backend == "mooncake",
+            )
+        )
+    validate_port_bindings(bindings)
 
 
 def add_routing_args(parser):
@@ -97,7 +162,7 @@ def local_plan(args, visible_gpus):
     if host in ("0.0.0.0", "::"):
         raise ValueError("wildcard Worker bind requires --worker-advertise-host")
     endpoint_address(endpoint_name(host, args.base_control_port))
-    specs, ports = [], {args.port} if not args.no_gateway else set()
+    specs = []
     for role, count, gpus, numa, hcas in (
         ("prefill", n, pg, values(args.prefill_numa_nodes), values(args.prefill_rdma_devices)),
         ("decode", m, dg, values(args.decode_numa_nodes), values(args.decode_rdma_devices)),
@@ -108,25 +173,9 @@ def local_plan(args, visible_gpus):
             index = len(specs)
             control = args.base_control_port + 2 * index
             te = args.base_mooncake_port + 2 * index
-            if args.pd_transfer_backend == "mooncake":
-                validate_mooncake_port(te)
-            occupied = {control, control + 1, te, te + 1}
             dram_port = None
             if getattr(args, "dram_remote_enabled", False):
                 dram_port = getattr(args, "base_dram_port", 25000) + index
-                validate_mooncake_port(dram_port)
-                if dram_port in occupied:
-                    raise ValueError("DRAM TE port overlaps another Worker port")
-                occupied.add(dram_port)
-            if (
-                len(occupied) != (5 if dram_port is not None else 4)
-                or ports.intersection(occupied)
-                or any(not 0 < p < 65536 for p in occupied)
-            ):
-                raise ValueError(
-                    "Worker control/distributed/TE/data and gateway ports must be distinct and valid"
-                )
-            ports.update(occupied)
             node = int(numa[i]) if numa else None
             if node is not None and node < 0:
                 raise ValueError("NUMA nodes must be nonnegative")
@@ -138,4 +187,7 @@ def local_plan(args, visible_gpus):
                     f"{role[0]}-{i}", role, gpu, host, control, te, te + 1, node, hca, dram_port
                 )
             )
+    validate_cluster_ports(
+        specs, gateway_port=None if args.no_gateway else args.port, backend=args.pd_transfer_backend
+    )
     return specs

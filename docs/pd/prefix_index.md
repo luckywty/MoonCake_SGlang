@@ -113,5 +113,8 @@ Worker health 的 `prefix_index` 包含实例、域、seq、pages、max_pages、
 | [router.py](../../python/minisgl/disagg/router.py)、[routed_client.py](../../python/minisgl/disagg/routed_client.py) | 后台同步、health 失效及路由接入 |
 | [radix_cache.py](../../python/minisgl/kvcache/radix_cache.py)、[cache.py](../../python/minisgl/scheduler/cache.py) | 真实页发布、拆分及淘汰钩子 |
 
-本轮按要求未新增或运行测试、未开展实验。只做源码审查、Python 编译和 `git diff --check`；
-历史路由测试结果不代表本次新索引已完成运行验收。
+2026-11-26 新增 `test_pd_prefix_index.py` 的 26 项独立 CPU 回归：固定哈希向量、域隔离、整页发布、
+Radix 拆分/淘汰、快照/增量追赶、溢出重建、重启/过期/失联失效、容量清理和实际选路。
+其中过期 Hint 用例先淘汰真实 HBM，验证下一请求从零计算，输出仍与 CPU attention 参考一致。
+`test_pd_prompt_prepare.py` 另有 3 项有界任务回归，检查取消/超时期间容量保护及 submit 失败回收。
+这些用例随扩大 CPU 集合通过；复现命令与真实进程/CUDA 边界见 [CPU 回归记录](cpu_regression.md)。

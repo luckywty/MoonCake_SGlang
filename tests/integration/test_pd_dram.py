@@ -142,6 +142,27 @@ def test_eviction_does_not_recycle_local_readers(policy):
     pool.release(borrowed)
 
 
+@pytest.mark.parametrize("policy,victim", [("lru", 0), ("lfu", 1)])
+def test_capacity_pressure_uses_the_configured_eviction_policy(policy, victim):
+    now = [0.0]
+    pool = DramPagePool(16, 3 * 256, pin_memory=False, policy=policy, clock=lambda: now[0])
+    prepared = prepare_prefix(tuple(range(16)), identity())
+    pages = [commit_page(pool, prepared)]
+    # A was used often, but its last use precedes the creation of B and C.
+    for _ in range(5):
+        borrowed = pool.acquire([pages[0].digest])
+        pool.release(borrowed)
+    for i in range(1, 3):
+        now[0] = float(i)
+        pages.append(commit_page(pool, prepared, i))
+    now[0] = 3.0
+    replacement = commit_page(pool, prepared, 3)
+    assert pages[victim].digest not in pool.pages
+    assert all(page.digest in pool.pages for i, page in enumerate(pages) if i != victim)
+    assert replacement.ready and pool.stats["evictions"] == 1
+    assert not pool.free and not any(page.readers or page.exports for page in pool.pages.values())
+
+
 def sync(index, node, publisher):
     index.observe(node.worker_id, node.health)
     for _ in range(20):
@@ -178,7 +199,11 @@ def test_tier_index_joins_local_prefix_with_one_remote_suffix():
                     "packing": "kv-layer-token-head-dim-le",
                     "quantization": "none",
                 },
-                "dram_cache": {"remote_ready": True},
+                "dram_cache": {
+                    "remote_ready": True,
+                    "min_remote_tokens": 4,
+                    "remote_max_bytes": 64 * 1024**2,
+                },
             },
         )
         nodes.append(node)
@@ -198,6 +223,17 @@ def test_tier_index_joins_local_prefix_with_one_remote_suffix():
     assert (hit.hbm_tokens, hit.dram_tokens, hit.remote_tokens) == (0, 8, 4)
     assert hit.remote_plan.source_id == nodes[1].worker_id
     assert hit.total == 12
+    for constraints in (
+        {"min_remote_tokens": 8},
+        {"min_remote_tokens": 4, "max_remote_bytes": 511},  # One KV page is 512 bytes.
+        {"min_remote_tokens": 4, "prefill_ms_per_token": 1e-12},
+    ):
+        rejected = index.hits(nodes[:1], nodes[1:], prepared, **constraints)[nodes[0].worker_id]
+        assert rejected.total == 8 and rejected.remote_plan is None
+    nodes[1].healthy = False
+    rejected = index.hits(nodes[:1], nodes[1:], prepared, min_remote_tokens=4)[nodes[0].worker_id]
+    assert rejected.total == 8 and rejected.remote_plan is None
+    nodes[1].healthy = True
     # Removing an ancestor on P must not remove a still-resident donor suffix.
     publishers[0].update("remove", "DRAM", hashes[0], spec.root, 1, 1)
     sync(index, nodes[0], publishers[0])
@@ -390,6 +426,11 @@ def test_reverse_promotion_and_dram_reserve_keep_original_suffix_boundary(
         enable(d, batch_pages=1)
         receiver, donor = attach_host(p, host_rdma), attach_host(d, host_rdma)
         assert receiver.engine.get_rpc_port() == 26000 and donor.engine.get_rpc_port() == 26001
+        for service in (p, d):
+            health = service.health()["dram_cache"]
+            assert health["remote_enabled"] and health["remote_ready"]
+            assert health["min_remote_tokens"] == service.dram_config.min_remote_tokens
+            assert health["remote_max_bytes"] == service.dram_config.remote_max_bytes
         assert os.environ["MC_MIN_RPC_PORT"] == os.environ["MC_MAX_RPC_PORT"] == "22501"
         receiver._rpc = lambda endpoint, message: donor.rpc(message)
         first, output = run_request(p, d, prompt, 8)
@@ -547,6 +588,52 @@ def test_remote_failure_recomputes_and_completes_the_request(host_rdma, failure)
             if failure == "read_busy":
                 receiver.read_slots.release()
                 receiver.read_slots.release()
+
+
+def test_partial_remote_timeout_keeps_loaded_prefix_and_recomputes_the_remainder(
+    host_rdma, monkeypatch
+):
+    with cluster(budget=32) as (p, decoders, _):
+        d = decoders[0]
+        enable(p, batch_pages=1)
+        enable(d, batch_pages=1)
+        receiver, donor = attach_host(p, host_rdma, timeout=0.01), attach_host(d, host_rdma)
+        receiver._rpc = lambda endpoint, message: donor.rpc(message)
+        first, output = run_request(p, d, tuple(range(1, 11)), 8)
+        for service in (p, d):
+            service._dram_rpc({"op": "cache_commit", "transfer_id": first.transfer_id})
+        followup = first.prompt_ids + tuple(output) + (22, 23)
+        prepared = prepare_prefix(followup, p.tier_publisher.spec)
+        hashes = tuple(prepared.digests())
+        plan = RemotePullPlan(
+            "d-0", d.instance_id, "donor:9000", prepared.domain_id, 2, hashes[2:4]
+        )
+        submit = receiver.engine.submit_scatter_read
+        gate = threading.Event()
+
+        def block_second_page(*args):
+            ticket = submit(*args)
+            if len(receiver.engine.submissions) == 2:
+                receiver.engine.gate = gate
+            return ticket
+
+        monkeypatch.setattr(receiver.engine, "submit_scatter_read", block_second_page)
+        try:
+            second, output2 = run_request(p, d, followup, 3, plan=plan)
+            assert output2 == reference_tokens(followup, 3)
+            assert p.dram_stats["remote_hit_tokens"] == 4
+            assert p.dram_stats["pull_fallbacks"] > 0
+            assert len(p.s.cache_manager.free_slots) == p.s.engine.num_pages
+            assert len(receiver.operations) == 1 and receiver.pool.quarantined_slots
+            for service in (p, d):
+                service._dram_rpc({"op": "cache_commit", "transfer_id": second.transfer_id})
+            assert p.dram_pool.pages[hashes[2]].ready
+            assert not p.dram_pool.pages[hashes[3]].ready  # Late DMA cannot publish a page.
+        finally:
+            gate.set()
+            receiver.progress()
+        wait_for(lambda: not donor.pool.leases)
+        assert not receiver.operations and not receiver.pool.quarantined_slots
 
 
 @pytest.mark.parametrize("result", [0, -1])

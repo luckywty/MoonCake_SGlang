@@ -79,7 +79,9 @@ class TinyEngine:
         )
 
 
-def cpu_scheduler(role, page_size=4, delay=0.0, max_running_req=2, prefill_budget=3):
+def cpu_scheduler(
+    role, page_size=4, delay=0.0, max_running_req=2, prefill_budget=3, cache_type="naive"
+):
     tp_info._TP_INFO = tp_info.DistributedInfo(0, 1)
     core._GLOBAL_CTX = core.Context(page_size)
     scheduler = PDWorkerScheduler.__new__(PDWorkerScheduler)
@@ -91,7 +93,7 @@ def cpu_scheduler(role, page_size=4, delay=0.0, max_running_req=2, prefill_budge
     scheduler.eos_token_id = 31
     scheduler.engine_stream_ctx = nullcontext()
     scheduler.table_manager = TableManager(max_running_req, scheduler.engine.page_table)
-    scheduler.cache_manager = CacheManager(32, page_size, scheduler.engine.page_table, "naive")
+    scheduler.cache_manager = CacheManager(32, page_size, scheduler.engine.page_table, cache_type)
     if scheduler.role is WorkerRole.DECODE:
         scheduler.cache_manager.free_slots = scheduler.cache_manager.free_slots.flip(0)
     scheduler.decode_manager = DecodeManager(page_size)

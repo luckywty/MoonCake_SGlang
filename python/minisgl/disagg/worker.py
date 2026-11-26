@@ -65,6 +65,13 @@ class PDWorkerScheduler(Scheduler):
         from .dram_protocol import DramConfig
 
         dram = getattr(config, "pd_dram", DramConfig())
+        if dram.remote_enabled:
+            model = config.model_config
+            # Split Workers require TP=1. Check before loading weights or constructing CUDA pools.
+            dram.validate_layout(
+                2 * model.num_layers * model.num_kv_heads * model.head_dim * config.dtype.itemsize,
+                config.page_size,
+            )
         if dram.enabled:
             config = replace(
                 config, pd_dram_staging_pages=2 * dram.staging_slots * dram.batch_pages

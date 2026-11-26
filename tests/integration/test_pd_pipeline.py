@@ -109,10 +109,29 @@ def test_duplicate_attempt_rejected(workers):
             assert result["status"] == ("handoff" if index == 0 else "error")
 
 
-def test_first_token_eos_short_circuits_decode(workers):
+def test_first_token_eos_releases_decode_reservation_without_transfer_or_decode(
+    workers, monkeypatch
+):
     # Find a deterministic prompt whose first greedy token is the reference model EOS (31).
     prompt = next(([token] for token in range(32) if reference_tokens([token], 1) == [31]), None)
     if prompt is None:
         pytest.fail("reference fixture must include a first-token EOS case")
-    assert PDClient(workers[0], "127.0.0.1:1", timeout=3).generate(prompt, 5) == [31]
-    assert idle_health(workers[1])["free_rows"] == 2
+    before = idle_health(workers[1])
+    messages = []
+    send = Channel.send
+
+    def record(channel, message):
+        messages.append(message)
+        return send(channel, message)
+
+    monkeypatch.setattr(Channel, "send", record)
+    # D must be reachable for reserve-first even when P's first token is EOS.
+    assert PDClient(*workers, timeout=3).generate(prompt, 5) == [31]
+    operations = [message["op"] for message in messages]
+    assert operations.count("reserve") == operations.count("release") == 1
+    assert operations.index("reserve") < operations.index("prefill") < operations.index("release")
+    assert not {"prepare", "send", "commit"}.intersection(operations)
+    after = idle_health(workers[1])
+    assert after["received_kv_tokens"] == before["received_kv_tokens"]
+    assert after["free_rows"] == 2 and after["free_pages"] == 32
+    assert idle_health(workers[0])["free_rows"] == 2

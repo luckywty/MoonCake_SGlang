@@ -25,6 +25,7 @@ class DramServiceMixin:
         self.dram_stats = {"pull_fallbacks": 0, "remote_hit_tokens": 0, "local_hit_tokens": 0}
         if not self.dram_config.enabled:
             return
+        self.dram_config.validate_layout(self.s.layout.bytes_per_token, self.s.layout.page_size)
         spec = PrefixHashSpec.from_layout(asdict(self.s.layout), self.cache_namespace)
         self.tier_publisher = TierPublisher(
             spec,
@@ -64,14 +65,20 @@ class DramServiceMixin:
                 self.dram_error = str(exc)
 
     def _dram_health(self):
+        limits = {
+            "remote_enabled": self.dram_config.remote_enabled,
+            "min_remote_tokens": self.dram_config.min_remote_tokens,
+            "remote_max_bytes": self.dram_config.remote_max_bytes,
+        }
         if self.dram_pool is None:
-            return {"enabled": False, "remote_ready": False}
+            return dict(enabled=False, remote_ready=False, **limits)
         return dict(
             enabled=True,
             version=1,
             remote_ready=self.dram_transfer is not None and self.dram_transfer.ready,
             error=self.dram_error
             or (self.dram_transfer.reason if self.dram_transfer is not None else None),
+            **limits,
             **self.dram_pool.health(),
             **self.dram_controller.stats,
             **self.dram_stats,
