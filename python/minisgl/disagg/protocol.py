@@ -10,6 +10,12 @@ from uuid import UUID
 DTYPE_BYTES = {"float16": 2, "bfloat16": 2, "float32": 4}
 MAX_INT32 = 2**31 - 1
 HANDOFF_VERSION = 2
+MOONCAKE_TRANSPORT_MODES = ("gpu_direct", "host_dram")
+
+
+def worker_transfer_mode(info):
+    """Missing metadata is the legacy direct-GPU protocol, never a host fallback."""
+    return info.get("transfer_mode", "gpu_direct" if info.get("layered_transfer") else "tcp")
 
 
 def _int(name: str, value: int, minimum: int = 0) -> None:
@@ -41,7 +47,12 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _wire(record: Any) -> bytes:
-    return json.dumps(asdict(record), separators=(",", ":"), allow_nan=False).encode("utf-8")
+    obj = asdict(record)
+    # Preserve the existing gpu_direct wire representation. Host mode must be explicit.
+    for value in (obj, obj.get("kv", {})):
+        if value.get("transfer_mode") == "gpu_direct":
+            value.pop("transfer_mode")
+    return json.dumps(obj, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
 def _load(payload: bytes) -> Any:
@@ -67,7 +78,8 @@ def _v1(version: int) -> None:
 
 @dataclass(frozen=True)
 class KVLayout:
-    '''定义 KV Cache 的数据类型、张量维度、打包格式和 TP 信息'''
+    """定义 KV Cache 的数据类型、张量维度、打包格式和 TP 信息"""
+
     """Per-rank packed payload: K/V, layer, logical token, local KV head, head dimension."""
 
     model_fingerprint: str
@@ -104,11 +116,12 @@ class KVLayout:
 
 @dataclass(frozen=True)
 class KVTransferMetadata:
-    '''某一次传输需要搬运哪些 KV Cache
+    """某一次传输需要搬运哪些 KV Cache
 
     KVLayout 描述一类 KV Cache 的格式。
     KVTransferMetadata 描述某次具体传输涉及的 KV Cache。
-    '''
+    """
+
     """Source pages cover the suffix after prefix_len; kv_tokens may be zero on a full hit."""
 
     transfer_id: str
@@ -117,8 +130,13 @@ class KVTransferMetadata:
     source_pages: tuple[int, ...]
     version: int = HANDOFF_VERSION
     prefix_len: int = 0
+    transfer_mode: str = "gpu_direct"
 
     def __post_init__(self) -> None:
+        if self.transfer_mode not in MOONCAKE_TRANSPORT_MODES:
+            raise ValueError("unsupported KV transfer mode")
+        if self.version == 1 and self.transfer_mode != "gpu_direct":
+            raise ValueError("v1 cannot describe host DRAM transport")
         if type(self.version) is not int or self.version not in (1, HANDOFF_VERSION):
             raise ValueError("unsupported KV metadata version")
         check_transfer_id(self.transfer_id)
@@ -160,6 +178,7 @@ class KVTransferMetadata:
         *,
         num_pool_pages: int,
         prefix_len: int = 0,
+        transfer_mode: str = "gpu_direct",
     ) -> KVTransferMetadata:
         """Consume only the valid CPU slot snapshot. num_pool_pages excludes the graph dummy."""
         _int("num_pool_pages", num_pool_pages, 1)
@@ -175,13 +194,22 @@ class KVTransferMetadata:
             elif pages[-1] != page:
                 raise ValueError("physical page changed within a logical page")
             count += 1
-        return cls(transfer_id, layout, count, tuple(pages), prefix_len=prefix_len)
+        return cls(
+            transfer_id,
+            layout,
+            count,
+            tuple(pages),
+            prefix_len=prefix_len,
+            transfer_mode=transfer_mode,
+        )
 
     def to_wire(self) -> bytes:
         return _wire(self)
 
     @classmethod
     def _from_object(cls, obj: Any) -> KVTransferMetadata:
+        if isinstance(obj, dict):
+            obj = {"transfer_mode": "gpu_direct", **obj}
         if isinstance(obj, dict) and obj.get("version") == 1:
             obj = {"prefix_len": 0, **obj}
         data = _object(cls, obj)
@@ -196,10 +224,11 @@ class KVTransferMetadata:
 
 @dataclass(frozen=True)
 class RequestHandoff:
-    '''Prefill 完成后，Decode 应该如何接续这个推理请求
-    
+    """Prefill 完成后，Decode 应该如何接续这个推理请求
+
     Decode 收到 KV Cache 后，如何知道自己应该继续执行哪个请求，以及接下来需要生成什么？
-    '''
+    """
+
     """After final prefill. P sampled token zero; the sole egress publishes it once."""
 
     uid: int
@@ -219,12 +248,11 @@ class RequestHandoff:
         _int("max_tokens", self.max_tokens, 1)
         if not isinstance(self.kv, KVTransferMetadata):
             raise ValueError("missing KV metadata")
-        if self.version == 1 and (self.kv.prefix_len or not self.kv.kv_tokens):
-            raise ValueError("v1 requires a nonempty full-prompt transfer")
-        if (
-            not isinstance(self.prompt_ids, tuple)
-            or len(self.prompt_ids) != self.kv.prompt_tokens
+        if self.version == 1 and (
+            self.kv.prefix_len or not self.kv.kv_tokens or self.kv.transfer_mode != "gpu_direct"
         ):
+            raise ValueError("v1 requires a nonempty full-prompt transfer")
+        if not isinstance(self.prompt_ids, tuple) or len(self.prompt_ids) != self.kv.prompt_tokens:
             raise ValueError("decode prefix and transferred KV must cover the complete prompt")
         for token in self.prompt_ids:
             _token(token)
@@ -253,10 +281,11 @@ class RequestHandoff:
 
 @dataclass(frozen=True)
 class ReceiveTicket:
-    '''Decode 已经准备好的接收任务，供 Prefill 定位传输目标
-    
+    """Decode 已经准备好的接收任务，供 Prefill 定位传输目标
+
     让Prefill 知道自己需要发送什么 KV Cache，但是应该发送到 Decode 的哪个接收任务
-    '''
+    """
+
     """Attempt-scoped receiver locator, interpreted only by the selected transfer backend."""
 
     transfer_id: str

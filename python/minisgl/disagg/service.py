@@ -108,6 +108,7 @@ class WorkerService(DramServiceMixin):
         self.recent = deque(maxlen=4096)
         self.next_uid = 0
         self.layered = bool(getattr(backend, "layered_transfer", False))
+        self.transfer_mode = getattr(backend, "transfer_mode", "gpu_direct")
         self.is_prefill = scheduler.role is WorkerRole.PREFILL
         self.instance_id = str(uuid4())
         self.cache_namespace = config.get("cache_namespace", "default")
@@ -135,7 +136,13 @@ class WorkerService(DramServiceMixin):
             scheduler.prefill_manager.page_aligned_budget = True
         self.io = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pd-transfer")
         self.install_stream = (
-            torch.cuda.Stream(device=scheduler.device) if scheduler.device.type == "cuda" else None
+            (
+                backend.install_stream
+                if self.transfer_mode == "host_dram"
+                else torch.cuda.Stream(device=scheduler.device)
+            )
+            if scheduler.device.type == "cuda" and not self.is_prefill
+            else None
         )
         self.stats = {
             "max_prefill_batch": 0,
@@ -191,6 +198,7 @@ class WorkerService(DramServiceMixin):
             "installing_requests": sum(c.phase == "installing" for c in self.contexts.values()),
             "routing_version": 1,
             "handoff_version": HANDOFF_VERSION,
+            "transfer_mode": self.transfer_mode if self.layered else "tcp",
             "decode_prefix_reuse": True,
             "decode_radix_cache": self.decode_radix_cache,
             "max_sequence_tokens": s.engine.max_seq_len,
@@ -213,6 +221,7 @@ class WorkerService(DramServiceMixin):
     def capabilities(self):
         return {
             "status": "capabilities",
+            "transfer_mode": self.transfer_mode if self.layered else "tcp",
             "layered_transfer": self.layered,
             "concurrent_requests": True,
             "multiplex_version": 1,
@@ -312,6 +321,7 @@ class WorkerService(DramServiceMixin):
             "decode_prefix_len": ctx.decode_prefix_len,
             "prompt_tokens": len(ctx.request.prompt_ids),
             "handoff_version": HANDOFF_VERSION,
+            "transfer_mode": self.transfer_mode if self.layered else "tcp",
         }
         if self.dram_pool is not None:
             reply["dram_cache_version"] = 1
@@ -467,6 +477,7 @@ class WorkerService(DramServiceMixin):
             or handoff.max_tokens != request.max_tokens
             or handoff.ignore_eos != request.ignore_eos
             or handoff.kv.layout != self.s.layout
+            or handoff.kv.transfer_mode != self.transfer_mode
             or handoff.kv.prefix_len != prefix_len
             or handoff.eos_token_id != self.s.eos_token_id
             or handoff.first_token_id >= self.s.vocab_size
@@ -735,6 +746,7 @@ class WorkerService(DramServiceMixin):
             slots.tolist(),
             num_pool_pages=s.engine.num_pages,
             prefix_len=ctx.decode_prefix_len,
+            transfer_mode=self.transfer_mode,
         )
         ctx.handoff = RequestHandoff(
             request.uid,
@@ -804,8 +816,8 @@ class WorkerService(DramServiceMixin):
                 stream.wait_stream(s.engine.stream)
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
                 if self.layered and ctx.transfer_tokens:
-                    s.engine.kv_cache.import_layered_tensor(
-                        ctx.staging, slots, num_pool_pages=s.engine.num_pages
+                    self.backend.install_layers(
+                        s.engine.kv_cache, ctx.staging, slots, num_pool_pages=s.engine.num_pages
                     )
                 elif ctx.transfer_tokens:
                     s.engine.kv_cache.import_tokens(

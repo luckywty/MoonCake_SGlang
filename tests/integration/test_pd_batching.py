@@ -38,6 +38,8 @@ def cluster(
     page_size=4,
     prefill_cache_type="naive",
     decode_radix_cache=False,
+    transport_mode="gpu_direct",
+    registered_bytes=32768,
 ):
     backends, services = [], []
     try:
@@ -62,9 +64,10 @@ def cluster(
                 None,
                 timeout=2,
                 max_transfer_bytes=16384,
-                max_registered_bytes=32768,
+                max_registered_bytes=registered_bytes,
                 layers_per_chunk=group,
                 staging_slots=staging_slots,
+                transfer_mode=transport_mode,
             )
             backends.append(backend)
             backend.endpoint = f"127.0.0.1:{1980 + i}"
@@ -235,9 +238,71 @@ def test_blocked_destination_does_not_delay_another_requests_sent_receipt(group,
         assert not p.contexts and not slow.backend._leases
 
 
+def test_host_dram_inference_startup_pools_complete_and_reclaim(monkeypatch):
+    with cluster(transport_mode="host_dram", inference_pools=True) as (p, decoders, _):
+        d = decoders[0]
+        from unittest.mock import Mock
+
+        for service in (p, d):
+            monkeypatch.setattr(
+                service.backend.runtime,
+                "allocate_buffer",
+                Mock(side_effect=AssertionError("hot staging allocation")),
+            )
+        item = reserve(d, (1, 2, 3, 4, 5), 5)
+        output = drive(p, [d], [item], [submit(p, item)])
+        assert output[item[0].transfer_id] == reference_tokens((1, 2, 3, 4, 5), 5)
+        assert (
+            not d.backend._leases
+            and d.backend._allocator.available == d.backend._receive_buffer.nbytes
+        )
+        assert p.backend._gpu_indices.is_inference() and d.backend._gpu_workspace.is_inference()
+
+
+def test_host_receive_slice_returns_as_soon_as_install_event_completes_before_decode_finishes():
+    with cluster(transport_mode="host_dram") as (p, decoders, _):
+        d = decoders[0]
+        item = reserve(d, (1, 2, 3, 4, 5), 10)
+        ps = submit(p, item)
+        messages = []
+        until = time.monotonic() + 2
+        while not ps.done.is_set() and time.monotonic() < until:
+            p.step()
+            messages.extend(receive(ps))
+            time.sleep(0.001)
+        messages.extend(receive(ps))
+        assert [m["status"] for m in messages] == ["handoff", "sent"]
+        d.install_stream = FakeStream()
+        d.s.engine.stream = FakeStream()
+        d._command(
+            item[1],
+            {"op": "commit", "transfer_id": item[0].transfer_id, "handoff": messages[0]["handoff"]},
+        )
+        ctx = d.contexts[item[1]]
+        d._install(ctx)
+        ready = threading.Event()
+        ctx.install_event.query = ready.is_set
+        d._progress()
+        assert ctx.phase == "installing" and item[2]["locator"] in d.backend._leases
+        ready.set()
+        d._progress()  # Only event.query, no Decode forward or CPU synchronization.
+        assert ctx.phase == "decode" and not item[1].done.is_set()
+        assert not d.backend._leases
+        assert d.backend._allocator.available == d.backend._receive_buffer.nbytes
+        assert ctx.ticket is ctx.staging is ctx.install_event is None
+        assert len(d.s.cache_manager.free_slots) < d.s.engine.num_pages
+
+
 @pytest.mark.parametrize("cancel_op", ["disconnect", "release"])
-def test_cancelled_install_retains_receive_slice_and_private_pages_until_event_query(cancel_op):
-    with cluster(group=2) as (p, decoders, _):
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_cancelled_install_retains_receive_slice_and_private_pages_until_event_query(
+    cancel_op, transport_mode
+):
+    with cluster(group=2, transport_mode=transport_mode, registered_bytes=65536) as (
+        p,
+        decoders,
+        _,
+    ):
         d = decoders[0]
         item = reserve(d, (1, 2, 3), 5)
         ps = submit(p, item)

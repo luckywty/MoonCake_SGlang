@@ -20,9 +20,61 @@ from minisgl.disagg.router import WorkerPool
 from minisgl.disagg.routing_policy import RoutingConfig
 from minisgl.disagg.service import WorkerService
 from minisgl.disagg.transfer import MockFabric, MockTransferBackend
+from pd_cache_reference import cpu_radix_compare  # noqa: F401
 from pd_reference import cpu_scheduler, reference_tokens
 from test_pd_batching import fake_cuda  # noqa: F401
 from test_pd_control_loop import MemoryChannel, MemoryListener, readable
+
+
+@pytest.mark.usefixtures("cpu_radix_compare")
+def test_host_dram_routed_multiturn_suffix_and_zero_payload_hit(monkeypatch):
+    from minisgl.disagg.routing_policy import RoutingBucket, WorkerGroup
+
+    config = RoutingConfig(
+        policy="round_robin",
+        decode_policy="round_robin",
+        buckets=(RoutingBucket(prefill=WorkerGroup(("p-0",)), decode=WorkerGroup(("d-0",))),),
+    )
+    with running_cluster(
+        monkeypatch, routing_config=config, transport_mode="host_dram", decode_radix_cache=True
+    ) as (client, services, _, frames):
+        prompt = tuple(range(1, 11))
+        output = client.generate(prompt, 7, ignore_eos=True)
+        assert output == reference_tokens(prompt, 7)
+        wait_for(lambda: all(not s.contexts for s in services))
+        p, d = services[0], services[2]
+        followup = prompt + tuple(output) + (20, 21)
+        before = len(p.backend.fake_engine.submissions)
+        assert client.generate(followup, 3, ignore_eos=True) == reference_tokens(followup, 3)
+        wait_for(lambda: all(not s.contexts for s in services))
+        assert (
+            sum(t.length for t in p.backend.fake_engine.submissions[before:])
+            == (len(followup) - 16) * d.s.layout.bytes_per_token
+        )
+        before = len(p.backend.fake_engine.submissions)
+        received = d.stats["received_kv_tokens"]
+        assert client.generate(prompt[:8], 3, ignore_eos=True) == reference_tokens(prompt[:8], 3)
+        wait_for(lambda: all(not s.contexts for s in services))
+        assert len(p.backend.fake_engine.submissions) == before
+        assert d.stats["received_kv_tokens"] == received
+        assert d.backend._allocator.available == d.backend._receive_buffer.nbytes
+        assert p.backend.fake_engine.register_calls == p.backend.staging_slots
+        assert d.backend.fake_engine.register_calls == 1 and d.backend.runtime.cuda.visible == 0
+        assert p.health()["transfer_mode"] == d.health()["transfer_mode"] == "host_dram"
+        assert any(
+            frame.get("message", {}).get("handoff", {}).get("kv", {}).get("transfer_mode")
+            == "host_dram"
+            for frame in frames
+        )
+        assert not client.router.inflight
+
+
+def test_routed_pool_rejects_host_gpu_mixed_workers_before_prefill(monkeypatch):
+    with pytest.raises(RuntimeError, match="transfer modes differ"):
+        with running_cluster(
+            monkeypatch, transport_mode="host_dram", decode_transport_mode="gpu_direct"
+        ):
+            pytest.fail("mixed main-channel transport must not become ready")
 
 
 @contextmanager
@@ -34,6 +86,8 @@ def running_cluster(
     dram_config=None,
     prefill_cache_type="naive",
     decode_radix_cache=False,
+    transport_mode="gpu_direct",
+    decode_transport_mode=None,
 ):
     services, backends, threads, errors = [], [], [], []
     stop, fabric = threading.Event(), MockFabric()
@@ -65,6 +119,11 @@ def running_cluster(
                     max_registered_bytes=32768,
                     layers_per_chunk=1,
                     staging_slots=2,
+                    transfer_mode=(
+                        transport_mode
+                        if role == "prefill"
+                        else decode_transport_mode or transport_mode
+                    ),
                 )
                 backend.endpoint = f"127.0.0.1:{22100 + index}"
                 backend.bind_device(scheduler.device)

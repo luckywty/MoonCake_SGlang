@@ -5,6 +5,8 @@
 当前支持多 P/D Worker 负载与缓存感知路由、多请求组批、逐层 KV 传输与后续 Prefill 计算重叠，
 以及可选的 D GPU Radix 前缀复用、按请求取消和资源回收。
 新增 P/D 本地 Pinned DRAM KV 缓存、单源 D→P 按需拉取和跨 P/D 的三级缓存感知选路。
+主 P→D 逐层通道另可显式使用 Pinned Host DRAM 中转，支持无 GPUDirect 的 CUDA/RDMA 部署，见
+[Host 中转说明](docs/pd/host_dram_transfer.md)。
 Python 包名和命令入口仍为 `minisgl`。
 
 新增 **P 本地 HBM 页面哈希链索引**：`cache_aware` 通过后台同步的页元数据选路，
@@ -13,10 +15,11 @@ Python 包名和命令入口仍为 `minisgl`。
 使用方法与一致性边界见[页面哈希索引](docs/pd/prefix_index.md)。
 启用 DRAM 后进一步使用 v2 HBM/DRAM 镜像，设计、配置与验收边界见 [DRAM KV 缓存](docs/pd/dram_cache.md)。
 
-> **当前版本（2026-11-26）**：新增默认关闭的本地 DRAM 缓存和 D→P 反向提升，支持 LRU/LFU、异步 D2H/H2D、短租约和失败重算。
+> **当前版本（2026-11-27）**：支持显式 `--pd-mooncake-transport-mode host_dram` 的主通道逐层中转；默认 `gpu_direct`，不会因 GDR 不可用而自动降级。
+> 本地 DRAM 缓存和 D→P 反向提升继续独立配置，支持 LRU/LFU、异步 D2H/H2D、短租约和失败重算；TE 与中转池完全分开。
 > D Radix 仍默认关闭；P→D 后缀始终取决于 D reserve 的真实前缀，单端点及 Routed 客户端继续先向 D 预留资源。
 > 已新增并运行 CPU attention 续算、受控 RDMA、拷贝 reader、缓存提交和索引一致性测试；CUDA/RDMA 实机验证仍待完成。
-> 三个缓存功能提交已补独立 CPU 回归，两个旧凭证测试修绿；扩大集合 **356 passed、16 skipped、0 failed**，见 [CPU 回归记录](docs/pd/cpu_regression.md)。
+> 扩大集合 **404 passed、19 skipped、117 subtests passed、0 failed**，包含 Host 中转的同步、隔离及混连回归，见 [CPU 回归记录](docs/pd/cpu_regression.md)。
 > 启动期检查模型 KV 门槛与字节上限，health 比对 Router/Worker 配置并约束计划；统一检查本机 Worker/Gateway 的端口冲突。
 > 远端拉取需配套构建 `../Mooncake` 的 reader fence API；本机 CMake 配置受缺失开发依赖阻止。旧 binding 可继续使用本地 DRAM。
 > 配套原生改动随仓库保存在 [Mooncake 补丁](patches/mooncake/README.md)，含准确基线和应用步骤。
@@ -397,6 +400,7 @@ P 开始计算后保持绑定，不因容量不足重选或重放。
 | `--pd-advertise-host` | D 对外公布的后端地址；通配绑定时必须指定。 |
 | `--pd-mooncake-host` | 本机可达 TE 地址，不能填对端或通配地址。 |
 | `--pd-mooncake-port` | 可选固定 TE RPC 端口；多 Worker 启动器按 `--base-mooncake-port` 分配。 |
+| `--pd-mooncake-transport-mode` | `gpu_direct` 默认，`host_dram` 显式选择主 TE 的 Pinned Host 逐层中转；仅 Mooncake split Worker 可用。 |
 | `--pd-mooncake-device` | 可选的逗号分隔 HCA 名称。 |
 | `--worker-id` | Worker 健康信息中的身份；本地启动器分配 `p-0`、`d-0` 等。 |
 | `--pd-timeout` | 默认 120 秒；超时不能证明原生 DMA 已停止。 |
@@ -504,8 +508,8 @@ TVM_FFI_DISABLE_TORCH_C_DLPACK=1 FLUXINFER_TEST_PYTHON=python bash tools/pd/test
 不下载 Hugging Face 权重。逐层所有权测试使用内存控制通道，端到端用例另使用真实 socket；
 CUDA event 和原生 DMA 的 CPU 适配器不能证明真实 GPU/RDMA 并发。
 
-当前扩大集合结果为 **356 passed、16 skipped、113 subtests passed、0 failed**，包括真实本机 TCP、
-HTTP/SSE 与两进程续算，无 deselected。16 项需要 CUDA/GPU 的用例跳过；完整记录见
+当前扩大集合结果为 **404 passed、19 skipped、117 subtests passed、0 failed**，包括真实本机 TCP、
+HTTP/SSE 与两进程续算，无 deselected。19 项需要 CUDA/GPU 的用例跳过；完整记录见
 [CPU 回归](docs/pd/cpu_regression.md)。真实模型、跨服务器、CUDA/RDMA 和性能仍需实机验收。
 
 ### GPU 模型对照
@@ -576,6 +580,7 @@ docs/pd/                # P/D 专项设计和阶段记录
 
 - [逐层 KV 传输](docs/pd/layered_transfer.md)：缓冲池、层组流水线、所有权、取消与验收入口。
 - [D Radix Cache](docs/pd/decode_radix_cache.md)：默认关闭、页级共享、后缀传输、完整命中及回收规则。
+- [主通道 Host 中转](docs/pd/host_dram_transfer.md)：显式模式、固定 pinned/GPU staging、双 DMA 屏障、TE/缓存隔离和混连校验。
 - [P 页面哈希索引](docs/pd/prefix_index.md)：SHA-256 哈希域、真实 HBM 发布、后台增删同步、容量与 P/D 边界。
 - [CPU 回归记录](docs/pd/cpu_regression.md)：三个缓存功能提交的独立覆盖、基线失败修复、完整 CPU 集合命令与验证边界。
 - [多请求调度](docs/pd/batching.md)：异步控制面、批量传输、动态 Decode、显存与准入参数。

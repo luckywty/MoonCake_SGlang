@@ -8,6 +8,64 @@ from .control import endpoint_address, endpoint_name
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class HostStagingPlan:
+    max_tokens: int
+    payload_bytes: int
+    group_bytes: int
+    registered_bytes: int
+    gpu_bytes: int
+
+
+def host_staging_plan(
+    *,
+    max_seq_len,
+    bytes_per_token,
+    layers,
+    layers_per_chunk,
+    staging_slots,
+    max_transfer_bytes,
+    max_registered_bytes,
+    rows,
+    prefill,
+):
+    """One main-TE registration budget; GPU workspaces are reserved separately."""
+    for value in (
+        max_seq_len,
+        bytes_per_token,
+        layers,
+        layers_per_chunk,
+        staging_slots,
+        max_transfer_bytes,
+        max_registered_bytes,
+        rows,
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError("host_dram staging dimensions and budgets must be positive integers")
+    tokens = min(max_seq_len, max_transfer_bytes // bytes_per_token)
+    if not tokens or bytes_per_token % layers:
+        raise ValueError("host_dram transfer limit cannot hold one valid KV token")
+
+    def align(size):
+        return (size + 255) // 256 * 256
+
+    payload = tokens * bytes_per_token
+    group = align(tokens * (bytes_per_token // layers) * min(layers, layers_per_chunk))
+    registered = (
+        staging_slots * group
+        if prefill
+        else min(max_registered_bytes // 256 * 256, rows * align(payload))
+    )
+    required = staging_slots * group if prefill else align(payload)
+    if required > max_registered_bytes:
+        raise ValueError(
+            f"host_dram {'sender ring' if prefill else 'receive pool'} requires {required} "
+            f"registered bytes, exceeding --pd-max-registered-bytes={max_registered_bytes}; "
+            "increase the budget, lower --pd-max-transfer-bytes or reduce --pd-layers-per-chunk"
+        )
+    return HostStagingPlan(tokens, payload, group, registered, group + tokens * 8)
+
+
 def values(items):
     if items is None:
         return []
@@ -40,7 +98,7 @@ def worker_port_bindings(
     ]
     for label, port, native in (
         ("data", data, False),
-        ("GPU TE", gpu_te, native_gpu),
+        ("main TE", gpu_te, native_gpu),
         ("Host TE", host_te, True),
     ):
         if port is not None:

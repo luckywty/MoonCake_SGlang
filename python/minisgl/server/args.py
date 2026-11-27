@@ -8,6 +8,7 @@ from typing import List, Tuple
 
 import torch
 from minisgl.disagg.dram_protocol import DramConfig, add_dram_args, pop_dram_config
+from minisgl.disagg.protocol import MOONCAKE_TRANSPORT_MODES
 from minisgl.disagg.role import WorkerRole
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
@@ -38,6 +39,7 @@ class ServerArgs(SchedulerConfig):
     pd_output_queue_size: int = 128
     worker_id: str = ""
     pd_mooncake_port: int | None = None
+    pd_mooncake_transport_mode: str = "gpu_direct"
     disaggregation_decode_enable_radix_cache: bool = False
     pd_cache_namespace: str = "default"
     pd_prefix_max_pages: int = 65536
@@ -93,6 +95,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
     add_dram_args(parser)
+    parser.add_argument(
+        "--pd-mooncake-transport-mode",
+        choices=MOONCAKE_TRANSPORT_MODES,
+        default="gpu_direct",
+        help="Explicit main P→D memory transport; no fallback.",
+    )
 
     parser.add_argument(
         "--worker-role",
@@ -304,6 +312,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    if (
+        kwargs["pd_mooncake_transport_mode"] != "gpu_direct"
+        and kwargs["pd_transfer_backend"] != "mooncake"
+    ):
+        parser.error(
+            "--pd-mooncake-transport-mode host_dram requires --pd-transfer-backend mooncake"
+        )
     try:
         kwargs["pd_dram"] = pop_dram_config(kwargs)
     except ValueError as exc:
@@ -375,7 +390,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
                 parser.error("Mooncake requires --pd-mooncake-host for a wildcard bind")
             if kwargs["pd_max_registered_bytes"] is None:
                 kwargs["pd_max_registered_bytes"] = 2 * kwargs["pd_max_transfer_bytes"]
-            kwargs["pd_transfer_reserve_bytes"] = kwargs["pd_max_registered_bytes"]
+            if kwargs["pd_mooncake_transport_mode"] == "gpu_direct":
+                kwargs["pd_transfer_reserve_bytes"] = kwargs["pd_max_registered_bytes"]
         data_port = (
             kwargs["server_port"] + 2 if kwargs["pd_data_port"] is None else kwargs["pd_data_port"]
         )

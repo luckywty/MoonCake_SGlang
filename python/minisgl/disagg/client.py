@@ -15,7 +15,14 @@ from .admission import AdmissionBudget, AdmissionError
 from .control import Channel, StartRequest, endpoint_address
 from .layered_protocol import LayeredReceiveTicket
 from .lifecycle import RequestLifecycle
-from .protocol import HANDOFF_VERSION, ReceiveTicket, RequestHandoff, _token
+from .protocol import (
+    HANDOFF_VERSION,
+    MOONCAKE_TRANSPORT_MODES,
+    ReceiveTicket,
+    RequestHandoff,
+    _token,
+    worker_transfer_mode,
+)
 
 """协调一次请求从 P 到 D 的全过程
 PDClient 本质上是一个 P/D Orchestrator（协调器）。"""
@@ -46,7 +53,7 @@ def response(channel: Channel, status: str) -> dict:
     return message
 
 
-def reservation_prefix(message, request, *, layered):
+def reservation_prefix(message, request, *, layered, transfer_mode="gpu_direct"):
     """Validate D's immutable reservation before any Prefill computation."""
     prefix = message.get("decode_prefix_len")
     if (
@@ -59,6 +66,8 @@ def reservation_prefix(message, request, *, layered):
     ):
         raise ValueError("invalid decode prefix reservation; upgrade Workers and clients together")
     if layered:
+        if message.get("transfer_mode", "gpu_direct") != transfer_mode:
+            raise ValueError("decode reservation transport mode does not match Prefill")
         if "ticket" not in message:
             raise ValueError("layered reservation must include a ticket or explicit null")
         wire_ticket = message.get("ticket")
@@ -71,6 +80,7 @@ def reservation_prefix(message, request, *, layered):
                 ticket.transfer_id != request.transfer_id
                 or ticket.prompt_tokens != len(request.prompt_ids)
                 or ticket.prefix_len != prefix
+                or ticket.transfer_mode != transfer_mode
             ):
                 raise ValueError("receive ticket belongs to another request or suffix")
     return prefix
@@ -86,9 +96,10 @@ def stream_reserved(
     on_prefill_done=None,
     cache_transaction=False,
     remote_pull_plan=None,
+    transfer_mode="gpu_direct",
 ):
     """Common reserve-first handshake for direct sockets and routed channels."""
-    prefix = reservation_prefix(ready, request, layered=layered)
+    prefix = reservation_prefix(ready, request, layered=layered, transfer_mode=transfer_mode)
     transfer_tokens = len(request.prompt_ids) - prefix
     state = RequestLifecycle(request.uid, request.transfer_id)
     state.begin_prefill()
@@ -117,6 +128,7 @@ def stream_reserved(
             or handoff.max_tokens != request.max_tokens
             or handoff.ignore_eos != request.ignore_eos
             or handoff.kv.prefix_len != prefix
+            or handoff.kv.transfer_mode != transfer_mode
         ):
             raise ValueError("prefill handoff does not match the decode reservation")
         state.complete_prefill(handoff)
@@ -308,10 +320,12 @@ class PDClient:
                 if cache_prefill:
                     cache_endpoints.append(self.prefill)
                 layered = capabilities.get("layered_transfer")
+                mode = worker_transfer_mode(capabilities)
                 if (
                     type(layered) is not bool
                     or capabilities.get("handoff_version") != HANDOFF_VERSION
                     or capabilities.get("decode_prefix_reuse") is not True
+                    or mode not in (MOONCAKE_TRANSPORT_MODES if layered else ("tcp",))
                 ):
                     raise ValueError(
                         "incompatible Prefill protocol; upgrade Workers and clients together"
@@ -326,6 +340,7 @@ class PDClient:
                     decode_caps.get("layered_transfer") is not layered
                     or decode_caps.get("handoff_version") != HANDOFF_VERSION
                     or decode_caps.get("decode_prefix_reuse") is not True
+                    or worker_transfer_mode(decode_caps) != mode
                 ):
                     raise ValueError("incompatible Decode protocol or transfer mode")
                 reserve = {"op": "reserve", "request": request.to_object()}
@@ -334,7 +349,13 @@ class PDClient:
                 d.send(reserve)
                 ready = response(d, "ready" if layered else "reserved")
                 yield from stream_reserved(
-                    request, p, d, ready, layered=layered, cache_transaction=cache_prefill
+                    request,
+                    p,
+                    d,
+                    ready,
+                    layered=layered,
+                    cache_transaction=cache_prefill,
+                    transfer_mode=mode if layered else "gpu_direct",
                 )
                 completed = True
             finally:

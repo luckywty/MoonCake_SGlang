@@ -35,6 +35,8 @@ N/M 默认各 1，必须均 >=1，总数不能超过实际可见 GPU 数，设�
 | d-1 | 3 | 1925 | 1926 | 19506 | 19507 |
 
 TCP 模式不启动 TE，P 不监听后端数据端口；端口仍保留在启动计划中以避免配置冲突。
+`--pd-mooncake-transport-mode host_dram` 会透传给两端，主 TE 仍使用 `--base-mooncake-port`，
+独立 D→P Host TE 仍使用 `--base-dram-port`。两端 health 模式不一致时拒绝组成 P/D 对，见 [Host 中转](host_dram_transfer.md)。
 Mooncake 模式的后端端口只传控制消息，KV 走 RDMA。端口分配会避开网关端口，非法或重叠配置先报错。
 其他 Worker 参数（如页大小、层组、KV 容量）传给所有子进程；身份和端口不能被透传参数覆盖。
 

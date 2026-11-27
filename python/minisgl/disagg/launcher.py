@@ -340,6 +340,8 @@ def main(argv=None):
                         args.model,
                         "--worker-role",
                         role,
+                        "--pd-transfer-backend",
+                        args.pd_transfer_backend,
                         *worker_args,
                         *role_flags,
                         "--dtype",

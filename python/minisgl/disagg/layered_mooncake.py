@@ -1,4 +1,4 @@
-"""Startup-registered GPU pools and a layer-ready compute/communication pipeline.
+"""Startup-registered GPU/host pools and a layer-ready compute/communication pipeline.
 
 Only the sender thread waits for packing or native completion. A staging slot
 is reused only after a checked terminal drain; D's published pool is retained
@@ -20,6 +20,7 @@ from uuid import uuid4
 import torch
 
 from .allocator import ReceiveAllocator
+from .cluster_config import host_staging_plan
 from .control import CancelledError, Channel, StartRequest
 from .layered_protocol import LayeredReceiveTicket
 from .layered_sender import ControlSession, LayeredSend, sender_loop
@@ -73,6 +74,10 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         self._sender_thread = None
         self._pipeline_closed = False
         super().__init__(*args, **kwargs)
+        self.transport = (
+            _TRANSPORT if self.transfer_mode == "gpu_direct" else "mooncake-layered-host-dram-v3"
+        )
+        self._gpu_workspace = self._gpu_indices = None
 
     def configure_pipeline(self, scheduler) -> None:
         """After Engine and bind_device, before the worker reports readiness."""
@@ -87,18 +92,52 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
             raise TransferError("transfer limit cannot hold one prompt token")
         self._pool_bytes = self._max_tokens * self._layout.bytes_per_token
         self.transfer_stream = torch.cuda.Stream(device=scheduler.device)
+        host_plan = None
+        if self.transfer_mode == "host_dram":
+            table = getattr(scheduler.engine, "page_table", None)
+            rows = table.shape[0] - 1 if table is not None else 1
+            host_plan = host_staging_plan(
+                max_seq_len=scheduler.engine.max_seq_len,
+                bytes_per_token=self._layout.bytes_per_token,
+                layers=self._layout.layers,
+                layers_per_chunk=self.layers_per_chunk,
+                staging_slots=self.staging_slots,
+                max_transfer_bytes=self.max_transfer_bytes,
+                max_registered_bytes=self.runtime.max_registered_bytes,
+                rows=rows,
+                prefill=scheduler.role is WorkerRole.PREFILL,
+            )
+            self._gpu_workspace = torch.empty(
+                host_plan.group_bytes, dtype=torch.uint8, device=scheduler.device
+            )
+            self._gpu_indices = torch.empty(
+                host_plan.max_tokens, dtype=torch.int64, device=scheduler.device
+            )
+            self.runtime.staging_tensors = (self._gpu_workspace, self._gpu_indices)
+            allocated = torch.cuda.Event()
+            allocated.record(torch.cuda.current_stream(scheduler.device))
+            self.transfer_stream.wait_event(allocated)
+            if scheduler.role is WorkerRole.DECODE:
+                self.install_stream = torch.cuda.Stream(device=scheduler.device)
+                self.install_stream.wait_event(allocated)
         if scheduler.role is WorkerRole.PREFILL:
             size = (
                 self._pool_bytes
                 // self._layout.layers
                 * min(self.layers_per_chunk, self._layout.layers)
             )
+            if host_plan is not None:
+                size = host_plan.group_bytes
             if size * self.staging_slots > self.runtime.max_registered_bytes:
                 raise TransferError("sender ring exceeds --pd-max-registered-bytes")
             if self.staging_slots > self.runtime.max_pending_transfers:
                 raise TransferError("sender ring exceeds --pd-max-pending-transfers")
             for slot in range(self.staging_slots):
-                self._send_buffers.append(self.runtime.allocate_buffer(size, f"layer-slot:{slot}"))
+                self._send_buffers.append(
+                    self.runtime.allocate_buffer(
+                        size, f"layer-slot:{slot}", pool=host_plan is not None
+                    )
+                )
             self._sender_thread = threading.Thread(
                 target=self._sender_loop, name="pd-layer-sender", daemon=True
             )
@@ -109,6 +148,8 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
             table = getattr(scheduler.engine, "page_table", None)
             rows = table.shape[0] - 1 if table is not None else 1
             capacity = min(self.runtime.max_registered_bytes, rows * (self._pool_bytes + 255))
+            if host_plan is not None:
+                capacity = host_plan.registered_bytes
             self._receive_buffer = self.runtime.allocate_buffer(
                 capacity, "layer-receive-pool", pool=True
             )
@@ -153,6 +194,7 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                     tuple(i * layer_bytes for i in range(self._layout.layers)),
                     eos_token_id,
                     prefix_len=prefix_len,
+                    transfer_mode=self.transfer_mode,
                 )
             except Exception:
                 self._allocator.release(locator)
@@ -168,6 +210,7 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
             or ticket.transfer_id != request.transfer_id
             or ticket.prompt_tokens != len(request.prompt_ids)
             or ticket.layers_per_chunk != self.layers_per_chunk
+            or ticket.transfer_mode != self.transfer_mode
         ):
             raise TransferError("incompatible early receive ticket")
         with self._lock:
@@ -224,13 +267,26 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         with self.runtime.cuda.activate():
             with torch.cuda.stream(self.transfer_stream):
                 self.transfer_stream.wait_event(ready)
-                job.pool.export_layers_into(
-                    buffer.tensor[:nbytes],
-                    slots,
-                    start,
-                    end,
-                    num_pool_pages=job.pool._kv_buffer.shape[2] - 1,
-                )
+                if self.transfer_mode == "host_dram":
+                    indices = self._gpu_indices[: len(slots)]
+                    indices.copy_(slots, non_blocking=True)
+                    job.pool.export_layers_into(
+                        self._gpu_workspace[:nbytes],
+                        slots,
+                        start,
+                        end,
+                        num_pool_pages=job.pool._kv_buffer.shape[2] - 1,
+                        trusted_indices=indices,
+                    )
+                    buffer.tensor[:nbytes].copy_(self._gpu_workspace[:nbytes], non_blocking=True)
+                else:
+                    job.pool.export_layers_into(
+                        buffer.tensor[:nbytes],
+                        slots,
+                        start,
+                        end,
+                        num_pool_pages=job.pool._kv_buffer.shape[2] - 1,
+                    )
                 copied = torch.cuda.Event()
                 copied.record(self.transfer_stream)
             # SYNC_MEMOPS is not a cross-stream producer fence. Both this host-side
@@ -239,10 +295,24 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
             copied.synchronize()
         return nbytes
 
+    @torch.inference_mode()
+    def install_layers(self, pool, packed, slots, *, num_pool_pages):
+        """Enqueue on the caller's install stream; no allocation, sync, or DRAM-cache insertion."""
+        if self.transfer_mode == "gpu_direct":
+            return pool.import_layered_tensor(packed, slots, num_pool_pages=num_pool_pages)
+        indices = self._gpu_indices[: len(slots)]
+        indices.copy_(slots, non_blocking=True)
+        pool.import_host_layered_tensor(
+            packed,
+            indices,
+            workspace=self._gpu_workspace,
+            layers_per_chunk=self.layers_per_chunk,
+        )
+
     def _send_terminal(self, ticket, submitted, completed, result, channel=None):
         message = {
             "op": "layer_terminal",
-            "backend": _TRANSPORT,
+            "backend": self.transport,
             "locator": ticket.locator,
             "transfer_id": ticket.transfer_id,
             "receiver": ticket.session,
@@ -275,7 +345,7 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         try:
             while not self._stop.is_set():
                 message = channel.receive()
-                if message.get("backend") != _TRANSPORT:
+                if message.get("backend") != self.transport:
                     raise TransferError("incompatible layered transfer backend")
                 if message.get("op") == "layer_terminal":
                     channel.send(self._settle_layers(message))
@@ -358,7 +428,7 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                 "result",
             }
             or message["op"] != "layer_terminal"
-            or message["backend"] != _TRANSPORT
+            or message["backend"] != self.transport
         ):
             raise TransferError("incorrect layer completion message")
         with self._lock:
@@ -416,9 +486,11 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
                 entry.terminal = dict(message)
                 entry.done.set()
             reply = {
-                "status": "quarantined"
-                if result == "quarantined"
-                else ("retired" if entry.cancelled else "complete"),
+                "status": (
+                    "quarantined"
+                    if result == "quarantined"
+                    else ("retired" if entry.cancelled else "complete")
+                ),
                 "locator": entry.ticket.locator,
             }
             if entry.owner_released and entry.safe and not entry.consuming:
@@ -468,6 +540,10 @@ class LayeredMooncakeBackend(MooncakeTransferBackend):
         result = super().health()
         with self._lock:
             result["mooncake"]["layered"] = {
+                "transfer_mode": self.transfer_mode,
+                "gpu_workspace_bytes": (
+                    self._gpu_workspace.numel() if self._gpu_workspace is not None else 0
+                ),
                 "layers_per_chunk": self.layers_per_chunk,
                 "staging_slots": self.staging_slots,
                 "pool_bytes": getattr(self, "_pool_bytes", 0),

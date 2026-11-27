@@ -46,14 +46,17 @@ class FakeEvent:
 class FakeCuda:
     info = {"fake": True}
 
-    def __init__(self):
+    def __init__(self, transfer_mode="gpu_direct"):
         self.visible = 0
+        self.transfer_mode = transfer_mode
 
     def activate(self):
         return nullcontext()
 
     def prepare_buffer(self, tensor):
-        pass
+        if self.transfer_mode == "host_dram":
+            assert tensor.device.type == "cpu" and tensor.dtype == torch.uint8
+            assert tensor.is_contiguous() and tensor.data_ptr() % 256 == 0
 
     def make_visible(self):
         self.visible += 1
@@ -140,7 +143,11 @@ class CpuLayeredBackend(LayeredMooncakeBackend):
 
     def bind_device(self, device):
         self.runtime.device = torch.device("cpu")
-        self.runtime.cuda = FakeCuda()
+        self.runtime.cuda = FakeCuda(self.transfer_mode)
+        self.runtime._info = {
+            "transfer_mode": self.transfer_mode,
+            "memory": "host_pinned" if self.transfer_mode == "host_dram" else "cuda",
+        }
         self.runtime.module = SimpleNamespace(
             ScatterTransferCompletionStatus=SimpleNamespace(
                 COMPLETED="complete",

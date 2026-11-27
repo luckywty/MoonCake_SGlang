@@ -1,4 +1,4 @@
-"""Worker-owned TE and CUDA registrations; no helper or host KV staging.
+"""Worker-owned main TE and explicit CUDA/pinned-host registrations.
 
 Cancelling a business request does not cancel DMA. Keep Tensor, registration,
 ticket and engine references until native completion is proved. An unresolved
@@ -22,6 +22,7 @@ import torch
 from .cluster_config import validate_mooncake_port
 from .control import endpoint_address, endpoint_name
 from .cuda_transfer import CudaTransfer
+from .protocol import MOONCAKE_TRANSPORT_MODES
 from .transfer import TransferBackendUnavailable, TransferError
 
 # Unknown tickets must not lose their last reference: their native destructor
@@ -69,7 +70,12 @@ class MooncakeRuntime:
         device_name: str = "",
         engine_module: str = "mooncake.engine",
         rpc_port: int | None = None,
+        transfer_mode: str = "gpu_direct",
     ):
+        if transfer_mode not in MOONCAKE_TRANSPORT_MODES:
+            raise ValueError("unsupported Mooncake transfer mode")
+        self.transfer_mode = transfer_mode
+        self.staging_tensors = ()  # Retain GPU scratch even if a host DMA/copy cannot be fenced.
         if (
             not isinstance(local_host, str)
             or not local_host.strip()
@@ -86,7 +92,7 @@ class MooncakeRuntime:
         if max_registered_bytes is None:
             max_registered_bytes = max_transfer_bytes * 2
         if type(max_registered_bytes) is not int or max_registered_bytes < max_transfer_bytes:
-            raise ValueError("registered GPU budget must cover one maximum-sized transfer")
+            raise ValueError("registered transfer budget must cover one maximum-sized transfer")
         if type(max_pending_transfers) is not int or max_pending_transfers < 1:
             raise ValueError("max_pending_transfers must be positive")
         if not math.isfinite(max_quarantine_seconds) or max_quarantine_seconds <= 0:
@@ -145,7 +151,7 @@ class MooncakeRuntime:
         present = [name for name in incompatible if name in os.environ]
         if present:
             raise TransferBackendUnavailable(
-                "GPU Mooncake requires classic one-sided RDMA; unset " + ", ".join(present)
+                "Mooncake main channel requires classic one-sided RDMA; unset " + ", ".join(present)
             )
         root = Path("/sys/class/infiniband")
         devices = sorted(path.name for path in root.iterdir()) if root.is_dir() else []
@@ -175,12 +181,19 @@ class MooncakeRuntime:
                 # Classic P2PHANDSHAKE chooses within this range, including
                 # when initialize(local_host:port) would ignore a requested port.
                 os.environ["MC_MIN_RPC_PORT"] = os.environ["MC_MAX_RPC_PORT"] = str(self.rpc_port)
-            cuda = CudaTransfer(device)
+            cuda = (
+                CudaTransfer(device)
+                if self.transfer_mode == "gpu_direct"
+                else CudaTransfer(device, transfer_mode=self.transfer_mode)
+            )
             try:
                 module = importlib.import_module(self.engine_module)
             except ImportError as exc:
                 raise TransferBackendUnavailable("mooncake.engine cannot be loaded") from exc
-            if getattr(module, "SUPPORT_CUDA", False) is not True:
+            if (
+                self.transfer_mode == "gpu_direct"
+                and getattr(module, "SUPPORT_CUDA", False) is not True
+            ):
                 raise TransferBackendUnavailable("the Mooncake extension lacks CUDA support")
             engine_type = getattr(module, "TransferEngine", None)
             methods = (
@@ -193,7 +206,7 @@ class MooncakeRuntime:
             if engine_type is None or any(
                 not callable(getattr(engine_type, name, None)) for name in methods
             ):
-                raise TransferBackendUnavailable("Mooncake lacks the required GPU scatter API")
+                raise TransferBackendUnavailable("Mooncake lacks the required scatter API")
             states = getattr(module, "ScatterTransferCompletionStatus", None)
             if states is None or any(
                 not hasattr(states, name)
@@ -231,7 +244,8 @@ class MooncakeRuntime:
                 "owner_pid": self.owner_pid,
                 "session": self.session,
                 "transport": "rdma",
-                "memory": "cuda",
+                "memory": "cuda" if self.transfer_mode == "gpu_direct" else "host_pinned",
+                "transfer_mode": self.transfer_mode,
                 "helpers": False,
                 "engine_file": str(getattr(module, "__file__", "unknown")),
                 "package_version": version,
@@ -285,36 +299,37 @@ class MooncakeRuntime:
                         "unresolved GPU registrations exhausted the transfer budget"
                     )
                     raise TransferBackendUnavailable(self._retire_reason)
-                raise TransferError("the registered GPU transfer budget is busy")
+                raise TransferError("the registered transfer budget is busy")
 
     def _owned_locked(self, buffer: RegisteredBuffer) -> None:
         if self._buffers.get(buffer.key) is not buffer:
-            raise TransferError("unknown or released GPU registration")
+            raise TransferError("unknown or released memory registration")
 
     def register_tensor(self, tensor: torch.Tensor, key: str, *, pool=False) -> RegisteredBuffer:
-        if not isinstance(tensor, torch.Tensor) or tensor.device != self.device:
-            raise TransferError("KV payload must be a tensor on the Worker's CUDA device")
+        target = self.device if self.transfer_mode == "gpu_direct" else torch.device("cpu")
+        if not isinstance(tensor, torch.Tensor) or tensor.device != target:
+            raise TransferError("KV payload is on the wrong device for the explicit transport mode")
         if not isinstance(key, str) or not key:
-            raise TransferError("GPU registrations need an attempt-scoped key")
+            raise TransferError("memory registrations need an attempt-scoped key")
         if not tensor.is_contiguous() or tensor.dtype not in (
             torch.uint8,
             torch.float16,
             torch.bfloat16,
             torch.float32,
         ):
-            raise TransferError("GPU KV registration requires contiguous, unquantized storage")
+            raise TransferError("KV registration requires contiguous, unquantized storage")
         nbytes = tensor.numel() * tensor.element_size()
         address = tensor.data_ptr()
         with self._lock:
             # A startup pool can hold several individually bounded transfers.
             self.check_capacity(nbytes, pool=pool)
             if key in self._buffers:
-                raise TransferError("GPU registration key is already in use")
+                raise TransferError("memory registration key is already in use")
             if any(
                 address < entry.address + entry.nbytes and entry.address < address + nbytes
                 for entry in self._buffers.values()
             ):
-                raise TransferError("GPU allocation overlaps an existing registration")
+                raise TransferError("allocation overlaps an existing registration")
             # Registration itself is native work. close() must retain this
             # Tensor even before register_memory() has returned.
             buffer = RegisteredBuffer(key, tensor, address, nbytes, safe_to_release=False)
@@ -326,8 +341,9 @@ class MooncakeRuntime:
                 # CUDA's allocator can recycle a block according to stream
                 # ordering even for torch.empty(). External RDMA does not obey
                 # that stream, so finish prior allocation/producer work first.
-                with self.cuda.activate():
-                    torch.cuda.current_stream(self.device).synchronize()
+                if self.transfer_mode == "gpu_direct":
+                    with self.cuda.activate():
+                        torch.cuda.current_stream(self.device).synchronize()
                 self.cuda.prepare_buffer(tensor)
             except Exception:
                 with self._lock:
@@ -342,12 +358,19 @@ class MooncakeRuntime:
                     self._native_ok(
                         "register_memory",
                         self.engine.register_memory(
-                            address, nbytes, f"cuda:{self.device.index}", True
+                            address,
+                            nbytes,
+                            (
+                                f"cuda:{self.device.index}"
+                                if self.transfer_mode == "gpu_direct"
+                                else "*"
+                            ),
+                            True,
                         ),
                     )
             except Exception as exc:
                 self.quarantine(buffer, f"memory registration failed: {exc}")
-                raise TransferError(f"GPU memory registration failed: {exc}") from exc
+                raise TransferError(f"Mooncake memory registration failed: {exc}") from exc
             with self._lock:
                 buffer.safe_to_release = True
         return buffer
@@ -356,7 +379,14 @@ class MooncakeRuntime:
         self.check_capacity(nbytes, pool=pool)
         assert self.cuda is not None
         with self.cuda.activate():
-            tensor = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
+            if self.transfer_mode == "host_dram":
+                backing = torch.empty(
+                    nbytes + 255, dtype=torch.uint8, device="cpu", pin_memory=True
+                )
+                offset = (-backing.data_ptr()) % 256
+                tensor = backing[offset : offset + nbytes]
+            else:
+                tensor = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
         return self.register_tensor(tensor, key, pool=pool)
 
     def expose(self, buffer: RegisteredBuffer) -> None:
@@ -398,7 +428,8 @@ class MooncakeRuntime:
         with self._lock:
             self._owned_locked(buffer)
         assert self.cuda is not None
-        self.cuda.make_visible()
+        if self.transfer_mode == "gpu_direct":
+            self.cuda.make_visible()
 
     def release(self, buffer: RegisteredBuffer) -> None:
         with buffer.release_lock:
@@ -571,9 +602,11 @@ class MooncakeRuntime:
                 (time.monotonic() - entry.quarantine_since for entry in quarantined), default=0.0
             )
             return {
-                "state": "unavailable"
-                if self._retire_reason or self._closing
-                else ("degraded" if quarantined else ("ready" if self.session else "unbound")),
+                "state": (
+                    "unavailable"
+                    if self._retire_reason or self._closing
+                    else ("degraded" if quarantined else ("ready" if self.session else "unbound"))
+                ),
                 "reason": self._retire_reason,
                 "registered_bytes": self._registered_bytes,
                 "registered_buffers": len(self._buffers),
@@ -624,11 +657,12 @@ class MooncakeRuntime:
         with self._lock:
             if self._buffers or (self._reaper is not None and self._reaper.is_alive()):
                 self._retire_reason = (
-                    "Mooncake close could not drain every GPU registration; the Worker must exit"
+                    "Mooncake close could not drain every registration; the Worker must exit"
                 )
                 raise TransferBackendUnavailable(self._retire_reason)
             self.engine = None
             self.module = None
+            self.staging_tensors = ()
             self._closed = True
             with _LIVE_RUNTIMES_LOCK:
                 _LIVE_RUNTIMES.pop(id(self), None)

@@ -14,6 +14,7 @@ from .client import (
 )
 from .control import StartRequest
 from .prefix_hash import PreparedPrefix, prepare_prefix
+from .protocol import worker_transfer_mode
 from .router import NoHealthyWorker, WorkerPool
 from .routing_policy import PolicyRouter
 
@@ -162,7 +163,9 @@ class RoutedPDClient(PDClient):
             excluded.add(node.worker_id)
             channel = None
             try:
-                if node.health["layered_transfer"] != layered:
+                if node.health["layered_transfer"] != layered or worker_transfer_mode(
+                    node.health
+                ) != worker_transfer_mode(prefill.health):
                     raise RemoteUnavailableError("P/D transfer modes differ")
                 channel = self.pool.connect(node).open(request.transfer_id, cancel)
                 message = {"op": "reserve", "request": request.to_object()}
@@ -170,7 +173,12 @@ class RoutedPDClient(PDClient):
                     message["cache_transaction"] = True
                 channel.send(message)
                 ready = response(channel, "ready" if layered else "reserved")
-                reservation_prefix(ready, request, layered=layered)
+                reservation_prefix(
+                    ready,
+                    request,
+                    layered=layered,
+                    transfer_mode=worker_transfer_mode(prefill.health) if layered else "gpu_direct",
+                )
                 self.router.record(request.transfer_id, prefill, node, attempt, bucket=bucket)
                 return node, channel, ready
             except InterruptedError:
@@ -281,6 +289,7 @@ class RoutedPDClient(PDClient):
                 d,
                 ready,
                 layered=layered,
+                transfer_mode=worker_transfer_mode(prefill.health) if layered else "gpu_direct",
                 on_prefill_done=release_prefill,
                 cache_transaction=cache_prefill,
                 remote_pull_plan=self.pull_plans.get(request.transfer_id),

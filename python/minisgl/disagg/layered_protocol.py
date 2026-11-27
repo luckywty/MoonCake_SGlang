@@ -5,7 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .control import endpoint_address
-from .protocol import KVLayout, _array, _int, _load, _object, _token, _wire, check_transfer_id
+from .protocol import (
+    MOONCAKE_TRANSPORT_MODES,
+    KVLayout,
+    _array,
+    _int,
+    _load,
+    _object,
+    _token,
+    _wire,
+    check_transfer_id,
+)
 
 LAYERED_TICKET_VERSION = 3
 
@@ -25,8 +35,13 @@ class LayeredReceiveTicket:
     packing: str = "layer-kv-token-head-dim-le"
     version: int = LAYERED_TICKET_VERSION
     prefix_len: int = 0
+    transfer_mode: str = "gpu_direct"
 
     def __post_init__(self) -> None:
+        if self.transfer_mode not in MOONCAKE_TRANSPORT_MODES:
+            raise ValueError("unsupported layer transfer mode")
+        if self.version == 2 and self.transfer_mode != "gpu_direct":
+            raise ValueError("v2 cannot describe host DRAM transport")
         check_transfer_id(self.transfer_id)
         check_transfer_id(self.locator)
         endpoint_address(self.endpoint)
@@ -80,6 +95,8 @@ class LayeredReceiveTicket:
     @classmethod
     def from_wire(cls, payload: bytes) -> LayeredReceiveTicket:
         obj = _load(payload)
+        if isinstance(obj, dict):
+            obj = {"transfer_mode": "gpu_direct", **obj}
         if isinstance(obj, dict) and obj.get("version") == 2:
             obj = {"prefix_len": 0, **obj}
         data = _object(cls, obj)

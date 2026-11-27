@@ -49,7 +49,15 @@ def fake_cuda(monkeypatch):
 
 
 @contextmanager
-def pair(layers=5, group=2, gate=None, fail=False, timeout=1, lose_receipt=None):
+def pair(
+    layers=5,
+    group=2,
+    gate=None,
+    fail=False,
+    timeout=1,
+    lose_receipt=None,
+    transport_mode="gpu_direct",
+):
     layout = KVLayout("a" * 64, "float32", layers, 1, 8, 1)
     backends = []
     try:
@@ -63,6 +71,7 @@ def pair(layers=5, group=2, gate=None, fail=False, timeout=1, lose_receipt=None)
                 staging_slots=2,
                 gate=gate if role is WorkerRole.PREFILL else None,
                 fail=fail,
+                transfer_mode=transport_mode,
             )
             backends.append(backend)
             if role is WorkerRole.DECODE:
@@ -96,10 +105,116 @@ def start_job(p, d, layout, tokens=3):
     return job, pool, slots, target
 
 
-@pytest.mark.parametrize("group", [1, 2, 4])
-def test_ring_backpressure_and_byte_exact_layer_install(group):
+def test_host_cuda_service_initialization_only_uses_install_stream_on_decode():
+    from minisgl.disagg.service import WorkerService
+
+    with pair(layers=2, group=1, transport_mode="host_dram") as (p, d, _):
+        assert not hasattr(p, "install_stream")
+        for role, backend in (("prefill", p), ("decode", d)):
+            scheduler = cpu_scheduler(role, page_size=1)
+            scheduler.device = torch.device(
+                "cuda:0"
+            )  # Exercise the real CUDA branch, without GPU allocation.
+            service = None
+            try:
+                service = WorkerService(scheduler, backend, 1)
+                assert service.install_stream is (
+                    None if role == "prefill" else backend.install_stream
+                )
+                assert service.capabilities()["transfer_mode"] == "host_dram"
+            finally:
+                scheduler.device = torch.device("cpu")
+                if service is not None:
+                    service.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_host_dram_waits_for_d2h_on_sender_thread_before_any_native_write(monkeypatch, cancel):
+    entered, ready = threading.Event(), threading.Event()
+    with pair(layers=2, group=1, transport_mode="host_dram") as (p, d, layout):
+        job, _, _, target = start_job(p, d, layout)
+
+        class D2HEvent(FakeEvent):
+            def synchronize(self):
+                super().synchronize()
+                entered.set()
+                assert ready.wait(3), "test did not release D2H"
+
+        monkeypatch.setattr(torch.cuda, "Event", D2HEvent)
+        try:
+            for layer in range(layout.layers):
+                job.layer_ready(layer)
+            assert entered.wait(1)
+            job.seal(cancel=cancel)
+            assert not p.fake_engine.submissions
+            assert not job.sources_done.is_set() and not job.safe_sources
+        finally:
+            ready.set()
+        job.finish(cancel=cancel)
+        assert job.sources_done.is_set()
+        assert len(p.fake_engine.submissions) == (0 if cancel else 2)
+        assert d.runtime.cuda.visible == 0  # No GDR visibility operation for host memory.
+        d.release_layers(target)
+
+
+def test_host_dram_sources_release_after_d2h_while_native_slots_remain_owned(monkeypatch):
     gate = threading.Event()
-    with pair(group=group, gate=gate) as (p, d, layout):
+    with pair(layers=2, group=1, gate=gate, transport_mode="host_dram") as (p, d, layout):
+        job, pool, slots, target = start_job(p, d, layout)
+        expected = pool._kv_buffer[:, :, slots].clone()
+        original_registration_count = (p.fake_engine.register_calls, d.fake_engine.register_calls)
+        monkeypatch.setattr(
+            torch, "empty", Mock(side_effect=AssertionError("hot staging allocation"))
+        )
+        monkeypatch.setattr(
+            p.runtime, "register_tensor", Mock(side_effect=AssertionError("hot MR registration"))
+        )
+        try:
+            for layer in range(layout.layers):
+                job.layer_ready(layer)
+            job.seal()
+            wait_for(job.sources_done.is_set)
+            assert len(p.fake_engine.submissions) == 2 and not job.done.is_set()
+            assert all(not t.drained for t in p.fake_engine.submissions)
+            assert all(not b.safe_to_release for b in p._send_buffers)
+            # The source HBM can be reused; ongoing RDMA reads only the pinned ring.
+            pool._kv_buffer.fill_(-99)
+        finally:
+            gate.set()
+        job.finish()
+        packed = d.finish_layers(target)
+        typed = packed.view(torch.float32).view(layout.layers, 2, len(slots), 1, 8)
+        assert torch.equal(typed.permute(1, 0, 2, 3, 4), expected.flatten(2, 3))
+        assert (
+            p.fake_engine.register_calls,
+            d.fake_engine.register_calls,
+        ) == original_registration_count
+        assert all(b.address % 256 == 0 for b in p._send_buffers + [d._receive_buffer])
+        assert p._gpu_workspace.data_ptr() not in FakeEngine.registrations
+        assert d._gpu_workspace.data_ptr() not in FakeEngine.registrations
+        d.release_layers(target, consumer_complete=True)
+
+
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_ticket_from_another_transport_cannot_start_a_sender(transport_mode):
+    from dataclasses import replace
+
+    with pair(transport_mode=transport_mode) as (p, d, layout):
+        # Forged mode is rejected before enqueueing any job or native write.
+        request = StartRequest(str(uuid4()), 0, (1, 2), 3, True)
+        target = d.reserve_layers(request, 31)
+        other_mode = "gpu_direct" if transport_mode == "host_dram" else "host_dram"
+        with pytest.raises(TransferError, match="incompatible early receive ticket"):
+            p.begin_layer_send(replace(target, transfer_mode=other_mode), request, None)
+        assert not p.fake_engine.submissions
+        d.release_layers(target)
+
+
+@pytest.mark.parametrize("group", [1, 2, 4])
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_ring_backpressure_and_byte_exact_layer_install(group, transport_mode):
+    gate = threading.Event()
+    with pair(group=group, gate=gate, transport_mode=transport_mode) as (p, d, layout):
         job, pool, slots, target = start_job(p, d, layout)
         first_group_end = target.groups[0][1]
         for layer in range(first_group_end):
@@ -120,7 +235,7 @@ def test_ring_backpressure_and_byte_exact_layer_install(group):
         received = d.finish_layers(target)
         dest = MHAKVCache(1, 5, 8, 9, 1, torch.float32, torch.device("cpu"))
         dest._kv_buffer.fill_(-1)
-        dest.import_layered_tensor(received, torch.tensor([1, 3, 6]), num_pool_pages=8)
+        d.install_layers(dest, received, torch.tensor([1, 3, 6]), num_pool_pages=8)
         assert torch.equal(pool._kv_buffer[:, :, slots], dest._kv_buffer[:, :, [1, 3, 6]])
         assert torch.all(dest._kv_buffer[:, :, 8] == -1)
         d.release_layers(target, consumer_complete=True)
@@ -134,9 +249,10 @@ def test_ring_backpressure_and_byte_exact_layer_install(group):
         assert d.fake_engine.register_calls == 1
 
 
-def test_cancel_keeps_exposed_receive_and_slots_until_drain():
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_cancel_keeps_exposed_receive_and_slots_until_drain(transport_mode):
     gate = threading.Event()
-    with pair(group=1, gate=gate) as (p, d, layout):
+    with pair(group=1, gate=gate, transport_mode=transport_mode) as (p, d, layout):
         job, _, _, target = start_job(p, d, layout)
         for layer in range(layout.layers):
             job.layer_ready(layer)
@@ -155,8 +271,9 @@ def test_cancel_keeps_exposed_receive_and_slots_until_drain():
         assert all(ticket.drained for ticket in p.fake_engine.submissions)
 
 
-def test_receive_pool_waits_for_cuda_consumer_after_native_drain():
-    with pair() as (p, d, layout):
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_receive_pool_waits_for_cuda_consumer_after_native_drain(transport_mode):
+    with pair(transport_mode=transport_mode) as (p, d, layout):
         job, _, _, target = start_job(p, d, layout)
         for layer in range(layout.layers):
             job.layer_ready(layer)
@@ -169,8 +286,9 @@ def test_receive_pool_waits_for_cuda_consumer_after_native_drain():
         assert d._lease is None and d._receive_buffer.safe_to_release
 
 
-def test_terminal_state_without_drained_flag_does_not_allow_slot_reuse():
-    with pair() as (p, d, _):
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_terminal_state_without_drained_flag_does_not_allow_slot_reuse(transport_mode):
+    with pair(transport_mode=transport_mode) as (p, d, _):
         slot = p._send_buffers[0]
         operation = p.runtime.submit_write(
             slot,
@@ -194,9 +312,11 @@ def test_terminal_state_without_drained_flag_does_not_allow_slot_reuse():
             ticket.drain = drain
 
 
-def test_lost_receipt_replays_identical_terminal_proof():
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_lost_receipt_replays_identical_terminal_proof(transport_mode):
     lost = threading.Event()
-    with pair(lose_receipt=lost) as (p, d, layout):
+    with pair(lose_receipt=lost, transport_mode=transport_mode) as (p, d, layout):
+        receipt = d._settle_layers = Mock(wraps=d._settle_layers)
         job, _, _, target = start_job(p, d, layout)
         for layer in range(layout.layers):
             job.layer_ready(layer)
@@ -204,6 +324,8 @@ def test_lost_receipt_replays_identical_terminal_proof():
         assert lost.is_set()
         assert d._lease.terminal["result"] == "complete"
         assert d._receive_buffer.safe_to_release
+        assert receipt.call_count == 2 and receipt.call_args_list[0] == receipt.call_args_list[1]
+        assert len(p.fake_engine.submissions) == len(target.groups)
         d.release_layers(target)
 
 
@@ -326,9 +448,16 @@ def test_layered_decode_failure_rolls_back_private_pages(failure, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["unknown", "failed_drained"])
-def test_unproven_remote_completion_is_quarantined(failure):
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_unproven_remote_completion_is_quarantined(failure, transport_mode):
     gate = threading.Event() if failure == "unknown" else None
-    with pair(group=1, gate=gate, fail=failure == "failed_drained", timeout=0.1) as (p, d, layout):
+    with pair(
+        group=1,
+        gate=gate,
+        fail=failure == "failed_drained",
+        timeout=0.1,
+        transport_mode=transport_mode,
+    ) as (p, d, layout):
         job, _, _, target = start_job(p, d, layout)
         for layer in range(layout.layers):
             job.layer_ready(layer)
@@ -344,7 +473,7 @@ def test_unproven_remote_completion_is_quarantined(failure):
 
 
 @contextmanager
-def cpu_workers(group):
+def cpu_workers(group, transport_mode="gpu_direct", decode_transport_mode=None):
     backends, threads, listeners, schedulers = [], [], [], []
     stop = threading.Event()
     errors = []
@@ -360,6 +489,11 @@ def cpu_workers(group):
                 max_registered_bytes=32768,
                 layers_per_chunk=group,
                 staging_slots=2,
+                transfer_mode=(
+                    transport_mode
+                    if role is WorkerRole.PREFILL
+                    else decode_transport_mode or transport_mode
+                ),
             )
             backends.append(backend)
             backend.bind_device(torch.device("cpu"))
@@ -391,8 +525,9 @@ def cpu_workers(group):
 
 
 @pytest.mark.parametrize("group", [1, 2, 4])
-def test_early_handshake_real_scheduler_continuation_and_eos(group):
-    with cpu_workers(group) as (client, schedulers, backends):
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_early_handshake_real_scheduler_continuation_and_eos(group, transport_mode):
+    with cpu_workers(group, transport_mode) as (client, schedulers, backends):
         for prompt, budget, ignore_eos in (([1], 1, True), ([1, 2, 3, 4, 5, 6, 7], 5, True)):
             assert client.generate(prompt, budget, ignore_eos=ignore_eos) == reference_tokens(
                 prompt, budget
@@ -412,8 +547,9 @@ def test_early_handshake_real_scheduler_continuation_and_eos(group):
         assert backends[1]._lease is None
 
 
-def test_client_disconnect_after_first_token_reclaims_layer_reservation():
-    with cpu_workers(1) as (client, schedulers, backends):
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_client_disconnect_after_first_token_reclaims_layer_reservation(transport_mode):
+    with cpu_workers(1, transport_mode) as (client, schedulers, backends):
         iterator = client.stream([1, 2, 3, 4, 5], 10, ignore_eos=True)
         next(iterator)
         iterator.close()
@@ -422,8 +558,9 @@ def test_client_disconnect_after_first_token_reclaims_layer_reservation():
         assert client.generate([1, 2], 3, ignore_eos=True) == reference_tokens([1, 2], 3)
 
 
-def test_reservation_disconnect_before_prefill_reclaims_private_pages():
-    with cpu_workers(1) as (client, schedulers, backends):
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_reservation_disconnect_before_prefill_reclaims_private_pages(transport_mode):
+    with cpu_workers(1, transport_mode) as (client, schedulers, backends):
         request = StartRequest(str(uuid4()), 0, (1, 2, 3), 5, True)
         with socket.create_connection(endpoint_address(client.decode)) as sock:
             channel = Channel(sock, 2)
@@ -435,6 +572,16 @@ def test_reservation_disconnect_before_prefill_reclaims_private_pages():
         assert backends[1]._lease is None
         assert schedulers[1].table_manager.available_size == 2
         assert len(schedulers[1].cache_manager.free_slots) == 32
+
+
+@pytest.mark.parametrize(
+    "prefill_mode,decode_mode", [("gpu_direct", "host_dram"), ("host_dram", "gpu_direct")]
+)
+def test_direct_client_rejects_transport_mismatch_before_decode_reserve(prefill_mode, decode_mode):
+    with cpu_workers(1, prefill_mode, decode_mode) as (client, _, backends):
+        with pytest.raises(ValueError, match="incompatible Decode protocol or transfer mode"):
+            client.generate((1, 2), 3, ignore_eos=True)
+        assert not any(b.fake_engine.submissions or b._leases for b in backends)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

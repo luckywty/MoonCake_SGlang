@@ -5,6 +5,8 @@
 本次在 `4d15539` 页面哈希索引、`5e1e21e` D Radix 后缀交接基础上实现。
 功能默认关闭；`--pd-dram-cache-bytes` 大于零时启用本地缓存，
 `--pd-dram-remote-pull` 额外启用独立 Mooncake host RDMA 引擎。
+主 P→D 通道也可显式启用 [Host 中转](host_dram_transfer.md)。该通道使用主 TE 和独立 pinned staging，
+与本文缓存池、D→P Host TE 物理隔离，不要求开启本地 DRAM 缓存；入站 prompt 不批量写入 D 缓存。
 它不依赖 Mooncake Store，不提供持久化、自动发现或跨请求故障迁移。
 
 ## 内存与所有权

@@ -73,12 +73,14 @@ class MooncakeTransferBackend:
         device_name: str = "",
         rpc_port: int | None = None,
         _engine_module: str = "mooncake.engine",
+        transfer_mode: str = "gpu_direct",
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive")
         if type(max_pending_transfers) is not int or max_pending_transfers <= 0:
             raise ValueError("max_pending_transfers must be positive")
         self.timeout = timeout
+        self.transfer_mode = transfer_mode
         self.max_transfer_bytes = max_transfer_bytes
         self._stop = threading.Event()
         self._bound = threading.Event()
@@ -117,6 +119,7 @@ class MooncakeTransferBackend:
             device_name=device_name,
             engine_module=_engine_module,
             rpc_port=rpc_port,
+            transfer_mode=transfer_mode,
         )
         self.endpoint = "rdma-sender"
         if bind is not None:

@@ -5,10 +5,12 @@ RDMA 与后续层 Prefill 计算重叠。TCP 仍使用完整 Prefill 后的整�
 本实现保持 TP=1、greedy，关闭 CUDA Graph；支持并发控制、Prefill batch 和 Continuous Batching Decode。
 多请求细节见[多请求调度说明](batching.md)。
 当前支持默认关闭的 [D GPU Radix Cache](decode_radix_cache.md)：命中时只传后缀，完整命中不创建数据传输。
+主通道默认使用 `gpu_direct`；无 GDR 部署可显式启用 [Pinned Host 中转](host_dram_transfer.md)，
+两端均设置 `--pd-mooncake-transport-mode host_dram`，保留同一逐层调度与隔离状态机。
 
 ## 启动与内存预算
 
-Engine 初始化 CUDA、模型和 KV 池后，后端绑定相同 GPU，再创建独立
+本节默认描述 GPU 直传。Engine 初始化 CUDA、模型和 KV 池后，后端绑定相同 GPU，再创建独立
 `transfer_stream`。P 一次性分配并注册 2～4 个固定容量槽位，启动一个常驻发送线程；
 D 一次性分配并注册一个连续接收池。正常请求不注册或注销显存，正常关闭才注销。
 
@@ -83,6 +85,8 @@ D 的 reserve/commit/cancel 不再等待活跃请求 Decode 完整结束；GPU �
 端到端测试另使用真实 socket。覆盖提前发送、背压、槽位覆写、
 分组尾层、dtype/稀疏页、重复请求复用、EOS、断连、未知/失败排空及资源回收。
 这些测试不证明真实 CUDA 并发、GPUDirect 可见性或性能。
+2026-11-27 已将关键所有权、socket/EOS/取消、后缀与安装事件测试扩展到 Host 模式，
+最新完整集合为 **404 passed、19 skipped、117 subtests passed、0 failed**，详见 [CPU 回归](cpu_regression.md)。
 `test_pd_layered_cuda.py` 另提供真实 CUDA 的分组打包/安装检查，无 CUDA 时跳过。
 就绪日志的 `overlap=false` 仍指原有调度重叠关闭；`kv_transfer_overlap=true` 表示启用逐层路径。
 

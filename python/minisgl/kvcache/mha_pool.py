@@ -75,6 +75,7 @@ class MHAKVCache(BaseKVCachePool):
         end: int,
         *,
         num_pool_pages: int,
+        trusted_indices: torch.Tensor | None = None,
     ) -> None:
         """Gather into a preallocated layer-major staging slot, without a KV temporary.
 
@@ -84,7 +85,17 @@ class MHAKVCache(BaseKVCachePool):
         """
         if not 0 <= start < end <= self.num_layers:
             raise ValueError("invalid layer range")
-        indices = self._transfer_indices(slots, num_pool_pages)
+        indices = (
+            self._transfer_indices(slots, num_pool_pages)
+            if trusted_indices is None
+            else trusted_indices
+        )
+        if (
+            indices.device != self.device
+            or indices.dtype != torch.int64
+            or len(indices) != len(slots)
+        ):
+            raise ValueError("invalid trusted staging indices")
         heads, dim = self._storage_shape[1:]
         shape = (end - start, 2, len(slots), heads, dim)
         nbytes = (end - start) * 2 * len(slots) * heads * dim * self.dtype.itemsize
@@ -121,6 +132,40 @@ class MHAKVCache(BaseKVCachePool):
         typed = packed.view(self.dtype).view(shape)
         for layer in range(self.num_layers):
             self._kv_buffer[:, layer].flatten(1, 2).index_copy_(1, indices, typed[layer])
+
+    @torch.inference_mode()
+    def import_host_layered_tensor(self, packed, indices, *, workspace, layers_per_chunk):
+        """Pinned receive region -> fixed GPU group buffer -> private KV, on install_stream.
+
+        Indices are scheduler-owned and copied into a startup int64 workspace.
+        No GPU-to-host metadata validation or allocation is allowed on this path.
+        """
+        if (
+            packed.device.type != "cpu"
+            or packed.dtype != torch.uint8
+            or not packed.is_contiguous()
+            or indices.device != self.device
+            or (self.device.type == "cuda" and not packed.is_pinned())
+            or indices.dtype != torch.int64
+            or indices.ndim != 1
+            or workspace.device != self.device
+            or workspace.dtype != torch.uint8
+        ):
+            raise ValueError("invalid host layered staging or scheduler indices")
+        heads, dim = self._storage_shape[1:]
+        layer_bytes = 2 * len(indices) * heads * dim * self.dtype.itemsize
+        if packed.numel() != self.num_layers * layer_bytes:
+            raise ValueError("incorrect host layered receive length")
+        for start in range(0, self.num_layers, layers_per_chunk):
+            end = min(start + layers_per_chunk, self.num_layers)
+            nbytes = (end - start) * layer_bytes
+            if workspace.numel() < nbytes:
+                raise ValueError("startup scatter workspace is too small")
+            group = workspace[:nbytes]
+            group.copy_(packed[start * layer_bytes : end * layer_bytes], non_blocking=True)
+            typed = group.view(self.dtype).view(end - start, 2, len(indices), heads, dim)
+            for offset, layer in enumerate(range(start, end)):
+                self._kv_buffer[:, layer].flatten(1, 2).index_copy_(1, indices, typed[offset])
 
     def _transfer_indices(self, slots: torch.Tensor, num_pool_pages: int) -> torch.Tensor:
         """验证传入的 KV Cache Slot 索引是否合法，避免访问非法显存位置、重复 Slot 或不支持的数据格式。

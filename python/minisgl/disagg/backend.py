@@ -32,6 +32,7 @@ def create_transfer_backend(args):
             rpc_port=getattr(args, "pd_mooncake_port", None),
             layers_per_chunk=getattr(args, "pd_layers_per_chunk", 1),
             staging_slots=getattr(args, "pd_staging_slots", 3),
+            transfer_mode=getattr(args, "pd_mooncake_transport_mode", "gpu_direct"),
             **kwargs,
         )
     raise ValueError(f"unsupported P/D transfer backend: {name}")

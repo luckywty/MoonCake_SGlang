@@ -1,23 +1,24 @@
 # P/D 缓存 CPU 回归
 
-验证日期：2026-11-26（Asia/Shanghai）。对应三个功能提交：`5e1e21e`（D Radix 与后缀传输）、
+验证日期：2026-11-27（Asia/Shanghai）。对应三个功能提交：`5e1e21e`（D Radix 与后缀传输）、
 `4d15539`（P 页面哈希索引）、`deb7e11`（P/D DRAM 缓存）。首次补测修改测试、适配器、运行脚本和文档，
 未放宽完成凭证校验；后续增加模型容量启动校验、health 参数告警及三方规划限额、统一端口防碰撞。
+在 `1899a5d` 上进一步增加显式主通道 Host 中转，覆盖两道 DMA 屏障、混连拒绝及 TE/缓存池隔离。
 
 ## 结果与命令
 
 环境：Python 3.12.3、PyTorch 2.9.1+cpu、pytest 9.2.0，无 CUDA。首次补测新增 46 项，
-启动期防呆另增 63 项，合计 **109 个参数化展开后的新用例**。
-当前扩大集合结果：**356 passed、16 skipped、113 subtests passed、0 failed**；未排除 TCP、HTTP 或逐层 socket 用例。
-16 个跳过项需要 CUDA/GPU 环境，其中真实模型对照还需显式配置模型。
-JUnit 报告：执行机 `/tmp/minisgl-startup-cpu.xml`，不随仓库发布。
+启动期防呆另增 63 项；Host 中转再增 48 项 CPU 回归和 3 项 CUDA 参数化用例。
+当前扩大集合结果：**404 passed、19 skipped、117 subtests passed、0 failed**；未排除 TCP、HTTP 或逐层 socket 用例。
+19 个跳过项需要 CUDA/GPU 环境，其中真实模型对照还需显式配置模型。
+JUnit 报告：执行机 `/tmp/minisgl-host-dram-cpu.xml`，不随仓库发布。
 
 在项目根目录、已安装测试依赖且允许本机 socket/子进程的环境中运行：
 
 ```bash
 TVM_FFI_DISABLE_TORCH_C_DLPACK=1 PYTHONPATH=python python -m pytest -q -o addopts= \
   tests/disagg tests/integration tests/core tests/misc \
-  --tb=short --junitxml=/tmp/minisgl-startup-cpu.xml
+  --tb=short --junitxml=/tmp/minisgl-host-dram-cpu.xml
 ```
 
 本机已有虚拟环境时把 `python` 换成 `.venv/bin/python`。
@@ -57,6 +58,7 @@ TVM_FFI_DISABLE_TORCH_C_DLPACK=1 FLUXINFER_TEST_PYTHON=python bash tools/pd/test
 | 缓存介质成本 | [test_pd_policy.py](../../tests/integration/test_pd_policy.py) | `balanced` 对远端 RDMA+H2D 折算额外成本，同样的命中数量不能直接等同于 HBM 命中 |
 | 启动期防呆 | [test_pd_startup_validation.py](../../tests/integration/test_pd_startup_validation.py)，63 项 | 默认 64 MiB 临界值、满页向上对齐、权重/Engine/pinned 池前拒绝无解配置；health 不一致去重告警、缺失字段降级；P/D/Router 三方限额裁剪；全种类跨 Worker 冲突、Host TE 默认偏移、网关冲突、TE 临时端口区间及首个子进程前拒绝 |
 | 完成协议与网络 | [test_pd_layered.py](../../tests/integration/test_pd_layered.py)、[test_pd_pipeline.py](../../tests/integration/test_pd_pipeline.py) | 两个旧失败、非法协议下的 reader 保护、真实 socket/两进程续算及 EOS 预留释放 |
+| 主通道 Host 中转 | [test_pd_layered.py](../../tests/integration/test_pd_layered.py)、[test_pd_batching.py](../../tests/integration/test_pd_batching.py)、[test_pd_routing.py](../../tests/integration/test_pd_routing.py) | D2H event 完成前禁止提交写、源 HBM 与在途 pinned ring 独立复用、安装 event 前后切片回收、两种客户端混连拒绝、后缀与完整命中、EOS/断连、UNKNOWN/FAILED_DRAINED 隔离、回执只补送一次 |
 
 共享适配器 [pd_cache_reference.py](../../tests/integration/pd_cache_reference.py) 复用真实请求握手、
 CacheManager、Radix、页表、MHAKVCache、哈希发布与镜像同步。CPU Radix 测试仅替换原生最长前缀比较原语，
@@ -70,3 +72,5 @@ CacheManager、Radix、页表、MHAKVCache、哈希发布与镜像同步。CPU R
 
 配套 Mooncake 的原生编译、GPU 字节对照、跨服务器、多请求压力及进程崩溃后的 reader fence
 仍需实机验证，见 [DRAM 验收清单](dram_cache.md#验证与实机验收)。
+Host 模式的独立 pinned/CUDA 双流往返也提供 opt-in 检查；CPU 适配器不能证明主 TE 的真实 Host RDMA 或 TPOT，
+配置与验收边界见 [Host 中转说明](host_dram_transfer.md)。

@@ -12,16 +12,24 @@ from contextlib import contextmanager
 
 import torch
 
+from .protocol import MOONCAKE_TRANSPORT_MODES
 from .transfer import TransferBackendUnavailable, TransferError
 
 
 class CudaTransfer:
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, *, transfer_mode="gpu_direct"):
+        if transfer_mode not in MOONCAKE_TRANSPORT_MODES:
+            raise ValueError("unsupported Mooncake transfer mode")
+        self.transfer_mode = transfer_mode
         self.device = torch.device(device)
         if self.device.type != "cuda" or self.device.index is None:
-            raise TransferBackendUnavailable("Mooncake GPU transfer requires an indexed CUDA device")
+            raise TransferBackendUnavailable(
+                "Mooncake GPU transfer requires an indexed CUDA device"
+            )
         if not torch.cuda.is_initialized():
-            raise TransferBackendUnavailable("bind Mooncake after the model Engine initializes CUDA")
+            raise TransferBackendUnavailable(
+                "bind Mooncake after the model Engine initializes CUDA"
+            )
         try:
             self.driver = importlib.import_module("cuda.bindings.driver")
         except ImportError as exc:
@@ -33,9 +41,11 @@ class CudaTransfer:
             self.context = self._one(self.driver.cuCtxGetCurrent(), "cuCtxGetCurrent")
             if not int(self.context):
                 raise TransferBackendUnavailable("the model's CUDA context is not current")
-            self.cuda_device = self._one(
-                self.driver.cuDeviceGet(self.device.index), "cuDeviceGet"
-            )
+            self.cuda_device = self._one(self.driver.cuDeviceGet(self.device.index), "cuDeviceGet")
+            if transfer_mode == "host_dram":
+                self.ordering = self.flush_options = 0
+                self.needs_flush = False
+                return  # No GDR capability query, device-pointer check or GDR flush required.
             attrs = self.driver.CUdevice_attribute
             supported = self._attribute(attrs.CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED)
             if not supported:
@@ -95,8 +105,23 @@ class CudaTransfer:
 
     def prepare_buffer(self, tensor: torch.Tensor) -> None:
         """Check real device memory, then enable CUDA's registration consistency mode."""
+        if self.transfer_mode == "host_dram":
+            if (
+                tensor.device.type != "cpu"
+                or tensor.dtype != torch.uint8
+                or not tensor.is_contiguous()
+                or not tensor.numel()
+                or not tensor.is_pinned()
+                or tensor.data_ptr() % 256
+            ):
+                raise TransferError(
+                    "host_dram requires nonempty 256-byte-aligned pinned CPU uint8 storage"
+                )
+            return
         if tensor.device != self.device or not tensor.is_contiguous() or not tensor.numel():
-            raise TransferError("registered KV must be a nonempty contiguous tensor on the Worker GPU")
+            raise TransferError(
+                "registered KV must be a nonempty contiguous tensor on the Worker GPU"
+            )
         address = tensor.data_ptr()
         attrs = self.driver.CUpointer_attribute
         with self.activate():
@@ -113,7 +138,9 @@ class CudaTransfer:
             if managed:
                 raise TransferError("managed/unified memory is not accepted for GPU KV transfer")
             ordinal = self._one(
-                self.driver.cuPointerGetAttribute(attrs.CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, address),
+                self.driver.cuPointerGetAttribute(
+                    attrs.CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, address
+                ),
                 "cuPointerGetAttribute(device ordinal)",
             )
             if int(ordinal) != self.device.index:
@@ -128,12 +155,13 @@ class CudaTransfer:
 
     def make_visible(self) -> None:
         """Run only after remote completion, before enqueueing the CUDA consumer."""
+        if self.transfer_mode == "host_dram":
+            return
         with self.activate():
             if self.needs_flush:
                 self._call(
                     self.driver.cuFlushGPUDirectRDMAWrites(
-                        self.driver.CUflushGPUDirectRDMAWritesTarget
-                        .CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+                        self.driver.CUflushGPUDirectRDMAWritesTarget.CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
                         self.scope,
                     ),
                     "cuFlushGPUDirectRDMAWrites",
@@ -146,7 +174,8 @@ class CudaTransfer:
     def info(self) -> dict:
         return {
             "device": str(self.device),
-            "gpudirect_rdma": True,
+            "gpudirect_rdma": self.transfer_mode == "gpu_direct",
+            "transfer_mode": self.transfer_mode,
             "rdma_writes_ordering": self.ordering,
             "rdma_flush_options": self.flush_options,
             "host_flush_required": self.needs_flush,

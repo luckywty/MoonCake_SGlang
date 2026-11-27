@@ -150,7 +150,7 @@ def sender_loop(backend):
             channel.send(
                 {
                     "op": "layer_open",
-                    "backend": TRANSPORT,
+                    "backend": backend.transport,
                     "ticket": json.loads(job.ticket.to_wire()),
                     "source": backend.runtime.session,
                 }

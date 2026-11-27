@@ -284,12 +284,18 @@ def run_request(p, d, prompt, tokens, *, plan=None, ready_out=None, wait_drain=T
     return req, output
 
 
-def test_decode_without_gpu_radix_retains_only_new_full_dram_pages():
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
+def test_decode_without_gpu_radix_retains_only_new_full_dram_pages(transport_mode):
     prompt = tuple(range(1, 11))
-    with cluster(budget=32) as (p, decoders, _):
+    with cluster(budget=32, transport_mode=transport_mode) as (p, decoders, _):
         d = decoders[0]
         enable(p)
         enable(d)
+        if transport_mode == "host_dram":
+            staging = d.backend._receive_buffer
+            cache_start = d.dram_pool.buffer.data_ptr()
+            cache_end = cache_start + d.dram_pool.buffer.numel()
+            assert staging.address + staging.nbytes <= cache_start or cache_end <= staging.address
         request, output = run_request(p, d, prompt, 8)
         assert output == reference_tokens(prompt, 8)
         assert len(d.s.cache_manager.free_slots) == d.s.engine.num_pages
@@ -412,19 +418,25 @@ def attach_host(service, module, *, timeout=0.1):
 
 
 @pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
 def test_reverse_promotion_and_dram_reserve_keep_original_suffix_boundary(
-    host_rdma, monkeypatch, inference
+    host_rdma, monkeypatch, inference, transport_mode
 ):
     prompt = tuple(range(1, 11))
     monkeypatch.setenv("MC_MIN_RPC_PORT", "22501")
     monkeypatch.setenv("MC_MAX_RPC_PORT", "22501")
-    with torch.inference_mode(inference), cluster(budget=32) as (p, decoders, _):
+    with (
+        torch.inference_mode(inference),
+        cluster(budget=32, transport_mode=transport_mode) as (p, decoders, _),
+    ):
         d = decoders[0]
         d.decode_radix_cache = True
         d.s.cache_manager = CacheManager(32, 4, d.s.engine.page_table, "radix")
         enable(p, batch_pages=1)
         enable(d, batch_pages=1)
         receiver, donor = attach_host(p, host_rdma), attach_host(d, host_rdma)
+        assert receiver.engine is not p.backend.runtime.engine
+        assert donor.engine is not d.backend.runtime.engine
         assert receiver.engine.get_rpc_port() == 26000 and donor.engine.get_rpc_port() == 26001
         for service in (p, d):
             health = service.health()["dram_cache"]
@@ -637,10 +649,11 @@ def test_partial_remote_timeout_keeps_loaded_prefix_and_recomputes_the_remainder
 
 
 @pytest.mark.parametrize("result", [0, -1])
+@pytest.mark.parametrize("transport_mode", ["gpu_direct", "host_dram"])
 def test_export_expiry_fences_only_the_host_engine_and_never_recycles_without_proof(
-    host_rdma, result
+    host_rdma, result, transport_mode
 ):
-    with cluster() as (p, decoders, _):
+    with cluster(transport_mode=transport_mode) as (p, decoders, _):
         d = decoders[0]
         enable(d)
         donor = attach_host(d, host_rdma)
@@ -668,6 +681,10 @@ def test_export_expiry_fences_only_the_host_engine_and_never_recycles_without_pr
             assert not donor.pool._evict_one()
             # The controlled fake has no in-flight read; a late receipt is safe.
             donor.pool.unpin_dram(lease.id, lease.peer, drained=True)
+        assert donor.engine is not d.backend.runtime.engine
+        if transport_mode == "host_dram":
+            _, output = run_request(p, d, (1, 2, 3, 4, 5), 3)
+            assert output == reference_tokens((1, 2, 3, 4, 5), 3)
 
 
 def test_restart_and_broken_delta_clear_both_tiers():

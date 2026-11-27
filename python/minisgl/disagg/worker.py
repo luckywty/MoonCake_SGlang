@@ -7,7 +7,7 @@ import json
 import os
 import socket
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event
@@ -23,7 +23,7 @@ from minisgl.scheduler.utils import PendingReq
 from .backend import create_transfer_backend
 from .control import CancelledError, Channel, StartRequest
 from .lifecycle import RequestLifecycle
-from .protocol import KVLayout, KVTransferMetadata, RequestHandoff
+from .protocol import MOONCAKE_TRANSPORT_MODES, KVLayout, KVTransferMetadata, RequestHandoff
 from .role import WorkerRole
 from .transfer import TransferBackendUnavailable
 
@@ -57,6 +57,11 @@ def validate_split_config(config) -> None:
         raise ValueError("Phase 2 requires real weights and unquantized KV")
     if config.max_extend_tokens < 1 or config.max_running_req < 1:
         raise ValueError("split worker requires positive prefill and request capacity")
+    mode = getattr(config, "pd_mooncake_transport_mode", "gpu_direct")
+    if mode not in MOONCAKE_TRANSPORT_MODES or (
+        mode == "host_dram" and getattr(config, "pd_transfer_backend", "tcp") != "mooncake"
+    ):
+        raise ValueError("host_dram requires explicit Mooncake transport configuration")
 
 
 class PDWorkerScheduler(Scheduler):
@@ -84,13 +89,35 @@ class PDWorkerScheduler(Scheduler):
         elif self.decode_radix_cache:
             raise ValueError("decode Radix caching requires a decode Worker")
         self._gpu_transfer = getattr(config, "pd_transfer_backend", "tcp") == "mooncake"
+        self.transfer_mode = getattr(config, "pd_mooncake_transport_mode", "gpu_direct")
         if self._gpu_transfer:
             maximum = getattr(config, "pd_max_transfer_bytes", 1024**3)
             reserved = getattr(config, "pd_max_registered_bytes", None)
             reserved = 2 * maximum if reserved is None else reserved
             if type(reserved) is not int or reserved < maximum:
                 raise ValueError("GPU transfer reserve must cover the maximum KV payload")
-            config = replace(config, pd_transfer_reserve_bytes=reserved)
+            if self.transfer_mode == "host_dram":
+                from .cluster_config import host_staging_plan
+
+                model = config.model_config
+                plan = host_staging_plan(
+                    max_seq_len=config.max_seq_len,
+                    bytes_per_token=2
+                    * model.num_layers
+                    * model.num_kv_heads
+                    * model.head_dim
+                    * config.dtype.itemsize,
+                    layers=model.num_layers,
+                    layers_per_chunk=getattr(config, "pd_layers_per_chunk", 1),
+                    staging_slots=getattr(config, "pd_staging_slots", 3),
+                    max_transfer_bytes=maximum,
+                    max_registered_bytes=reserved,
+                    rows=config.max_running_req,
+                    prefill=config.worker_role is WorkerRole.PREFILL,
+                )
+                config = replace(config, pd_transfer_reserve_bytes=plan.gpu_bytes)
+            else:
+                config = replace(config, pd_transfer_reserve_bytes=reserved)
         model_path = config.model_path
         if not Path(model_path).is_dir():
             from huggingface_hub import snapshot_download
@@ -227,6 +254,7 @@ class PDWorkerScheduler(Scheduler):
                         self.layout,
                         slots.tolist(),
                         num_pool_pages=self.engine.num_pages,
+                        transfer_mode=getattr(self, "transfer_mode", "gpu_direct"),
                     )
                     handoff = RequestHandoff(
                         req.uid,
@@ -323,15 +351,35 @@ class PDWorkerScheduler(Scheduler):
                     or handoff.ignore_eos != request.ignore_eos
                     or handoff.kv.transfer_id != request.transfer_id
                     or handoff.kv.layout != self.layout
+                    or handoff.kv.transfer_mode != backend.transfer_mode
                     or handoff.eos_token_id != self.eos_token_id
                     or not handoff.remaining_tokens
                     or handoff.first_token_id >= self.vocab_size
                 ):
                     raise ValueError("layered handoff does not match its reservation")
                 staging = backend.finish_layers(ticket)
-                self.engine.kv_cache.import_layered_tensor(
-                    staging, slots, num_pool_pages=self.engine.num_pages
+                install_stream = (
+                    backend.install_stream
+                    if backend.transfer_mode == "host_dram" and self.device.type == "cuda"
+                    else None
                 )
+                try:
+                    if install_stream is not None:
+                        install_stream.wait_stream(self.engine.stream)
+                    with (
+                        torch.cuda.stream(install_stream)
+                        if install_stream is not None
+                        else nullcontext()
+                    ):
+                        backend.install_layers(
+                            self.engine.kv_cache,
+                            staging,
+                            slots,
+                            num_pool_pages=self.engine.num_pages,
+                        )
+                finally:
+                    if install_stream is not None:
+                        self.engine.stream.wait_stream(install_stream)
                 req = self._owned_req
                 req.input_ids[-1] = handoff.first_token_id
                 self.token_pool[req.table_idx, : req.device_len] = req.input_ids.to(self.device)

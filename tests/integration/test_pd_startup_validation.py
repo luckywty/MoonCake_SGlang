@@ -2,7 +2,7 @@
 
 import copy
 import logging
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
@@ -22,6 +22,252 @@ from minisgl.disagg.tier_index import TierIndex, TierPublisher
 from minisgl.disagg.worker import PDWorkerScheduler
 from minisgl.scheduler import Scheduler
 from minisgl.server.args import parse_args
+
+
+@pytest.mark.parametrize(
+    "backend,mode,valid",
+    [
+        ("tcp", "host_dram", False),
+        ("mooncake", "host_dram", True),
+        ("mooncake", "gpu_direct", True),
+    ],
+)
+def test_main_transport_is_explicit_and_host_is_not_a_tcp_fallback(
+    monkeypatch, backend, mode, valid
+):
+    load = Mock(side_effect=AssertionError("model load during flag validation"))
+    monkeypatch.setattr("minisgl.utils.cached_load_hf_config", load)
+    flags = [
+        "--model",
+        "/unused",
+        "--dtype",
+        "bfloat16",
+        "--worker-role",
+        "prefill",
+        "--pd-transfer-backend",
+        backend,
+        "--pd-mooncake-transport-mode",
+        mode,
+    ]
+    if valid:
+        args, _ = parse_args(flags)
+        assert args.pd_mooncake_transport_mode == mode
+        if mode == "host_dram":
+            assert args.pd_transfer_reserve_bytes == 0  # Model-sized scratch reserved by Worker.
+    else:
+        with pytest.raises(SystemExit) as error:
+            parse_args(flags)
+        assert error.value.code == 2
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_host_staging_plan_counts_alignment_and_bounds_only_the_main_te(prefill):
+    from minisgl.disagg.cluster_config import host_staging_plan
+
+    options = {
+        "max_seq_len": 32,
+        "bytes_per_token": 128,
+        "layers": 2,
+        "layers_per_chunk": 1,
+        "staging_slots": 2,
+        "max_transfer_bytes": 4096,
+        "max_registered_bytes": 4096,
+        "rows": 8,
+        "prefill": prefill,
+    }
+    plan = host_staging_plan(**options)
+    assert (plan.payload_bytes, plan.group_bytes, plan.registered_bytes, plan.gpu_bytes) == (
+        4096,
+        2048,
+        4096,
+        2304,
+    )
+    options.update(
+        max_transfer_bytes=1000, max_registered_bytes=1000, bytes_per_token=240, layers=3
+    )
+    with pytest.raises(ValueError, match="--pd-max-registered-bytes"):
+        host_staging_plan(**options)
+
+
+@dataclass
+class StagingModel:
+    num_layers: int = 3
+    num_kv_heads: int = 1
+    head_dim: int = 20
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("bad_budget", [False, True])
+def test_host_model_budget_is_validated_before_weights_and_reserves_only_gpu_scratch(
+    monkeypatch, tmp_path, role, bad_budget
+):
+    from minisgl.distributed import DistributedInfo
+    from minisgl.engine.config import EngineConfig
+    from minisgl.server.args import ServerArgs
+
+    model = StagingModel() if bad_budget else StagingModel(2, 1, 8)
+    monkeypatch.setattr(EngineConfig, "model_config", property(lambda _: model))
+    config = ServerArgs(
+        str(tmp_path),
+        DistributedInfo(0, 1),
+        torch.float16,
+        worker_role=role,
+        pd_transfer_backend="mooncake",
+        pd_mooncake_transport_mode="host_dram",
+        max_seq_len_override=32,
+        pd_max_transfer_bytes=1000 if bad_budget else 1024,
+        pd_max_registered_bytes=1000 if bad_budget else 4096,
+        pd_layers_per_chunk=1,
+        pd_staging_slots=2,
+    )
+    captured = []
+
+    class EngineBoundary(Exception):
+        pass
+
+    def stop_before_engine(self, actual, **kwargs):
+        captured.append(actual)
+        raise EngineBoundary()
+
+    fingerprint = Mock(return_value="a" * 64)
+    monkeypatch.setattr("minisgl.disagg.worker.checkpoint_fingerprint", fingerprint)
+    monkeypatch.setattr(Scheduler, "__init__", stop_before_engine)
+    if bad_budget:
+        with pytest.raises(ValueError, match="--pd-max-registered-bytes"):
+            PDWorkerScheduler(config)
+        assert not captured
+        fingerprint.assert_not_called()
+    else:
+        with pytest.raises(EngineBoundary):
+            PDWorkerScheduler(config)
+        assert captured[0].pd_transfer_reserve_bytes == 640  # 512-byte group + 16 int64 slots.
+
+
+@pytest.mark.parametrize("mode", ["gpu_direct", "host_dram"])
+def test_main_te_host_registration_does_not_require_cuda_enabled_mooncake(monkeypatch, mode):
+    import sys
+    from types import ModuleType
+
+    from layered_reference import FakeCuda
+    from minisgl.disagg import mooncake_runtime as module
+    from minisgl.disagg.mooncake_runtime import MooncakeRuntime
+    from minisgl.disagg.transfer import TransferBackendUnavailable
+    from pd_reference import cpu_pinned_allocations
+
+    registrations = []
+
+    class Engine:
+        def initialize(self, *args):
+            return 0
+
+        def get_rpc_port(self):
+            return 22501
+
+        def register_memory(self, address, length, location, remote):
+            registrations.append((address, length, location, remote))
+            return 0
+
+        def unregister_memory(self, address):
+            return 0
+
+        def submit_scatter_write(self, *args):
+            raise AssertionError("no request submitted in startup test")
+
+    native = ModuleType("host_staging_test_engine")
+    native.SUPPORT_CUDA = False
+    native.TransferEngine = Engine
+    native.ScatterTransferCompletionStatus = SimpleNamespace(
+        COMPLETED=1, FAILED_DRAINED=2, COMPLETION_UNKNOWN=3
+    )
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+    monkeypatch.setattr(
+        module,
+        "CudaTransfer",
+        lambda device, **kwargs: FakeCuda(kwargs.get("transfer_mode", "gpu_direct")),
+    )
+    monkeypatch.setattr(MooncakeRuntime, "_configure_rdma", staticmethod(lambda _: ["fake_hca"]))
+    monkeypatch.setenv("MC_MIN_RPC_PORT", "16000")
+    monkeypatch.setenv("MC_MAX_RPC_PORT", "16000")
+    runtime = MooncakeRuntime(
+        "127.0.0.1",
+        engine_module=native.__name__,
+        rpc_port=22501,
+        transfer_mode=mode,
+        max_transfer_bytes=512,
+        max_registered_bytes=1024,
+    )
+    try:
+        if mode == "gpu_direct":
+            with pytest.raises(TransferBackendUnavailable, match="lacks CUDA support"):
+                runtime.bind_device(torch.device("cuda:0"))
+            assert runtime.transfer_mode == "gpu_direct" and not registrations
+        else:
+            with cpu_pinned_allocations():
+                runtime.bind_device(torch.device("cuda:0"))
+                buffer = runtime.allocate_buffer(512, "host-main", pool=True)
+            assert buffer.tensor.device.type == "cpu" and buffer.address % 256 == 0
+            assert registrations == [(buffer.address, 512, "*", True)]
+            assert runtime.info["memory"] == "host_pinned"
+            assert runtime.info["transfer_mode"] == "host_dram"
+            runtime.make_visible(buffer)
+            assert runtime.cuda.visible == 0
+    finally:
+        runtime.close()
+
+
+def test_explicit_host_cuda_adapter_skips_gdr_and_rejects_unpinned_memory(monkeypatch):
+    from contextlib import nullcontext
+
+    from minisgl.disagg import cuda_transfer
+    from minisgl.disagg.transfer import TransferBackendUnavailable, TransferError
+
+    driver = SimpleNamespace(
+        CUresult=SimpleNamespace(CUDA_SUCCESS=0),
+        cuInit=lambda _: (0,),
+        cuCtxGetCurrent=lambda: (0, 1),
+        cuDeviceGet=lambda _: (0, 0),
+        CUdevice_attribute=SimpleNamespace(CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED=1),
+        cuDeviceGetAttribute=lambda *args: (0, 0),
+    )
+    original = cuda_transfer.importlib.import_module
+    monkeypatch.setattr(
+        cuda_transfer.importlib,
+        "import_module",
+        lambda name: driver if name == "cuda.bindings.driver" else original(name),
+    )
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    adapter = cuda_transfer.CudaTransfer(torch.device("cuda:0"), transfer_mode="host_dram")
+    backing = torch.empty(767, dtype=torch.uint8)
+    start = -backing.data_ptr() % 256
+    tensor = backing[start : start + 512]
+    with pytest.raises(TransferError, match="pinned CPU"):
+        adapter.prepare_buffer(tensor)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda _: True)
+    adapter.prepare_buffer(tensor)
+    adapter.make_visible()  # Driver has no cuCtxSynchronize or GDR flush entrypoints.
+    assert not adapter.info["gpudirect_rdma"]
+    with pytest.raises(TransferBackendUnavailable, match="does not support GPUDirect"):
+        cuda_transfer.CudaTransfer(torch.device("cuda:0"))
+
+
+def test_full_prefix_reservation_still_rejects_a_different_transport_mode():
+    from minisgl.disagg.client import reservation_prefix
+    from minisgl.disagg.control import StartRequest
+
+    request = StartRequest(str(uuid4()), 0, (1, 2, 3, 4), 3, True)
+    ready = {
+        "handoff_version": 2,
+        "transfer_id": request.transfer_id,
+        "prompt_tokens": 4,
+        "decode_prefix_len": 4,
+        "ticket": None,
+        "transfer_mode": "host_dram",
+    }
+    assert reservation_prefix(ready, request, layered=True, transfer_mode="host_dram") == 4
+    with pytest.raises(ValueError, match="transport mode"):
+        reservation_prefix(ready, request, layered=True, transfer_mode="gpu_direct")
 
 
 def dram_config(**kwargs):
@@ -247,7 +493,7 @@ def cluster_args(*flags):
     return args
 
 
-@pytest.mark.parametrize("source", ["control", "distributed", "data", "GPU TE", "Host TE"])
+@pytest.mark.parametrize("source", ["control", "distributed", "data", "main TE", "Host TE"])
 @pytest.mark.parametrize("target", ["control_port", "data_port", "mooncake_port", "dram_port"])
 def test_every_cross_worker_port_category_is_checked_with_both_owners_in_the_error(source, target):
     args = cluster_args("--pd-transfer-backend", "mooncake")
@@ -256,7 +502,7 @@ def test_every_cross_worker_port_category_is_checked_with_both_owners_in_the_err
         "control": p.control_port,
         "distributed": p.control_port + 1,
         "data": p.data_port,
-        "GPU TE": p.mooncake_port,
+        "main TE": p.mooncake_port,
         "Host TE": p.dram_port,
     }[source]
     bad = replace(d, **{target: port})
