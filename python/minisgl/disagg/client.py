@@ -343,6 +343,10 @@ class PDClient:
                     or worker_transfer_mode(decode_caps) != mode
                 ):
                     raise ValueError("incompatible Decode protocol or transfer mode")
+                from .shared_dram_routing import compatible_history
+
+                if not compatible_history(capabilities, decode_caps):
+                    raise ValueError("P/D shared history host/pool differs")
                 if mode == "shm_dram" and (
                     not capabilities.get("host_id")
                     or capabilities.get("host_id") != decode_caps.get("host_id")

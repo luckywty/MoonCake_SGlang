@@ -149,10 +149,16 @@ class RoutingConfig:
     dram_prefill_ms_per_token: float = 0.01
     dram_max_pull_bytes: int = 64 * 1024**2
     pd_cross_numa_penalty: float = 4.0
+    pd_shared_dram_remote_h2d_factor: float = 1.5
 
     def __post_init__(self):
         if not math.isfinite(self.pd_cross_numa_penalty) or self.pd_cross_numa_penalty < 0:
             raise ValueError("cross NUMA routing penalty must be finite and nonnegative")
+        if (
+            not math.isfinite(self.pd_shared_dram_remote_h2d_factor)
+            or self.pd_shared_dram_remote_h2d_factor < 1
+        ):
+            raise ValueError("shared history cross-NUMA H2D factor must be finite and >= 1")
         if (
             type(self.min_remote_pull_tokens) is not int
             or self.min_remote_pull_tokens < 1
@@ -339,7 +345,10 @@ class PolicyRouter:
             loads = self._loads()
             nodes = self.candidates("prefill", request, bucket, exclude, loads=loads)
             policy = bucket.prefill.policy or self.config.policy
-            if nodes and any(n.health.get("transfer_mode") == "shm_dram" for n in nodes):
+            if nodes and any(
+                n.health.get("transfer_mode") == "shm_dram" or n.health.get("shared_dram")
+                for n in nodes
+            ):
                 decodes = self.candidates("decode", request, bucket, loads=loads)
                 nodes = [p for p in nodes if any(self._shm_pair(p, d) for d in decodes)]
                 if not nodes:
@@ -413,6 +422,12 @@ class PolicyRouter:
     @staticmethod
     def _shm_pair(prefill, decode):
         p, d = prefill.health, decode.health
+        from .shared_dram_routing import compatible_history
+
+        if not compatible_history(p, d):
+            return False
+        if p.get("transfer_mode") != "shm_dram" and d.get("transfer_mode") != "shm_dram":
+            return p.get("transfer_mode") == d.get("transfer_mode")
         return (
             p.get("transfer_mode") == d.get("transfer_mode") == "shm_dram"
             and p.get("host_id")
@@ -471,7 +486,10 @@ class PolicyRouter:
         with self.lock:
             loads = self._loads()
             nodes = self.candidates("decode", request, bucket, exclude, loads=loads)
-            if prefill is not None and prefill.health.get("transfer_mode") == "shm_dram":
+            if prefill is not None and (
+                prefill.health.get("transfer_mode") == "shm_dram"
+                or prefill.health.get("shared_dram")
+            ):
                 nodes = [n for n in nodes if self._shm_pair(prefill, n)]
                 if not nodes:
                     raise NoHealthyWorker("no same-host shared-pool Decode Worker")
@@ -534,6 +552,7 @@ class PolicyRouter:
 
 
 def add_policy_args(parser):
+    parser.add_argument("--pd-shared-dram-remote-h2d-factor", type=float, default=1.5)
     parser.add_argument(
         "--pd-cross-numa-penalty",
         type=float,
@@ -600,12 +619,14 @@ def policy_config(args):
         dram_prefill_ms_per_token=args.dram_prefill_ms_per_token,
         dram_max_pull_bytes=args.dram_max_pull_bytes,
         pd_cross_numa_penalty=args.pd_cross_numa_penalty,
+        pd_shared_dram_remote_h2d_factor=args.pd_shared_dram_remote_h2d_factor,
     )
 
 
 def policy_cli_args(args):
     names = (
         "pd_cross_numa_penalty",
+        "pd_shared_dram_remote_h2d_factor",
         "routing_policy",
         "decode_policy",
         "bucket_config",

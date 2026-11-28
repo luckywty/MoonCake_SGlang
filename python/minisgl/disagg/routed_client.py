@@ -85,8 +85,14 @@ class RoutedPDClient(PDClient):
             return None
         nodes = self.pool.healthy("prefill")
         tier_index = getattr(self.pool, "tier_index", None)
-        return self.pool.prefix_index.spec_for(nodes) or (
-            tier_index.spec_for(nodes) if tier_index is not None else None
+        return (
+            self.pool.prefix_index.spec_for(nodes)
+            or (tier_index.spec_for(nodes) if tier_index is not None else None)
+            or (
+                self.pool.shared_history.spec_for(nodes)
+                if hasattr(self.pool, "shared_history")
+                else None
+            )
         )
 
     def _prefix_matches(self, request, bucket, cancel, prepared_prefix=None):
@@ -115,6 +121,10 @@ class RoutedPDClient(PDClient):
                 result.update(tier_hits)
             except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
                 pass  # An optional directory cannot fail an inference request.
+        if hasattr(self.pool, "shared_history"):
+            result.update(
+                self.pool.shared_history.hits(nodes, prepared_prefix, result, self.router.config)
+            )
         return result
 
     def _route_and_reserve(self, request, cancel, prepared_prefix=None):
@@ -169,6 +179,10 @@ class RoutedPDClient(PDClient):
                     node.health
                 ) != worker_transfer_mode(prefill.health):
                     raise RemoteUnavailableError("P/D transfer modes differ")
+                from .shared_dram_routing import compatible_history
+
+                if not compatible_history(prefill.health, node.health):
+                    raise RemoteUnavailableError("P/D shared history host/pool differs")
                 if worker_transfer_mode(prefill.health) == "shm_dram" and not self.router._shm_pair(
                     prefill, node
                 ):

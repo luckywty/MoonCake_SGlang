@@ -1,5 +1,8 @@
 # P/D 本地 DRAM KV 缓存与 D→P 按需拉取
 
+本文描述默认 `--pd-dram-cache-mode private`。新增单机 `shared_shm` 模式使用独立共享历史池，
+目录、逐页发布和直接跨 NUMA H2D 见 [shared_dram_cache.md](shared_dram_cache.md)；不改变本文私有池与跨机拉取语义。
+
 更新日期：2026-11-26（Asia/Shanghai）；CPU 回归记录更新于同日。
 
 本次在 `4d15539` 页面哈希索引、`5e1e21e` D Radix 后缀交接基础上实现。

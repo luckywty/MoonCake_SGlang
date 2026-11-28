@@ -30,6 +30,37 @@ JUnit 报告：执行机 `/tmp/minisgl-host-dram-cpu.xml`，不随仓库发布�
 `/tmp/minisgl-shm-final-config.xml`、`/tmp/minisgl-shm-pure-final.xml`。
 共享中转参数和真机预检见 [shm_dram 说明](shm_dram.md)。
 
+### 2026-11-28：共享历史 KV 池完整回归
+
+本轮先对 `688378a` 的独立快照运行四目录完整 CPU 集合，实际结果为
+**442 passed、19 skipped、117 subtests passed、0 failed**。此前待补跑的完整前缀命中与
+SIGTERM 子进程清理用例已在本轮基线中通过，上节保留的是上一轮验证过程记录。
+
+新增 `--pd-dram-cache-mode shared_shm` 后，同一完整集合实际结果为
+**477 passed、19 skipped、117 subtests passed、0 failed**，耗时 65.57 秒。
+新增 35 项：目录单元测试 10 项、真实 POSIX SHM/UDS 与 CPU KV 集成测试 12 项、
+预算/配置/路由测试 13 项。具体文件：
+
+- `tests/disagg/test_shared_dram_directory.py`：动态 NUMA 分配顺序、去重、STAGED 隔离、
+  LRU/LFU、引用/ABA/所有者校验、无锁 Hint、并发重复分配、断连隔离。
+- `tests/integration/test_pd_shared_history.py`：Decode 历史页复用并减少 Prefill 计算、
+  本地满后跨 NUMA 直写/直读、无额外 Host payload 复制、全 pin 时不阻塞 Decode、
+  D2H 发布屏障、H2D 取消排空、generation 复核、模型域隔离、回执重放、实际进程退出回收、
+  Launcher SIGTERM 删除段/socket/manifest。
+- `tests/integration/test_shared_dram_config_routing.py`：加载权重前的容量/身份/几何校验、
+  历史池与主 relay/Host TE 的合计注册预算、`/dev/shm` 空间、动态节点预算、
+  本地/跨 NUMA 恢复成本及同池配对约束。
+
+环境仍为 Python 3.12.3、PyTorch 2.9.1+cpu、pytest 9.2.0，无 CUDA。报告在执行机
+`/tmp/minisgl-shared-history-baseline.xml` 和 `/tmp/minisgl-shared-history-final.xml`，不随仓库发布。
+本次改动 Python 文件的 Ruff、Black 格式和 diff whitespace 检查通过。
+扩大 Ruff 范围到整个 `disagg` 时仍有未修改文件 `prefix_index.py`、`prompt_prepare.py`
+的既有导入排序告警，未顺带修改。
+
+使用下方同一完整回归命令可复验。功能配置、故障边界和新真机预检脚本见
+[共享历史池说明](shared_dram_cache.md)。脚本的 `--help` 入口已检查，
+真实双进程 CUDA 注册、严格 NUMA 页驻留、跨路 H2D 带宽与端到端模型收益仍未验收。
+
 在项目根目录、已安装测试依赖且允许本机 socket/子进程的环境中运行：
 
 ```bash

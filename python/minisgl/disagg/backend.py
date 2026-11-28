@@ -16,6 +16,9 @@ def create_transfer_backend(args):
         else None
     )
     kwargs = {"advertise_host": args.pd_advertise_host, "timeout": args.pd_timeout}
+    from .cluster_config import main_registered_budget
+
+    registered_budget = main_registered_budget(args)
     if name == "tcp":
         return TcpTransferBackend(bind, max_transfer_bytes=args.pd_max_transfer_bytes, **kwargs)
     if name == "mooncake":
@@ -25,7 +28,7 @@ def create_transfer_backend(args):
             bind,
             local_host=args.pd_mooncake_host or args.pd_advertise_host or args.server_host,
             max_transfer_bytes=args.pd_max_transfer_bytes,
-            max_registered_bytes=getattr(args, "pd_max_registered_bytes", None),
+            max_registered_bytes=registered_budget,
             max_pending_transfers=getattr(args, "pd_max_pending_transfers", 32),
             max_quarantine_seconds=getattr(args, "pd_max_quarantine_seconds", 300.0),
             device_name=getattr(args, "pd_mooncake_device", ""),
@@ -49,7 +52,7 @@ def create_transfer_backend(args):
             overflow_slots=args.pd_shm_overflow_slots,
             local_wait_ms=args.pd_shm_local_wait_ms,
             max_transfer_bytes=args.pd_max_transfer_bytes,
-            max_registered_bytes=args.pd_max_registered_bytes or 2 * args.pd_max_transfer_bytes,
+            max_registered_bytes=registered_budget,
             max_pending_transfers=args.pd_max_pending_transfers,
             **kwargs,
         )

@@ -57,6 +57,10 @@ def validate_split_config(config) -> None:
         raise ValueError("Phase 2 requires real weights and unquantized KV")
     if config.max_extend_tokens < 1 or config.max_running_req < 1:
         raise ValueError("split worker requires positive prefill and request capacity")
+    if getattr(config, "pd_dram_cache_mode", "private") == "shared_shm":
+        from .cluster_config import validate_shared_history
+
+        validate_shared_history(config)
     mode = getattr(config, "pd_mooncake_transport_mode", "gpu_direct")
     if mode not in MOONCAKE_TRANSPORT_MODES or (
         mode == "host_dram" and getattr(config, "pd_transfer_backend", "tcp") != "mooncake"
@@ -85,6 +89,10 @@ def validate_split_config(config) -> None:
                 "shm_dram requires a launcher manifest and valid NUMA/overflow options"
             )
         manifest = RelayManifest.from_json(Path(config.pd_shm_manifest).read_text())
+        if getattr(config, "pd_dram_cache_mode", "private") == "shared_shm":
+            from .cluster_config import main_registered_budget
+
+            config = replace(config, pd_max_registered_bytes=main_registered_budget(config))
         shm_staging_plan(config, manifest=manifest)  # Before weights/CUDA/SHM registration.
 
 
@@ -124,6 +132,10 @@ class PDWorkerScheduler(Scheduler):
             maximum = getattr(config, "pd_max_transfer_bytes", 1024**3)
             reserved = getattr(config, "pd_max_registered_bytes", None)
             reserved = 2 * maximum if reserved is None else reserved
+            if getattr(config, "pd_dram_cache_mode", "private") == "shared_shm":
+                from .cluster_config import main_registered_budget
+
+                reserved = main_registered_budget(config)
             if type(reserved) is not int or reserved < (1 if shm else maximum):
                 raise ValueError("GPU transfer reserve must cover the maximum KV payload")
             if shm:
@@ -131,7 +143,9 @@ class PDWorkerScheduler(Scheduler):
                 from .shm_relay_pool import RelayManifest
 
                 manifest = RelayManifest.from_json(Path(config.pd_shm_manifest).read_text())
-                plan = shm_staging_plan(config, manifest=manifest)
+                plan = shm_staging_plan(
+                    replace(config, pd_max_registered_bytes=reserved), manifest=manifest
+                )
                 config = replace(config, pd_transfer_reserve_bytes=plan.gpu_bytes)
             elif self.transfer_mode == "host_dram":
                 from .cluster_config import host_staging_plan
@@ -190,6 +204,8 @@ class PDWorkerScheduler(Scheduler):
         self._owned_req = None
         self._allocated_len = 0
         self.pd_service_config = {
+            "dram_cache_mode": getattr(config, "pd_dram_cache_mode", "private"),
+            "shared_dram_manifest": getattr(config, "pd_shared_dram_manifest", None),
             "numa_id": getattr(config, "pd_numa_id", 0),
             "host_id": getattr(config, "pd_host_id", ""),
             "dram": asdict(dram),
@@ -664,7 +680,10 @@ def launch_split_worker(args) -> None:
     backend = None
     scheduler = None
     try:
-        if args.pd_transfer_backend == "shm_dram":
+        if (
+            args.pd_transfer_backend == "shm_dram"
+            or getattr(args, "pd_dram_cache_mode", "private") == "shared_shm"
+        ):
             from .numa import bind_worker
 
             validate_split_config(args)

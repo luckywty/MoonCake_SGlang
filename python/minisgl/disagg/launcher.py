@@ -60,6 +60,10 @@ def parser():
     p.add_argument("--worker-advertise-host", default=None)
     p.add_argument("--pd-mooncake-host", default=None)
     p.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake", "shm_dram"), default="tcp")
+    p.add_argument("--pd-dram-cache-mode", choices=("private", "shared_shm"), default="private")
+    p.add_argument(
+        "--pd-shared-dram-numa-bytes", help="JSON per-node budgets within host-wide cache bytes"
+    )
     p.add_argument(
         "--gpu-numa-map", help="JSON GPU-id to OS NUMA-node map; also MINISGL_GPU_NUMA_MAP"
     )
@@ -91,6 +95,57 @@ def visible_gpus():
     if len(devices) != count:
         raise ValueError("CUDA_VISIBLE_DEVICES does not match the accessible GPU inventory")
     return devices
+
+
+def prepare_shared_history(args, specs, config):
+    from dataclasses import replace
+
+    from .cluster_config import validate_shared_history
+    from .numa import host_numa_nodes
+    from .shared_dram_pool import build_shared_manifest
+
+    nodes = host_numa_nodes(override=args.pd_shm_numa_nodes)
+    if (
+        args.pd_shm_numa_nodes is None
+        and "MINISGL_NUMA_NODES" not in os.environ
+        and (args.gpu_numa_map or "MINISGL_GPU_NUMA_MAP" in os.environ)
+    ):
+        nodes = sorted({s.numa_id for s in specs})
+    root = Path(tempfile.mkdtemp(prefix="minisgl-cache-"))
+    args.shared_history_manifest_path = str(root / "manifest.json")
+    model = config.model_config
+    manifest = build_shared_manifest(
+        name=f"minisgl_history_{uuid4().hex}",
+        page_size=config.page_size,
+        page_bytes=2
+        * model.num_layers
+        * model.num_kv_heads
+        * model.head_dim
+        * config.dtype.itemsize
+        * config.page_size,
+        capacity_bytes=config.pd_dram.capacity_bytes,
+        numa_nodes=nodes,
+        worker_numa={s.worker_id: s.numa_id for s in specs},
+        directory_socket=str(root / "directory.sock"),
+        secret=uuid4().hex,
+        cache_namespace=config.pd_cache_namespace,
+        node_bytes=(
+            json.loads(args.pd_shared_dram_numa_bytes) if args.pd_shared_dram_numa_bytes else None
+        ),
+    )
+    effective = replace(
+        config,
+        pd_shared_dram_manifest=args.shared_history_manifest_path,
+        pd_shm_manifest=getattr(args, "shm_manifest_path", None),
+    )
+    validate_shared_history(effective, manifest=manifest, check_worker=False, check_segments=False)
+    relay = getattr(args, "shm_manifest", None)
+    manifest.check_space(additional_bytes=relay.registered_bytes if relay else 0)
+    fd = os.open(args.shared_history_manifest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as file:
+        file.write(manifest.to_json())
+    args.shared_history_manifest = manifest
+    args.shared_history_policy = config.pd_dram.policy
 
 
 def worker_command(spec, args, worker_args):
@@ -136,6 +191,13 @@ def worker_command(spec, args, worker_args):
         if spec.rdma_device:
             command += ["--pd-mooncake-device", spec.rdma_device]
     command += ["--pd-numa-id", str(spec.numa_id), "--pd-host-id", spec.host_id]
+    if getattr(args, "pd_dram_cache_mode", "private") == "shared_shm":
+        command += [
+            "--pd-dram-cache-mode",
+            "shared_shm",
+            "--pd-shared-dram-manifest",
+            args.shared_history_manifest_path,
+        ]
     if args.pd_transfer_backend == "shm_dram":
         command += [
             "--pd-shm-manifest",
@@ -148,7 +210,10 @@ def worker_command(spec, args, worker_args):
             str(args.pd_cross_numa_penalty),
         ]
         # The child applies sched_setaffinity + set_mempolicy before model load.
-    elif spec.numa_node is not None:
+    elif (
+        spec.numa_node is not None
+        and getattr(args, "pd_dram_cache_mode", "private") != "shared_shm"
+    ):
         numactl = shutil.which("numactl")
         if numactl is None:
             raise ValueError("NUMA placement requires numactl")
@@ -171,7 +236,10 @@ class ClusterSupervisor:
         self.popen, self.children = popen or subprocess.Popen, []
         self.stop = threading.Event()
         self.relay = None
-        if getattr(args, "shm_manifest_path", None):
+        self.history_pool = self.history_server = None
+        if getattr(args, "shm_manifest_path", None) or getattr(
+            args, "shared_history_manifest_path", None
+        ):
             atexit.register(self.close)
 
     def start(self):
@@ -180,6 +248,14 @@ class ClusterSupervisor:
             gateway_port=None if self.args.no_gateway else self.args.port,
             backend=self.args.pd_transfer_backend,
         )
+        if getattr(self.args, "pd_dram_cache_mode", "private") == "shared_shm" and self.specs:
+            from .shared_dram_directory import SharedDramDirectory, SharedDramServer
+            from .shared_dram_pool import SharedDramPool
+
+            self.history_pool = SharedDramPool(self.args.shared_history_manifest, create=True)
+            self.history_server = SharedDramServer(
+                SharedDramDirectory(self.history_pool, policy=self.args.shared_history_policy)
+            )
         if self.args.pd_transfer_backend == "shm_dram" and self.specs:
             from .shm_relay_pool import SharedRelayPool
 
@@ -265,6 +341,8 @@ class ClusterSupervisor:
             self.start()
             announced = set()
             while not self.stop.wait(0.2):
+                if self.history_server is not None and not self.history_server.thread.is_alive():
+                    raise RuntimeError("shared history directory exited")
                 running = set()
                 for name, child, role in self.children:
                     code = child.poll()
@@ -305,10 +383,21 @@ class ClusterSupervisor:
         if self.relay is not None:
             self.relay.close()  # All processes have exited, including uncertain DMA owners.
             self.relay = None
+        if self.history_server is not None:
+            self.history_server.close()
+            self.history_server = None
+        if self.history_pool is not None:
+            self.history_pool.close()
+            self.history_pool = None
         atexit.unregister(self.close)
         path = getattr(self.args, "shm_manifest_path", None)
         if path:
             Path(path).unlink(missing_ok=True)
+        history_path = getattr(self.args, "shared_history_manifest_path", None)
+        if history_path:
+            Path(history_path).unlink(missing_ok=True)
+            if Path(history_path).parent.exists():
+                Path(history_path).parent.rmdir()
 
 
 def main(argv=None):
@@ -349,6 +438,7 @@ def main(argv=None):
                 or worker_args
                 or args.no_gateway
                 or args.disaggregation_decode_enable_radix_cache
+                or args.pd_dram_cache_mode != "private"
             ):
                 raise ValueError(
                     "remote-address mode only starts a gateway; local GPU/Worker arguments do not apply"
@@ -366,6 +456,7 @@ def main(argv=None):
                 "--pd-shm-manifest",
                 "--pd-numa-id",
                 "--pd-host-id",
+                "--pd-shared-dram-manifest",
             }
             if any(arg.split("=", 1)[0] in blocked for arg in worker_args):
                 raise ValueError("cluster launcher owns Worker roles, identities and ports")
@@ -393,10 +484,17 @@ def main(argv=None):
                         role,
                         "--pd-transfer-backend",
                         args.pd_transfer_backend,
+                        "--pd-dram-cache-mode",
+                        args.pd_dram_cache_mode,
                         *worker_args,
                         *role_flags,
                         "--dtype",
-                        args.dtype if args.pd_transfer_backend == "shm_dram" else "bfloat16",
+                        (
+                            args.dtype
+                            if args.pd_transfer_backend == "shm_dram"
+                            or args.pd_dram_cache_mode == "shared_shm"
+                            else "bfloat16"
+                        ),
                         "--model-source",
                         "huggingface",
                     ]
@@ -461,6 +559,8 @@ def main(argv=None):
                 fd, args.shm_manifest_path = tempfile.mkstemp(prefix="minisgl-shm-", suffix=".json")
                 with os.fdopen(fd, "w") as file:
                     file.write(args.shm_manifest.to_json())
+            if args.pd_dram_cache_mode == "shared_shm":
+                prepare_shared_history(args, specs, preflight)
             prefill = [spec.endpoint for spec in specs if spec.role == "prefill"]
             decode = [spec.endpoint for spec in specs if spec.role == "decode"]
         routing.validate_worker_ids(
@@ -469,6 +569,9 @@ def main(argv=None):
     except (ValueError, RuntimeError, OSError) as exc:
         if getattr(args, "shm_manifest_path", None):
             Path(args.shm_manifest_path).unlink(missing_ok=True)
+        if getattr(args, "shared_history_manifest_path", None):
+            Path(args.shared_history_manifest_path).unlink(missing_ok=True)
+            Path(args.shared_history_manifest_path).parent.rmdir()
         p.error(str(exc))
     supervisor = ClusterSupervisor(args, specs, prefill, decode, worker_args)
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}

@@ -16,10 +16,11 @@ Python 包名和命令入口仍为 `minisgl`。
 启用 DRAM 后进一步使用 v2 HBM/DRAM 镜像，设计、配置与验收边界见 [DRAM KV 缓存](docs/pd/dram_cache.md)。
 
 > **当前版本（2026-11-28）**：新增单机 `--pd-transfer-backend shm_dram`，通过 NUMA 专属共享 Pinned DRAM 槽位逐组中转，详见 [NUMA 共享中转说明](docs/pd/shm_dram.md)。Mooncake 默认仍为 `gpu_direct`，`host_dram` 需显式开启，不会自动降级。
+> 另可显式启用 `--pd-dram-cache-mode shared_shm`，在独立 NUMA 分段历史池中统一管理 P/D 完整页；本地优先、满后溢出，P 从页所在段直接 H2D。见 [共享历史 KV 缓存](docs/pd/shared_dram_cache.md)。
 > 本地 DRAM 缓存和 D→P 反向提升继续独立配置，支持 LRU/LFU、异步 D2H/H2D、短租约和失败重算；TE 与中转池完全分开。
 > D Radix 仍默认关闭；P→D 后缀始终取决于 D reserve 的真实前缀，单端点及 Routed 客户端继续先向 D 预留资源。
 > 已新增并运行 CPU attention 续算、受控 RDMA、拷贝 reader、缓存提交和索引一致性测试；CUDA/RDMA 实机验证仍待完成。
-> 扩大集合 **404 passed、19 skipped、117 subtests passed、0 failed**，包含 Host 中转的同步、隔离及混连回归，见 [CPU 回归记录](docs/pd/cpu_regression.md)。
+> 本轮完整 CPU 集合 **477 passed、19 skipped、117 subtests passed、0 failed**，包含既有 442 项和共享历史池新增 35 项，见 [CPU 回归记录](docs/pd/cpu_regression.md)。
 > 启动期检查模型 KV 门槛与字节上限，health 比对 Router/Worker 配置并约束计划；统一检查本机 Worker/Gateway 的端口冲突。
 > 远端拉取需配套构建 `../Mooncake` 的 reader fence API；本机 CMake 配置受缺失开发依赖阻止。旧 binding 可继续使用本地 DRAM。
 > 配套原生改动随仓库保存在 [Mooncake 补丁](patches/mooncake/README.md)，含准确基线和应用步骤。
@@ -53,9 +54,9 @@ Python 包名和命令入口仍为 `minisgl`。
 当前 split 模式限制为 **TP=1、greedy、真实 safetensors 权重、未量化 MHA KV、eager 执行**。
 每个 Worker 支持多个请求，由单个 GPU 调度主循环组 batch；关闭 CUDA Graph 和原有 CPU/GPU 调度重叠。
 Mooncake 的逐层计算/通信重叠是独立机制；多节点使用显式地址池，尚未提供自动发现或请求故障迁移。
-当前接入的是 **Mooncake Transfer Engine**；可选 P/D 本地 DRAM 池，缓存亲和读取 Router 的 HBM/DRAM 元数据镜像，尚无共享 Store 或 SSD 层。
+当前接入的是 **Mooncake Transfer Engine**；可选 P/D 私有 DRAM 池，或独立的单机 NUMA 共享历史池，尚无 Mooncake Store 或 SSD 层。
 TCP 路径的 CPU 接收区用于传输暂存，不是 Mooncake 论文中的 L2/L3 缓存池；session/SLO 选路和 Decode retract 尚未移植。
-P/D 各自管理 DRAM 副本；后续请求优先复用 P 本地缓存，也可按门槛从单个健康 D 的 DRAM 拉取，缺失或失败部分由 P 重算。
+默认 `private` 模式下，P/D 各自管理 DRAM 副本；后续请求优先复用 P 本地缓存，也可按门槛从单个健康 D 的 DRAM 拉取。`shared_shm` 模式由统一目录保护共享页，P 直接读取页所在 NUMA，缺失部分重算。
 
 模型源码包含 Llama、Qwen2、Qwen3、Qwen3MoE 和 Mistral；这些模型尚未全部通过新的
 P/D/RDMA 验收。上游性能结果也不代表本项目逐层传输版本的性能。
@@ -582,6 +583,7 @@ docs/pd/                # P/D 专项设计和阶段记录
 - [D Radix Cache](docs/pd/decode_radix_cache.md)：默认关闭、页级共享、后缀传输、完整命中及回收规则。
 - [主通道 Host 中转](docs/pd/host_dram_transfer.md)：显式模式、固定 pinned/GPU staging、双 DMA 屏障、TE/缓存隔离和混连校验。
 - [单机 NUMA 共享中转](docs/pd/shm_dram.md)：`shm_dram`、静态主/溢出配额、逐组安装、同机亲和路由与真机预检。
+- [单机共享历史 KV 缓存](docs/pd/shared_dram_cache.md)：`shared_shm`、全局页目录、本地优先与溢出、直接跨 NUMA H2D、读写屏障和双进程预检。
 - [P 页面哈希索引](docs/pd/prefix_index.md)：SHA-256 哈希域、真实 HBM 发布、后台增删同步、容量与 P/D 边界。
 - [CPU 回归记录](docs/pd/cpu_regression.md)：三个缓存功能提交的独立覆盖、基线失败修复、完整 CPU 集合命令与验证边界。
 - [多请求调度](docs/pd/batching.md)：异步控制面、批量传输、动态 Decode、显存与准入参数。

@@ -129,6 +129,96 @@ def shm_staging_plan(config, *, manifest=None):
     return plan
 
 
+def main_registered_budget(config):
+    budget = getattr(config, "pd_max_registered_bytes", None)
+    budget = 2 * config.pd_max_transfer_bytes if budget is None else budget
+    if getattr(config, "pd_dram_cache_mode", "private") == "shared_shm":
+        from pathlib import Path
+
+        from .shared_dram_pool import SharedDramManifest
+
+        manifest = SharedDramManifest.from_json(Path(config.pd_shared_dram_manifest).read_text())
+        budget -= manifest.registered_bytes
+    return budget
+
+
+def validate_shared_history(config, *, manifest=None, check_worker=True, check_segments=True):
+    from pathlib import Path
+
+    from .numa import host_id
+    from .shared_dram_pool import SharedDramManifest
+
+    if getattr(config, "pd_dram_cache_mode", "private") != "shared_shm":
+        return None
+    if not config.pd_dram.enabled or config.pd_dram.remote_enabled:
+        raise ValueError(
+            "shared_shm needs cache capacity and is separate from private Host TE pulling"
+        )
+    if manifest is None:
+        if not config.pd_shared_dram_manifest:
+            raise ValueError("shared_shm requires a launcher-owned shared history manifest")
+        manifest = SharedDramManifest.from_json(Path(config.pd_shared_dram_manifest).read_text())
+    budget = config.pd_max_registered_bytes
+    budget = 2 * config.pd_max_transfer_bytes if budget is None else budget
+    manifest.validate(budget=min(budget, config.pd_dram.capacity_bytes), local_host=host_id())
+    model = config.model_config
+    page_bytes = (
+        2
+        * model.num_layers
+        * model.num_kv_heads
+        * model.head_dim
+        * config.dtype.itemsize
+        * config.page_size
+    )
+    if (
+        manifest.page_bytes != page_bytes
+        or manifest.page_size != config.page_size
+        or manifest.cache_namespace != config.pd_cache_namespace
+    ):
+        raise ValueError("shared history model geometry/page size/namespace differs")
+    if check_worker and (
+        manifest.worker_numa.get(config.worker_id) != config.pd_numa_id
+        or config.pd_host_id != manifest.host_id
+    ):
+        raise ValueError("shared history Worker identity differs from launcher manifest")
+    if check_segments:
+        for node in manifest.node_slots:
+            path = Path("/dev/shm") / manifest.segment_name(node)[1:]
+            if not path.is_file() or path.stat().st_size != manifest.segment_bytes(node):
+                raise ValueError("shared history segment is missing or has an incorrect size")
+        if not Path(manifest.directory_socket).exists():
+            raise ValueError("shared history directory is unavailable")
+    remaining = budget - manifest.registered_bytes
+    if config.pd_transfer_backend == "mooncake" and remaining < config.pd_max_transfer_bytes:
+        raise ValueError("combined shared history and main TE registration budget is too small")
+    if (
+        config.pd_transfer_backend == "mooncake"
+        and config.pd_mooncake_transport_mode == "host_dram"
+    ):
+        # The launcher validates both roles before it creates pools/children.
+        # Main TE buffers may only consume the budget left after history SHM.
+        for prefill in (True, False):
+            host_staging_plan(
+                max_seq_len=config.max_seq_len,
+                bytes_per_token=page_bytes // config.page_size,
+                layers=model.num_layers,
+                layers_per_chunk=config.pd_layers_per_chunk,
+                staging_slots=config.pd_staging_slots,
+                max_transfer_bytes=config.pd_max_transfer_bytes,
+                max_registered_bytes=remaining,
+                rows=config.max_running_req,
+                prefill=prefill,
+            )
+    if config.pd_transfer_backend == "shm_dram":
+        from .shm_relay_pool import RelayManifest
+
+        relay = RelayManifest.from_json(Path(config.pd_shm_manifest).read_text())
+        if manifest.name == relay.name:
+            raise ValueError("shared history and P/D relay must use distinct segments")
+        relay.validate(budget=remaining, local_host=manifest.host_id)
+    return manifest
+
+
 def values(items):
     if items is None:
         return []

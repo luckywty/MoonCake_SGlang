@@ -90,6 +90,9 @@ class WorkerPool:
         self.prefix_index = PrefixIndex()
         self.tier_index = TierIndex()
         self.prefix_enabled = False
+        from .shared_dram_routing import SharedHistoryHints
+
+        self.shared_history = SharedHistoryHints()
         self.routing_config = None
         self.prefix_sync_interval = 0.2
         self.prefix_thread = None
@@ -326,6 +329,19 @@ class WorkerPool:
                 and health["shm_pool"]
             )
         warnings = self._dram_config_warnings(health) if valid else ()
+        info = health.get("shared_dram")
+        if info is not None:
+            from .numa import host_id
+
+            valid = bool(
+                valid
+                and isinstance(info, dict)
+                and info.get("mode") == "shared_shm"
+                and info.get("host_id") == host_id()
+                and info.get("pool")
+                and isinstance(info.get("manifest"), str)
+                and type(health.get("numa_id")) is int
+            )
         with self.lock:
             instance = health.get("instance_id")
             if instance != node.instance_id:
@@ -395,6 +411,11 @@ class WorkerPool:
                 (
                     (health.get("host_id"), health.get("shm_pool"))
                     if worker_transfer_mode(health) == "shm_dram"
+                    else None
+                ),
+                (
+                    (health["shared_dram"].get("host_id"), health["shared_dram"].get("pool"))
+                    if isinstance(health.get("shared_dram"), dict)
                     else None
                 ),
             )
@@ -477,6 +498,7 @@ class WorkerPool:
             self.prefix_index.forget(node.worker_id)
             self.tier_index.forget(node.worker_id)
         self.closed = True
+        self.shared_history.close()
 
 
 class RandomRouter:

@@ -85,6 +85,7 @@ class RequestContext:
     pull_future: object = None
     pull_job: object = None
     drain_complete: bool = True
+    shared_pin_future: object = None
     enqueued_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -204,6 +205,7 @@ class WorkerService(DramServiceMixin):
             "numa_id": self.numa_id,
             "host_id": self.host_id,
             "shm_pool": getattr(getattr(self.backend, "manifest", None), "name", None),
+            "shared_dram": self._shared_identity(),
             "decode_prefix_reuse": True,
             "decode_radix_cache": self.decode_radix_cache,
             "max_sequence_tokens": s.engine.max_seq_len,
@@ -234,6 +236,7 @@ class WorkerService(DramServiceMixin):
             "decode_prefix_reuse": True,
             "prefix_index_version": PREFIX_INDEX_VERSION if self.prefix_publisher else None,
             "dram_cache_version": 1 if self.dram_pool is not None else None,
+            "shared_dram": self._shared_identity(),
             **(
                 {
                     "host_id": self.host_id,
@@ -923,6 +926,8 @@ class WorkerService(DramServiceMixin):
                                 "cannot publish installed decode KV safely"
                             ) from exc
                     self.stats["received_kv_tokens"] += ctx.transfer_tokens
+                    if getattr(self, "shared_history", False):
+                        self._stage_dram_live(ctx)
                     self.s.decode_manager.filter_reqs([ctx.req])
                     ctx.phase = "decode"
                     ctx.session.emit(

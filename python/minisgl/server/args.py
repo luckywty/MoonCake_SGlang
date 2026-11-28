@@ -51,6 +51,9 @@ class ServerArgs(SchedulerConfig):
     pd_shm_overflow_slots: int = 1
     pd_shm_local_wait_ms: float = 1.0
     pd_cross_numa_penalty: float = 4.0
+    pd_dram_cache_mode: str = "private"
+    pd_shared_dram_manifest: str | None = None
+    pd_shared_dram_numa_bytes: str | None = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -101,6 +104,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
     add_dram_args(parser)
+    parser.add_argument(
+        "--pd-dram-cache-mode", choices=("private", "shared_shm"), default="private"
+    )
+    parser.add_argument("--pd-shared-dram-manifest")
+    parser.add_argument(
+        "--pd-shared-dram-numa-bytes", help="JSON node-to-byte budgets within total cache bytes"
+    )
     parser.add_argument(
         "--pd-mooncake-transport-mode",
         choices=MOONCAKE_TRANSPORT_MODES,
@@ -335,6 +345,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         )
     try:
         kwargs["pd_dram"] = pop_dram_config(kwargs)
+        if kwargs["pd_dram_cache_mode"] == "shared_shm" and (
+            not kwargs["pd_dram"].enabled or kwargs["pd_dram"].remote_enabled
+        ):
+            raise ValueError(
+                "shared_shm requires positive host-wide cache bytes and excludes private Host TE pulling"
+            )
     except ValueError as exc:
         parser.error(str(exc))
     if not 1 <= len(kwargs["pd_cache_namespace"].encode("utf-8")) <= 1024:
@@ -367,7 +383,10 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         if kwargs["pd_max_transfer_bytes"] <= 0:
             parser.error("--pd-max-transfer-bytes must be positive")
         if kwargs["pd_max_registered_bytes"] is not None and kwargs["pd_max_registered_bytes"] < (
-            1 if kwargs["pd_transfer_backend"] == "shm_dram" else kwargs["pd_max_transfer_bytes"]
+            1
+            if kwargs["pd_transfer_backend"] == "shm_dram"
+            or kwargs["pd_dram_cache_mode"] == "shared_shm"
+            else kwargs["pd_max_transfer_bytes"]
         ):
             parser.error("--pd-max-registered-bytes must cover --pd-max-transfer-bytes")
         if (

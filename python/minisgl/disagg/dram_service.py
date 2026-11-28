@@ -13,16 +13,20 @@ from .dram_pool import DramPagePool
 from .dram_protocol import DramConfig, RemotePullPlan
 from .prefix_events import PrefixPublisher
 from .prefix_hash import PrefixHashSpec
+from .shared_dram_service import SharedDramServiceMixin
 from .tier_index import TierPublisher
 from .transfer import TransferBackendUnavailable
 
 
-class DramServiceMixin:
+class DramServiceMixin(SharedDramServiceMixin):
     def _init_dram(self, config):
         self.dram_config = DramConfig(**config.get("dram", {}))
         self.dram_pool = self.dram_controller = self.dram_transfer = self.tier_publisher = None
         self.dram_error = None
         self.dram_stats = {"pull_fallbacks": 0, "remote_hit_tokens": 0, "local_hit_tokens": 0}
+        if config.get("dram_cache_mode", "private") == "shared_shm":
+            self._init_shared_history(config)
+            return
         if not self.dram_config.enabled:
             return
         self.dram_config.validate_layout(self.s.layout.bytes_per_token, self.s.layout.page_size)
@@ -85,6 +89,8 @@ class DramServiceMixin:
         )
 
     def _begin_dram_request(self, ctx, message):
+        if getattr(self, "shared_history", False):
+            return self._shared_begin(ctx)
         if self.dram_controller is not None and message.get("cache_transaction") is True:
             if self.dram_pool.begin(ctx.request.transfer_id):
                 ctx.dram = self.dram_controller.begin(
@@ -112,6 +118,12 @@ class DramServiceMixin:
         return False
 
     def _dram_rpc(self, message):
+        if getattr(self, "shared_history", False):
+            return (
+                {"status": "cache_finalized"}
+                if message.get("op") in ("cache_commit", "cache_abort")
+                else {"status": "cache_miss"}
+            )
         if self.dram_pool is None:
             return {"status": "cache_miss"}
         op = message.get("op")
@@ -143,6 +155,11 @@ class DramServiceMixin:
                 ctx.dram.terminal = True
 
     def _dram_decode_restore(self, ctx):
+        if getattr(self, "shared_history", False):
+            if self.decode_radix_cache and ctx.dram is not None and not ctx.dram.terminal:
+                ctx.phase = "reserving_shared"
+                return True
+            return False
         if self.dram_controller is None or not self.decode_radix_cache:
             return False
         if not self.dram_pool.pages:
@@ -314,6 +331,9 @@ class DramServiceMixin:
         )
 
     def _dram_progress(self):
+        if getattr(self, "shared_history", False):
+            self._shared_progress()
+            return
         if self.dram_controller is None:
             return
         self.dram_controller.progress()
@@ -447,6 +467,8 @@ class DramServiceMixin:
             self._dram_enqueue_prefill(ctx)
 
     def _dram_can_free(self, ctx):
+        if getattr(self, "shared_history", False):
+            return self._shared_can_free(ctx)
         if self.dram_controller is None:
             return True
         if ctx.pull_future is not None:
