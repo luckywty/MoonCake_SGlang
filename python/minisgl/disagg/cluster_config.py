@@ -66,6 +66,69 @@ def host_staging_plan(
     return HostStagingPlan(tokens, payload, group, registered, group + tokens * 8)
 
 
+def shm_staging_plan(config, *, manifest=None):
+    """Use the main host staging geometry; pinning budgets include BOTH segments.
+
+    Every Worker registers the whole host pool, so the final check covers all P
+    partitions, headers and OS-page padding, rather than just one P's ring.
+    """
+    maximum = config.pd_max_transfer_bytes
+    budget = (
+        2 * maximum if config.pd_max_registered_bytes is None else config.pd_max_registered_bytes
+    )
+    model = config.model_config
+    per_token = 2 * model.num_layers * model.num_kv_heads * model.head_dim * config.dtype.itemsize
+    plan = host_staging_plan(
+        max_seq_len=config.max_seq_len,
+        bytes_per_token=per_token,
+        layers=model.num_layers,
+        layers_per_chunk=config.pd_layers_per_chunk,
+        staging_slots=config.pd_staging_slots
+        + (
+            0
+            if manifest is not None and len(manifest.node_slots) == 1
+            else config.pd_shm_overflow_slots
+        ),
+        max_transfer_bytes=maximum,
+        max_registered_bytes=budget,
+        rows=config.max_running_req,
+        prefill=True,
+    )
+    if manifest is not None:
+        from .numa import host_id
+
+        manifest.validate(budget=budget, local_host=host_id())
+        if (
+            manifest.group_bytes,
+            manifest.max_tokens,
+            manifest.bytes_per_token,
+            manifest.layers,
+            manifest.layers_per_chunk,
+        ) != (
+            plan.group_bytes,
+            plan.max_tokens,
+            per_token,
+            model.num_layers,
+            config.pd_layers_per_chunk,
+        ):
+            raise ValueError("Worker model/transfer geometry differs from shared relay manifest")
+        if config.pd_host_id != manifest.host_id or config.pd_numa_id not in manifest.node_slots:
+            raise ValueError("Worker host/NUMA identity differs from shared relay manifest")
+        if config.worker_role.value == "prefill":
+            try:
+                partition = manifest.partition(config.worker_id)
+            except StopIteration as exc:
+                raise ValueError("P Worker has no exclusive shared relay partition") from exc
+            if (
+                partition.numa_id != config.pd_numa_id
+                or len(partition.local_slots) != config.pd_staging_slots
+                or len(partition.overflow_slots)
+                != (config.pd_shm_overflow_slots if len(manifest.node_slots) == 2 else 0)
+            ):
+                raise ValueError("P Worker shared relay partition/slot configuration differs")
+    return plan
+
+
 def values(items):
     if items is None:
         return []
@@ -190,13 +253,15 @@ class WorkerSpec:
     numa_node: int | None = None
     rdma_device: str = ""
     dram_port: int | None = None
+    numa_id: int = 0
+    host_id: str = ""
 
     @property
     def endpoint(self):
         return endpoint_name(self.host, self.control_port)
 
 
-def local_plan(args, visible_gpus):
+def local_plan(args, visible_gpus, *, topology=None):
     n = 1 if args.num_prefill_workers is None else args.num_prefill_workers
     m = 1 if args.num_decode_workers is None else args.num_decode_workers
     if any(type(count) is not int or count < 1 for count in (n, m)):
@@ -211,7 +276,21 @@ def local_plan(args, visible_gpus):
     explicit = pg + dg
     if len(set(explicit)) != len(explicit) or any(gpu not in visible_gpus for gpu in explicit):
         raise ValueError("GPU mappings must be distinct members of CUDA_VISIBLE_DEVICES")
-    remaining = [gpu for gpu in visible_gpus if gpu not in explicit]
+    from .numa import gpu_numa_nodes, host_id, mixed_gpu_layout
+
+    override = getattr(args, "gpu_numa_map", None)
+    if topology is None:
+        import os
+
+        override = override or os.environ.get("MINISGL_GPU_NUMA_MAP")
+        topology = (
+            gpu_numa_nodes(visible_gpus, override=override)
+            if override is not None
+            else dict.fromkeys(visible_gpus, 0)
+        )
+    if not explicit:
+        pg, dg = mixed_gpu_layout(visible_gpus, topology, n, m)
+    remaining = [gpu for gpu in visible_gpus if gpu not in pg + dg]
     if not pg:
         pg, remaining = remaining[:n], remaining[n:]
     if not dg:
@@ -242,7 +321,18 @@ def local_plan(args, visible_gpus):
                 raise ValueError("invalid HCA mapping")
             specs.append(
                 WorkerSpec(
-                    f"{role[0]}-{i}", role, gpu, host, control, te, te + 1, node, hca, dram_port
+                    f"{role[0]}-{i}",
+                    role,
+                    gpu,
+                    host,
+                    control,
+                    te,
+                    te + 1,
+                    node,
+                    hca,
+                    dram_port,
+                    node if node is not None else topology[gpu],
+                    host_id(),
                 )
             )
     validate_cluster_ports(

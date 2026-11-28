@@ -11,6 +11,7 @@ DTYPE_BYTES = {"float16": 2, "bfloat16": 2, "float32": 4}
 MAX_INT32 = 2**31 - 1
 HANDOFF_VERSION = 2
 MOONCAKE_TRANSPORT_MODES = ("gpu_direct", "host_dram")
+LAYERED_TRANSFER_MODES = (*MOONCAKE_TRANSPORT_MODES, "shm_dram")
 
 
 def worker_transfer_mode(info):
@@ -133,7 +134,7 @@ class KVTransferMetadata:
     transfer_mode: str = "gpu_direct"
 
     def __post_init__(self) -> None:
-        if self.transfer_mode not in MOONCAKE_TRANSPORT_MODES:
+        if self.transfer_mode not in LAYERED_TRANSFER_MODES:
             raise ValueError("unsupported KV transfer mode")
         if self.version == 1 and self.transfer_mode != "gpu_direct":
             raise ValueError("v1 cannot describe host DRAM transport")

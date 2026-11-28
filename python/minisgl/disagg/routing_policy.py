@@ -148,8 +148,11 @@ class RoutingConfig:
     dram_rdma_gbps: float = 10.0
     dram_prefill_ms_per_token: float = 0.01
     dram_max_pull_bytes: int = 64 * 1024**2
+    pd_cross_numa_penalty: float = 4.0
 
     def __post_init__(self):
+        if not math.isfinite(self.pd_cross_numa_penalty) or self.pd_cross_numa_penalty < 0:
+            raise ValueError("cross NUMA routing penalty must be finite and nonnegative")
         if (
             type(self.min_remote_pull_tokens) is not int
             or self.min_remote_pull_tokens < 1
@@ -336,6 +339,15 @@ class PolicyRouter:
             loads = self._loads()
             nodes = self.candidates("prefill", request, bucket, exclude, loads=loads)
             policy = bucket.prefill.policy or self.config.policy
+            if nodes and any(n.health.get("transfer_mode") == "shm_dram" for n in nodes):
+                decodes = self.candidates("decode", request, bucket, loads=loads)
+                nodes = [p for p in nodes if any(self._shm_pair(p, d) for d in decodes)]
+                if not nodes:
+                    raise NoHealthyWorker("no same-host shared-pool P/D pair is admissible")
+                if len({n.health.get("numa_id", 0) for n in nodes + decodes}) > 1:
+                    return self._select_shm_prefill(
+                        nodes, policy, request, bucket, loads, prefix_hits
+                    )
             if policy != "cache_aware":
                 return self._pick(nodes, policy, "prefill", bucket, loads)
             detailed = prefix_hits or {}
@@ -398,11 +410,79 @@ class PolicyRouter:
                         return other
             return best
 
-    def select_decode(self, exclude=(), *, request, bucket):
+    @staticmethod
+    def _shm_pair(prefill, decode):
+        p, d = prefill.health, decode.health
+        return (
+            p.get("transfer_mode") == d.get("transfer_mode") == "shm_dram"
+            and p.get("host_id")
+            and p.get("host_id") == d.get("host_id")
+            and p.get("shm_pool")
+            and p.get("shm_pool") == d.get("shm_pool")
+        )
+
+    def _decode_cost(self, node, prefill, loads):
+        load = loads[node.worker_id]
+        pressure = (
+            load.get("waiting_requests", 0)
+            + load.get("running_requests", 0)
+            + self.inflight.get(node.worker_id, 0)
+        )
+        if load.get("kv_capacity", 0):
+            pressure += load.get("kv_tokens", 0) / load["kv_capacity"]
+        cross = prefill.health.get("numa_id", 0) != node.health.get("numa_id", 0)
+        return pressure + (self.config.pd_cross_numa_penalty if cross else 0)
+
+    def _select_shm_prefill(self, nodes, policy, request, bucket, loads, prefix_hits):
+        decodes = self.candidates("decode", request, bucket, loads=loads)
+        pairs = {p.worker_id: [d for d in decodes if self._shm_pair(p, d)] for p in nodes}
+        nodes = [p for p in nodes if pairs[p.worker_id]]
+        if not nodes:
+            raise NoHealthyWorker("no same-host shared-pool P/D pair is admissible")
+        if policy in ("random", "round_robin"):
+            return self._pick(nodes, policy, "prefill", bucket, loads)
+        detailed = prefix_hits or {}
+
+        def score(node):
+            value = detailed.get(node.worker_id, 0)
+            hit = getattr(value, "total", value) if policy == "cache_aware" else 0
+            if (
+                hit < self.config.cache_min_tokens
+                or hit / len(request.prompt_ids) < self.config.cache_min_ratio
+            ):
+                hit = 0
+            page = node.health.get("layout", {}).get("page_size", 1)
+            hit = min(hit, (len(request.prompt_ids) - 1) // page * page)
+            load = loads[node.worker_id]
+            queue_ms = load.get(
+                "estimated_prefill_queue_ms",
+                load.get("pending_prefill_tokens", 0) * self.config.dram_prefill_ms_per_token,
+            )
+            cost = queue_ms + self.inflight.get(node.worker_id, 0)
+            cost += (len(request.prompt_ids) - hit) * self.config.dram_prefill_ms_per_token
+            cost += getattr(value, "restore_cost_ms", 0) if hit else 0
+            return cost + min(self._decode_cost(d, node, loads) for d in pairs[node.worker_id])
+
+        # The cost includes the best admissible partner: cache savings may outweigh
+        # a cross-socket hop, while a busy local D does not trap a request.
+        return min(nodes, key=lambda n: (score(n), n.worker_id))
+
+    def select_decode(self, exclude=(), *, request, bucket, prefill=None):
         with self.lock:
             loads = self._loads()
+            nodes = self.candidates("decode", request, bucket, exclude, loads=loads)
+            if prefill is not None and prefill.health.get("transfer_mode") == "shm_dram":
+                nodes = [n for n in nodes if self._shm_pair(prefill, n)]
+                if not nodes:
+                    raise NoHealthyWorker("no same-host shared-pool Decode Worker")
+                if any(
+                    n.health.get("numa_id", 0) != prefill.health.get("numa_id", 0) for n in nodes
+                ):
+                    return min(
+                        nodes, key=lambda n: (self._decode_cost(n, prefill, loads), n.worker_id)
+                    )
             return self._pick(
-                self.candidates("decode", request, bucket, exclude, loads=loads),
+                nodes,
                 bucket.decode.policy or self.config.decode_policy,
                 "decode",
                 bucket,
@@ -454,6 +534,12 @@ class PolicyRouter:
 
 
 def add_policy_args(parser):
+    parser.add_argument(
+        "--pd-cross-numa-penalty",
+        type=float,
+        default=4.0,
+        help="Additional shared-relay cross-socket routing cost (ms equivalent)",
+    )
     parser.add_argument("--routing-policy", "--policy", choices=POLICIES, default="power_of_two")
     parser.add_argument(
         "--decode-policy",
@@ -513,11 +599,13 @@ def policy_config(args):
         dram_rdma_gbps=args.dram_rdma_gbps,
         dram_prefill_ms_per_token=args.dram_prefill_ms_per_token,
         dram_max_pull_bytes=args.dram_max_pull_bytes,
+        pd_cross_numa_penalty=args.pd_cross_numa_penalty,
     )
 
 
 def policy_cli_args(args):
     names = (
+        "pd_cross_numa_penalty",
         "routing_policy",
         "decode_policy",
         "bucket_config",

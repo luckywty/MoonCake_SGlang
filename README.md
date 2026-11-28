@@ -15,7 +15,7 @@ Python 包名和命令入口仍为 `minisgl`。
 使用方法与一致性边界见[页面哈希索引](docs/pd/prefix_index.md)。
 启用 DRAM 后进一步使用 v2 HBM/DRAM 镜像，设计、配置与验收边界见 [DRAM KV 缓存](docs/pd/dram_cache.md)。
 
-> **当前版本（2026-11-27）**：支持显式 `--pd-mooncake-transport-mode host_dram` 的主通道逐层中转；默认 `gpu_direct`，不会因 GDR 不可用而自动降级。
+> **当前版本（2026-11-28）**：新增单机 `--pd-transfer-backend shm_dram`，通过 NUMA 专属共享 Pinned DRAM 槽位逐组中转，详见 [NUMA 共享中转说明](docs/pd/shm_dram.md)。Mooncake 默认仍为 `gpu_direct`，`host_dram` 需显式开启，不会自动降级。
 > 本地 DRAM 缓存和 D→P 反向提升继续独立配置，支持 LRU/LFU、异步 D2H/H2D、短租约和失败重算；TE 与中转池完全分开。
 > D Radix 仍默认关闭；P→D 后缀始终取决于 D reserve 的真实前缀，单端点及 Routed 客户端继续先向 D 预留资源。
 > 已新增并运行 CPU attention 续算、受控 RDMA、拷贝 reader、缓存提交和索引一致性测试；CUDA/RDMA 实机验证仍待完成。
@@ -581,6 +581,7 @@ docs/pd/                # P/D 专项设计和阶段记录
 - [逐层 KV 传输](docs/pd/layered_transfer.md)：缓冲池、层组流水线、所有权、取消与验收入口。
 - [D Radix Cache](docs/pd/decode_radix_cache.md)：默认关闭、页级共享、后缀传输、完整命中及回收规则。
 - [主通道 Host 中转](docs/pd/host_dram_transfer.md)：显式模式、固定 pinned/GPU staging、双 DMA 屏障、TE/缓存隔离和混连校验。
+- [单机 NUMA 共享中转](docs/pd/shm_dram.md)：`shm_dram`、静态主/溢出配额、逐组安装、同机亲和路由与真机预检。
 - [P 页面哈希索引](docs/pd/prefix_index.md)：SHA-256 哈希域、真实 HBM 发布、后台增删同步、容量与 P/D 边界。
 - [CPU 回归记录](docs/pd/cpu_regression.md)：三个缓存功能提交的独立覆盖、基线失败修复、完整 CPU 集合命令与验证边界。
 - [多请求调度](docs/pd/batching.md)：异步控制面、批量传输、动态 Decode、显存与准入参数。

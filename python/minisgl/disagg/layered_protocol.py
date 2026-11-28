@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from .control import endpoint_address
 from .protocol import (
-    MOONCAKE_TRANSPORT_MODES,
+    LAYERED_TRANSFER_MODES,
     KVLayout,
     _array,
     _int,
@@ -38,7 +38,7 @@ class LayeredReceiveTicket:
     transfer_mode: str = "gpu_direct"
 
     def __post_init__(self) -> None:
-        if self.transfer_mode not in MOONCAKE_TRANSPORT_MODES:
+        if self.transfer_mode not in LAYERED_TRANSFER_MODES:
             raise ValueError("unsupported layer transfer mode")
         if self.version == 2 and self.transfer_mode != "gpu_direct":
             raise ValueError("v2 cannot describe host DRAM transport")

@@ -45,6 +45,12 @@ class ServerArgs(SchedulerConfig):
     pd_prefix_max_pages: int = 65536
     pd_prefix_event_limit: int = 32768
     pd_dram: DramConfig = field(default_factory=DramConfig)
+    pd_shm_manifest: str | None = None
+    pd_numa_id: int = 0
+    pd_host_id: str = ""
+    pd_shm_overflow_slots: int = 1
+    pd_shm_local_wait_ms: float = 1.0
+    pd_cross_numa_penalty: float = 4.0
 
     @property
     def share_tokenizer(self) -> bool:
@@ -116,7 +122,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
     parser.add_argument("--pd-data-port", type=int, default=None)
     parser.add_argument("--pd-advertise-host", default=None)
-    parser.add_argument("--pd-transfer-backend", choices=("tcp", "mooncake"), default="tcp")
+    parser.add_argument(
+        "--pd-transfer-backend", choices=("tcp", "mooncake", "shm_dram"), default="tcp"
+    )
+    parser.add_argument("--pd-shm-manifest", default=os.environ.get("MINISGL_SHM_MANIFEST"))
+    parser.add_argument("--pd-numa-id", type=int, default=0)
+    parser.add_argument("--pd-host-id", default="")
+    parser.add_argument("--pd-shm-overflow-slots", type=int, default=1)
+    parser.add_argument("--pd-shm-local-wait-ms", type=float, default=1.0)
+    parser.add_argument("--pd-cross-numa-penalty", type=float, default=4.0)
     parser.add_argument("--pd-mooncake-host", default=None)
     parser.add_argument("--worker-id", default="")
     parser.add_argument(
@@ -352,11 +366,19 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             parser.error("invalid split worker timeout or port")
         if kwargs["pd_max_transfer_bytes"] <= 0:
             parser.error("--pd-max-transfer-bytes must be positive")
-        if (
-            kwargs["pd_max_registered_bytes"] is not None
-            and kwargs["pd_max_registered_bytes"] < kwargs["pd_max_transfer_bytes"]
+        if kwargs["pd_max_registered_bytes"] is not None and kwargs["pd_max_registered_bytes"] < (
+            1 if kwargs["pd_transfer_backend"] == "shm_dram" else kwargs["pd_max_transfer_bytes"]
         ):
             parser.error("--pd-max-registered-bytes must cover --pd-max-transfer-bytes")
+        if (
+            kwargs["pd_numa_id"] < 0
+            or kwargs["pd_shm_overflow_slots"] < 0
+            or any(
+                not math.isfinite(kwargs[key]) or kwargs[key] < 0
+                for key in ("pd_shm_local_wait_ms", "pd_cross_numa_penalty")
+            )
+        ):
+            parser.error("invalid shared relay NUMA, overflow, wait or routing penalty")
         if kwargs["pd_max_pending_transfers"] <= 0:
             parser.error("--pd-max-pending-transfers must be positive")
         if kwargs["pd_layers_per_chunk"] <= 0:

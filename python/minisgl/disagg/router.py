@@ -17,7 +17,7 @@ from .control import endpoint_address
 from .dram_protocol import minimum_pull_bytes, remote_pull_limits
 from .multiplex import MUX_VERSION, WorkerConnection
 from .prefix_index import PrefixIndex
-from .protocol import HANDOFF_VERSION, MOONCAKE_TRANSPORT_MODES, KVLayout, worker_transfer_mode
+from .protocol import HANDOFF_VERSION, LAYERED_TRANSFER_MODES, KVLayout, worker_transfer_mode
 from .tier_index import TierIndex
 
 logger = logging.getLogger(__name__)
@@ -308,13 +308,23 @@ class WorkerPool:
             and health.get("decode_prefix_reuse") is True
             and type(health.get("layered_transfer")) is bool
             and worker_transfer_mode(health)
-            in (MOONCAKE_TRANSPORT_MODES if health.get("layered_transfer") else ("tcp",))
+            in (LAYERED_TRANSFER_MODES if health.get("layered_transfer") else ("tcp",))
             and isinstance(health.get("layout"), dict)
             and transfer.get("status", "ready") in ("ready", "degraded")
             and native.get("state", "ready") in ("ready", "degraded")
             and not native.get("reason")
             and native.get("quarantined_bytes", 0) <= self.max_quarantined_bytes
         )
+        if worker_transfer_mode(health) == "shm_dram":
+            valid = bool(
+                valid
+                and type(health.get("numa_id")) is int
+                and health["numa_id"] >= 0
+                and isinstance(health.get("host_id"), str)
+                and health["host_id"]
+                and isinstance(health.get("shm_pool"), str)
+                and health["shm_pool"]
+            )
         warnings = self._dram_config_warnings(health) if valid else ()
         with self.lock:
             instance = health.get("instance_id")
@@ -382,6 +392,11 @@ class WorkerPool:
                 worker_transfer_mode(health),
                 health.get("handoff_version"),
                 group if health.get("layered_transfer") else None,
+                (
+                    (health.get("host_id"), health.get("shm_pool"))
+                    if worker_transfer_mode(health) == "shm_dram"
+                    else None
+                ),
             )
 
         with self.lock:

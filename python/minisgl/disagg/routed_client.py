@@ -154,7 +154,9 @@ class RoutedPDClient(PDClient):
         layered = prefill.health["layered_transfer"]
         for _ in range(len(self.pool.decode_pool)):
             try:
-                node = self.router.acquire_decode(excluded, request=request, bucket=bucket)
+                node = self.router.acquire_decode(
+                    excluded, request=request, bucket=bucket, prefill=prefill
+                )
             except NoHealthyWorker:
                 if last_error is not None:
                     raise last_error
@@ -167,6 +169,10 @@ class RoutedPDClient(PDClient):
                     node.health
                 ) != worker_transfer_mode(prefill.health):
                     raise RemoteUnavailableError("P/D transfer modes differ")
+                if worker_transfer_mode(prefill.health) == "shm_dram" and not self.router._shm_pair(
+                    prefill, node
+                ):
+                    raise RemoteUnavailableError("shm_dram requires the same host and shared pool")
                 channel = self.pool.connect(node).open(request.transfer_id, cancel)
                 message = {"op": "reserve", "request": request.to_object()}
                 if node.health.get("dram_cache", {}).get("enabled", False):

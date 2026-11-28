@@ -62,6 +62,30 @@ def validate_split_config(config) -> None:
         mode == "host_dram" and getattr(config, "pd_transfer_backend", "tcp") != "mooncake"
     ):
         raise ValueError("host_dram requires explicit Mooncake transport configuration")
+    if getattr(config, "pd_transfer_backend", "tcp") == "shm_dram":
+        import math
+
+        from .cluster_config import shm_staging_plan
+        from .shm_relay_pool import RelayManifest
+
+        if (
+            not getattr(config, "pd_shm_manifest", None)
+            or not math.isfinite(config.pd_shm_local_wait_ms)
+            or config.pd_shm_local_wait_ms < 0
+            or not math.isfinite(config.pd_cross_numa_penalty)
+            or config.pd_cross_numa_penalty < 0
+            or type(config.pd_shm_overflow_slots) is not int
+            or config.pd_shm_overflow_slots < 0
+            or type(config.pd_staging_slots) is not int
+            or not 2 <= config.pd_staging_slots <= 4
+            or type(config.pd_layers_per_chunk) is not int
+            or config.pd_layers_per_chunk < 1
+        ):
+            raise ValueError(
+                "shm_dram requires a launcher manifest and valid NUMA/overflow options"
+            )
+        manifest = RelayManifest.from_json(Path(config.pd_shm_manifest).read_text())
+        shm_staging_plan(config, manifest=manifest)  # Before weights/CUDA/SHM registration.
 
 
 class PDWorkerScheduler(Scheduler):
@@ -88,15 +112,28 @@ class PDWorkerScheduler(Scheduler):
             config = replace(config, cache_type="radix" if self.decode_radix_cache else "naive")
         elif self.decode_radix_cache:
             raise ValueError("decode Radix caching requires a decode Worker")
-        self._gpu_transfer = getattr(config, "pd_transfer_backend", "tcp") == "mooncake"
-        self.transfer_mode = getattr(config, "pd_mooncake_transport_mode", "gpu_direct")
+        shm = getattr(config, "pd_transfer_backend", "tcp") == "shm_dram"
+        self._gpu_transfer = getattr(config, "pd_transfer_backend", "tcp") in (
+            "mooncake",
+            "shm_dram",
+        )
+        self.transfer_mode = (
+            "shm_dram" if shm else getattr(config, "pd_mooncake_transport_mode", "gpu_direct")
+        )
         if self._gpu_transfer:
             maximum = getattr(config, "pd_max_transfer_bytes", 1024**3)
             reserved = getattr(config, "pd_max_registered_bytes", None)
             reserved = 2 * maximum if reserved is None else reserved
-            if type(reserved) is not int or reserved < maximum:
+            if type(reserved) is not int or reserved < (1 if shm else maximum):
                 raise ValueError("GPU transfer reserve must cover the maximum KV payload")
-            if self.transfer_mode == "host_dram":
+            if shm:
+                from .cluster_config import shm_staging_plan
+                from .shm_relay_pool import RelayManifest
+
+                manifest = RelayManifest.from_json(Path(config.pd_shm_manifest).read_text())
+                plan = shm_staging_plan(config, manifest=manifest)
+                config = replace(config, pd_transfer_reserve_bytes=plan.gpu_bytes)
+            elif self.transfer_mode == "host_dram":
                 from .cluster_config import host_staging_plan
 
                 model = config.model_config
@@ -153,6 +190,8 @@ class PDWorkerScheduler(Scheduler):
         self._owned_req = None
         self._allocated_len = 0
         self.pd_service_config = {
+            "numa_id": getattr(config, "pd_numa_id", 0),
+            "host_id": getattr(config, "pd_host_id", ""),
             "dram": asdict(dram),
             "cache_namespace": getattr(config, "pd_cache_namespace", "default"),
             "prefix_max_pages": getattr(config, "pd_prefix_max_pages", 65536),
@@ -625,6 +664,11 @@ def launch_split_worker(args) -> None:
     backend = None
     scheduler = None
     try:
+        if args.pd_transfer_backend == "shm_dram":
+            from .numa import bind_worker
+
+            validate_split_config(args)
+            bind_worker(args.pd_numa_id)
         with socket.create_server((args.server_host, args.server_port)) as listener:
             backend = create_transfer_backend(args)
             with torch.inference_mode():

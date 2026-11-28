@@ -134,7 +134,9 @@ class MHAKVCache(BaseKVCachePool):
             self._kv_buffer[:, layer].flatten(1, 2).index_copy_(1, indices, typed[layer])
 
     @torch.inference_mode()
-    def import_host_layered_tensor(self, packed, indices, *, workspace, layers_per_chunk):
+    def import_host_layered_tensor(
+        self, packed, indices, *, workspace, layers_per_chunk, layer_start=0, layer_end=None
+    ):
         """Pinned receive region -> fixed GPU group buffer -> private KV, on install_stream.
 
         Indices are scheduler-owned and copied into a startup int64 workspace.
@@ -154,15 +156,19 @@ class MHAKVCache(BaseKVCachePool):
             raise ValueError("invalid host layered staging or scheduler indices")
         heads, dim = self._storage_shape[1:]
         layer_bytes = 2 * len(indices) * heads * dim * self.dtype.itemsize
-        if packed.numel() != self.num_layers * layer_bytes:
+        layer_end = self.num_layers if layer_end is None else layer_end
+        if not 0 <= layer_start < layer_end <= self.num_layers or layers_per_chunk < 1:
+            raise ValueError("invalid host layered receive range")
+        if packed.numel() != (layer_end - layer_start) * layer_bytes:
             raise ValueError("incorrect host layered receive length")
-        for start in range(0, self.num_layers, layers_per_chunk):
-            end = min(start + layers_per_chunk, self.num_layers)
+        for start in range(layer_start, layer_end, layers_per_chunk):
+            end = min(start + layers_per_chunk, layer_end)
             nbytes = (end - start) * layer_bytes
             if workspace.numel() < nbytes:
                 raise ValueError("startup scatter workspace is too small")
             group = workspace[:nbytes]
-            group.copy_(packed[start * layer_bytes : end * layer_bytes], non_blocking=True)
+            offset = (start - layer_start) * layer_bytes
+            group.copy_(packed[offset : offset + nbytes], non_blocking=True)
             typed = group.view(self.dtype).view(end - start, 2, len(indices), heads, dim)
             for offset, layer in enumerate(range(start, end)):
                 self._kv_buffer[:, layer].flatten(1, 2).index_copy_(1, indices, typed[offset])

@@ -111,6 +111,8 @@ class WorkerService(DramServiceMixin):
         self.transfer_mode = getattr(backend, "transfer_mode", "gpu_direct")
         self.is_prefill = scheduler.role is WorkerRole.PREFILL
         self.instance_id = str(uuid4())
+        self.numa_id = getattr(backend, "numa_id", config.get("numa_id", 0))
+        self.host_id = getattr(backend, "host_id", config.get("host_id", ""))
         self.cache_namespace = config.get("cache_namespace", "default")
         self.prefix_publisher = None
         cache = scheduler.cache_manager.prefix_cache
@@ -138,7 +140,7 @@ class WorkerService(DramServiceMixin):
         self.install_stream = (
             (
                 backend.install_stream
-                if self.transfer_mode == "host_dram"
+                if self.transfer_mode in ("host_dram", "shm_dram")
                 else torch.cuda.Stream(device=scheduler.device)
             )
             if scheduler.device.type == "cuda" and not self.is_prefill
@@ -199,6 +201,9 @@ class WorkerService(DramServiceMixin):
             "routing_version": 1,
             "handoff_version": HANDOFF_VERSION,
             "transfer_mode": self.transfer_mode if self.layered else "tcp",
+            "numa_id": self.numa_id,
+            "host_id": self.host_id,
+            "shm_pool": getattr(getattr(self.backend, "manifest", None), "name", None),
             "decode_prefix_reuse": True,
             "decode_radix_cache": self.decode_radix_cache,
             "max_sequence_tokens": s.engine.max_seq_len,
@@ -229,6 +234,15 @@ class WorkerService(DramServiceMixin):
             "decode_prefix_reuse": True,
             "prefix_index_version": PREFIX_INDEX_VERSION if self.prefix_publisher else None,
             "dram_cache_version": 1 if self.dram_pool is not None else None,
+            **(
+                {
+                    "host_id": self.host_id,
+                    "numa_id": self.numa_id,
+                    "shm_pool": self.backend.manifest.name,
+                }
+                if self.transfer_mode == "shm_dram"
+                else {}
+            ),
         }
 
     def health(self):
@@ -603,6 +617,16 @@ class WorkerService(DramServiceMixin):
             self.s.decode_manager.remove_req(ctx.req)
         if not self._dram_can_free(ctx):
             return
+        if (
+            not self.is_prefill
+            and ctx.ticket is not None
+            and getattr(self.backend, "incremental_install", False)
+        ):
+            slots = self.s.engine.page_table[
+                ctx.req.table_idx, ctx.decode_prefix_len : len(ctx.request.prompt_ids)
+            ]
+            if not self.backend.progress_receive(ctx.ticket, slots, cancel=True):
+                return  # A partial H2D still owns private GPU pages and its SHM reader.
         if ctx.job is not None:
             ctx.job.seal(cancel=True)
             if not ctx.job.sources_done.is_set():
@@ -854,6 +878,15 @@ class WorkerService(DramServiceMixin):
                 if ctx.session.cancelled.is_set():
                     self._cancel(ctx)
                     continue
+                if (
+                    not self.is_prefill
+                    and ctx.ticket is not None
+                    and getattr(self.backend, "incremental_install", False)
+                ):
+                    slots = self.s.engine.page_table[
+                        ctx.req.table_idx, ctx.decode_prefix_len : len(ctx.request.prompt_ids)
+                    ]
+                    self.backend.progress_receive(ctx.ticket, slots)
                 if ctx.job is not None:
                     if ctx.job.sources_done.is_set():
                         self._free_pages(ctx)

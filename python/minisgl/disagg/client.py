@@ -17,7 +17,7 @@ from .layered_protocol import LayeredReceiveTicket
 from .lifecycle import RequestLifecycle
 from .protocol import (
     HANDOFF_VERSION,
-    MOONCAKE_TRANSPORT_MODES,
+    LAYERED_TRANSFER_MODES,
     ReceiveTicket,
     RequestHandoff,
     _token,
@@ -325,7 +325,7 @@ class PDClient:
                     type(layered) is not bool
                     or capabilities.get("handoff_version") != HANDOFF_VERSION
                     or capabilities.get("decode_prefix_reuse") is not True
-                    or mode not in (MOONCAKE_TRANSPORT_MODES if layered else ("tcp",))
+                    or mode not in (LAYERED_TRANSFER_MODES if layered else ("tcp",))
                 ):
                     raise ValueError(
                         "incompatible Prefill protocol; upgrade Workers and clients together"
@@ -343,6 +343,13 @@ class PDClient:
                     or worker_transfer_mode(decode_caps) != mode
                 ):
                     raise ValueError("incompatible Decode protocol or transfer mode")
+                if mode == "shm_dram" and (
+                    not capabilities.get("host_id")
+                    or capabilities.get("host_id") != decode_caps.get("host_id")
+                    or not capabilities.get("shm_pool")
+                    or capabilities.get("shm_pool") != decode_caps.get("shm_pool")
+                ):
+                    raise ValueError("shm_dram requires the same host and shared pool")
                 reserve = {"op": "reserve", "request": request.to_object()}
                 if cache_decode:
                     reserve["cache_transaction"] = True

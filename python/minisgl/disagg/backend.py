@@ -35,4 +35,22 @@ def create_transfer_backend(args):
             transfer_mode=getattr(args, "pd_mooncake_transport_mode", "gpu_direct"),
             **kwargs,
         )
+    if name == "shm_dram":
+        from .layered_shm import LayeredShmBackend
+
+        return LayeredShmBackend(
+            bind,
+            manifest=args.pd_shm_manifest,
+            worker_id=args.worker_id,
+            numa_id=args.pd_numa_id,
+            host_id=args.pd_host_id,
+            layers_per_chunk=args.pd_layers_per_chunk,
+            staging_slots=args.pd_staging_slots,
+            overflow_slots=args.pd_shm_overflow_slots,
+            local_wait_ms=args.pd_shm_local_wait_ms,
+            max_transfer_bytes=args.pd_max_transfer_bytes,
+            max_registered_bytes=args.pd_max_registered_bytes or 2 * args.pd_max_transfer_bytes,
+            max_pending_transfers=args.pd_max_pending_transfers,
+            **kwargs,
+        )
     raise ValueError(f"unsupported P/D transfer backend: {name}")

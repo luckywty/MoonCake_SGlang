@@ -9,9 +9,26 @@
 
 环境：Python 3.12.3、PyTorch 2.9.1+cpu、pytest 9.2.0，无 CUDA。首次补测新增 46 项，
 启动期防呆另增 63 项；Host 中转再增 48 项 CPU 回归和 3 项 CUDA 参数化用例。
-当前扩大集合结果：**404 passed、19 skipped、117 subtests passed、0 failed**；未排除 TCP、HTTP 或逐层 socket 用例。
+该阶段扩大集合结果：**404 passed、19 skipped、117 subtests passed、0 failed**；未排除 TCP、HTTP 或逐层 socket 用例。
 19 个跳过项需要 CUDA/GPU 环境，其中真实模型对照还需显式配置模型。
 JUnit 报告：执行机 `/tmp/minisgl-host-dram-cpu.xml`，不随仓库发布。
+
+### 2026-11-28：shm_dram 实现与验证进度
+
+本轮先在原始 `8d693f8` 快照重跑完整集合，确认 **404 passed、19 skipped、117 subtests passed**。
+加入共享中转后端后，完整集合曾通过 **431 passed、19 skipped、117 subtests passed**，
+其中新增 27 项覆盖真实 POSIX 段、多 P 进程分区、独立 P/D 进程、逐组安装与槽位循环、
+两道 CUDA fence 的 CPU 模拟、取消排空、完成未知保护、NUMA 选路与协议版本。
+
+最终新增用例补至 38 项。之后沙箱内复验：既有配置/协议集合 **107 passed、69 subtests passed**，
+新拓扑/路由/启动校验、直连客户端等纯逻辑集合 **19 passed**；Ruff 与 diff whitespace 检查通过。
+最后补充的完整前缀命中和 SIGTERM 实际子进程清理用例尚未运行，最终完整集合仍待重跑；
+不能把此前 431 的结果当作最终全部新增用例的验收结果。
+环境仍为 CPU PyTorch，无 CUDA；没有执行真实双进程 CUDA 注册或 NUMA 带宽验收。
+
+本轮报告在执行机 `/tmp/minisgl-shm-baseline.xml`、`/tmp/minisgl-shm-regression.xml`、
+`/tmp/minisgl-shm-final-config.xml`、`/tmp/minisgl-shm-pure-final.xml`。
+共享中转参数和真机预检见 [shm_dram 说明](shm_dram.md)。
 
 在项目根目录、已安装测试依赖且允许本机 socket/子进程的环境中运行：
 
